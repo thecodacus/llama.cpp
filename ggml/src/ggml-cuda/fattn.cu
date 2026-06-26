@@ -191,7 +191,7 @@ static void ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2(ggml_backend_cuda_c
 static bool ggml_cuda_turbo_mma_fused() {
     static const bool v = []{
         const char * s = getenv("GGML_TURBO_MMA_FUSED");
-        return s && s[0] == '1';   // default OFF; only ON when explicitly set to "1"
+        return !(s && s[0] == '0');  // default ON (faster GQA-packed MMA, quality-neutral); GGML_TURBO_MMA_FUSED=0 = VEC kill-switch
     }();
     return v;
 }
