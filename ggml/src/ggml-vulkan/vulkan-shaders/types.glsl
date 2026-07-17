@@ -1826,6 +1826,12 @@ struct block_turbo4_0
 #define A_TYPE block_turbo4_0
 #endif
 
+// Any turbo tier compiled as a dedicated flash-attn variant: K/V bindings are
+// turbo-only (no f16/quant aliases at bindings 1/2).
+#if defined(DATA_A_TURBO2_0) || defined(DATA_A_TURBO3_0) || defined(DATA_A_TURBO4_0)
+#define DATA_A_TURBO_KV 1
+#endif
+
 #if defined(DATA_A_IQ4_NL) || defined(DATA_A_IQ4_XS)
 const int8_t kvalues_iq4nl_const[16] = {
     int8_t(-127), int8_t(-104), int8_t(-83), int8_t(-65), int8_t(-49), int8_t(-35), int8_t(-22), int8_t(-10),

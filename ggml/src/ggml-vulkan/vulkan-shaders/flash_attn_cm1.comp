@@ -35,7 +35,7 @@ const uint32_t cols_per_thread = Bc / cols_per_iter;
 
 layout (binding = 0) readonly buffer Q {float data_q[];};
 layout (binding = 0) readonly buffer QV4 {vec4 data_qv4[];};
-#if !defined(DATA_A_TURBO3_0)
+#if !defined(DATA_A_TURBO_KV)
 layout (binding = 1) readonly buffer K {FLOAT_TYPE data_k[];};
 layout (binding = 1) readonly buffer KV4 {FLOAT_TYPEV4 data_kv4[];};
 layout (binding = 2) readonly buffer V {FLOAT_TYPE data_v[];};
@@ -243,7 +243,7 @@ void main() {
                         } else
 #endif
                         {
-#if !defined(DATA_A_TURBO3_0)
+#if !defined(DATA_A_TURBO_KV)
                             K_Tf = FLOAT_TYPEV4(data_kv4[k_offset / 4 + (j * Bc + c) * k_stride / 4 + d]);
 #endif
                         }
@@ -288,7 +288,7 @@ void main() {
                             } else
 #endif
                             {
-#if !defined(DATA_A_TURBO3_0)
+#if !defined(DATA_A_TURBO_KV)
                                 K_Tf = FLOAT_TYPEV4(data_kv4[k_offset / 4 + (j * Bc + row) * k_stride / 4 + d * 16 / 4 + col_vec]);
 #endif
                             }
@@ -304,7 +304,7 @@ void main() {
                 uint coord = (gl_SubgroupID * MatBc) * kvsh_stride;
                 coopMatLoad(KMat, kvsh, coord, kvsh_stride, gl_CooperativeMatrixLayoutRowMajor);
             } else {
-#if !defined(DATA_A_TURBO3_0)
+#if !defined(DATA_A_TURBO_KV)
                 const uint coord = k_offset / 4 + (j * Bc + gl_SubgroupID * MatBc) * k_stride / 4 + d * 16 / 4;
                 coopMatLoad(KMat, data_kv4, coord, k_stride / 4, gl_CooperativeMatrixLayoutRowMajor);
 #endif
@@ -419,7 +419,7 @@ void main() {
                         } else
 #endif
                         {
-#if !defined(DATA_A_TURBO3_0)
+#if !defined(DATA_A_TURBO_KV)
                             V_Tf = FLOAT_TYPEV4(data_vv4[v_offset / 4 + (j * Bc + c) * v_stride / 4 + d]);
 #endif
                         }
@@ -472,7 +472,7 @@ void main() {
                         } else
 #endif
                         {
-#if !defined(DATA_A_TURBO3_0)
+#if !defined(DATA_A_TURBO_KV)
                             kvsh[row * vsh_stride + col] = data_vv4[(v_offset + v_row * v_stride + v_col) / 4];
 #endif
                         }
@@ -494,7 +494,7 @@ void main() {
                     if (!USE_DECODE_V && !KV_bounds_check) {
                         // F16/BF16 values can be loaded directly from global memory
                         const uint v_tile_row = j * Bc + bc_chunk * MatBc;
-#if !defined(DATA_A_TURBO3_0)
+#if !defined(DATA_A_TURBO_KV)
                         const uint v_tile_offset = v_offset / 4 + v_tile_row * v_stride / 4 + hsv_offset / 4;
                         coopMatLoad(QMat, data_vv4, v_tile_offset, v_stride / 4, gl_CooperativeMatrixLayoutRowMajor);
 #endif

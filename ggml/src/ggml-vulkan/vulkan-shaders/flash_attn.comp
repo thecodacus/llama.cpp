@@ -38,7 +38,7 @@ const uint32_t num_subgroups = SubGroupSize == 0 ? 0 : WorkGroupSize / SubGroupS
 
 layout (binding = 0) readonly buffer Q {float data_q[];};
 layout (binding = 0) readonly buffer QV4 {vec4 data_qv4[];};
-#if !defined(DATA_A_TURBO3_0)
+#if !defined(DATA_A_TURBO_KV)
 layout (binding = 1) readonly buffer K {float16_t data_k[];};
 layout (binding = 1) readonly buffer KV4 {f16vec4 data_kv4[];};
 layout (binding = 2) readonly buffer V {float16_t data_v[];};
@@ -267,7 +267,7 @@ void main() {
                             uint iqs = (coord % BLOCK_SIZE_K);
                             K_Tf = dequantize4(ib, iqs, k_offset, BINDING_IDX_K);
                         } else {
-#if !defined(DATA_A_TURBO3_0)
+#if !defined(DATA_A_TURBO_KV)
                             K_Tf = FLOAT_TYPEV4(data_kv4[k_offset / 4 + (j * Bc + c) * k_stride / 4 + d]);
 #endif
                         }
@@ -322,7 +322,7 @@ void main() {
                         uint iqs = (coord % BLOCK_SIZE_K);
                         K_Tf = dequantize4(ib, iqs, k_offset, BINDING_IDX_K);
                     } else {
-#if !defined(DATA_A_TURBO3_0)
+#if !defined(DATA_A_TURBO_KV)
                         K_Tf = FLOAT_TYPEV4(data_kv4[k_offset / 4 + (j * Bc + c * cols_per_iter + col_tid) * k_stride / 4 + d * D_split + d_tid]);
 #endif
                     }
@@ -347,7 +347,7 @@ void main() {
                         uint iqs = (coord % BLOCK_SIZE_K);
                         K_Tf = dequantize4(ib, iqs, k_offset, BINDING_IDX_K);
                     } else {
-#if !defined(DATA_A_TURBO3_0)
+#if !defined(DATA_A_TURBO_KV)
                         K_Tf = FLOAT_TYPEV4(data_kv4[k_offset / 4 + (j * Bc + c * cols_per_iter + col_tid) * k_stride / 4 + d * D_split + d_tid]);
 #endif
                     }
@@ -504,7 +504,7 @@ void main() {
                             uint iqs = (coord % BLOCK_SIZE_V);
                             V_Tf = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
                         } else {
-#if !defined(DATA_A_TURBO3_0)
+#if !defined(DATA_A_TURBO_KV)
                             V_Tf = FLOAT_TYPEV4(data_vv4[v_offset / 4 + (j * Bc + c) * v_stride / 4 + d]);
 #endif
                         }
@@ -537,7 +537,7 @@ void main() {
                     uint iqs = (coord % BLOCK_SIZE_V);
                     Vf = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
                 } else {
-#if !defined(DATA_A_TURBO3_0)
+#if !defined(DATA_A_TURBO_KV)
                     Vf = FLOAT_TYPEV4(data_vv4[v_offset / 4 + (j * Bc + c * cols_per_iter + col_tid) * v_stride / 4 + d * D_split + d_tid]);
 #endif
                 }

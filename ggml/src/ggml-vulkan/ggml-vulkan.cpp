@@ -4193,19 +4193,29 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
         const bool bf16_kv = fa.first.k_type == GGML_TYPE_BF16;
         const bool use_mmq = ggml_vk_fa_scalar_uses_mmq(device, fa.first.k_type);
+        const bool is_turbo2 = (fa.first.k_type == GGML_TYPE_TURBO2_0);
         const bool is_turbo3 = (fa.first.k_type == GGML_TYPE_TURBO3_0);
+        const bool is_turbo4 = (fa.first.k_type == GGML_TYPE_TURBO4_0);
         const void * spv_data = nullptr;
         size_t spv_size = 0;
         const char *name = nullptr;
-        if (is_turbo3) {
-            // Dedicated SPIR-V built with DATA_A_TURBO3_0: turbo3-only K/V
+        if (is_turbo2 || is_turbo3 || is_turbo4) {
+            // Dedicated SPIR-V built with DATA_A_TURBO*_0: turbo-only K/V
             // bindings and per-element centroid dequant.
             if (device->fp16) {
-                if (f32acc) { spv_data = flash_attn_f32_f16_turbo3_0_data;        spv_size = flash_attn_f32_f16_turbo3_0_len; }
-                else        { spv_data = flash_attn_f32_f16_turbo3_0_f16acc_data; spv_size = flash_attn_f32_f16_turbo3_0_f16acc_len; }
+                if (f32acc) {
+                    if (is_turbo2)      { spv_data = flash_attn_f32_f16_turbo2_0_data; spv_size = flash_attn_f32_f16_turbo2_0_len; }
+                    else if (is_turbo3) { spv_data = flash_attn_f32_f16_turbo3_0_data; spv_size = flash_attn_f32_f16_turbo3_0_len; }
+                    else                { spv_data = flash_attn_f32_f16_turbo4_0_data; spv_size = flash_attn_f32_f16_turbo4_0_len; }
+                } else {
+                    if (is_turbo2)      { spv_data = flash_attn_f32_f16_turbo2_0_f16acc_data; spv_size = flash_attn_f32_f16_turbo2_0_f16acc_len; }
+                    else if (is_turbo3) { spv_data = flash_attn_f32_f16_turbo3_0_f16acc_data; spv_size = flash_attn_f32_f16_turbo3_0_f16acc_len; }
+                    else                { spv_data = flash_attn_f32_f16_turbo4_0_f16acc_data; spv_size = flash_attn_f32_f16_turbo4_0_f16acc_len; }
+                }
             } else {
-                spv_data = flash_attn_f32_f16_turbo3_0_fp32_data;
-                spv_size = flash_attn_f32_f16_turbo3_0_fp32_len;
+                if (is_turbo2)      { spv_data = flash_attn_f32_f16_turbo2_0_fp32_data; spv_size = flash_attn_f32_f16_turbo2_0_fp32_len; }
+                else if (is_turbo3) { spv_data = flash_attn_f32_f16_turbo3_0_fp32_data; spv_size = flash_attn_f32_f16_turbo3_0_fp32_len; }
+                else                { spv_data = flash_attn_f32_f16_turbo4_0_fp32_data; spv_size = flash_attn_f32_f16_turbo4_0_fp32_len; }
             }
             name = aligned ? "flash_attn_f32_f16_aligned" : "flash_attn_f32_f16";
         } else if (bf16_kv) {
@@ -4256,14 +4266,23 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             const bool fa_ds = fa.first.subgroup_size == 0;
 
             const bool bf16_kv = fa.first.k_type == GGML_TYPE_BF16;
+            const bool is_turbo2 = (fa.first.k_type == GGML_TYPE_TURBO2_0);
             const bool is_turbo3 = (fa.first.k_type == GGML_TYPE_TURBO3_0);
+            const bool is_turbo4 = (fa.first.k_type == GGML_TYPE_TURBO4_0);
 
             const void * spv_data;
             size_t spv_size;
             const char *name;
-            if (is_turbo3) {
-                if (f32acc) { spv_data = flash_attn_f32_f16_turbo3_0_cm1_data;        spv_size = flash_attn_f32_f16_turbo3_0_cm1_len; }
-                else        { spv_data = flash_attn_f32_f16_turbo3_0_f16acc_cm1_data; spv_size = flash_attn_f32_f16_turbo3_0_f16acc_cm1_len; }
+            if (is_turbo2 || is_turbo3 || is_turbo4) {
+                if (f32acc) {
+                    if (is_turbo2)      { spv_data = flash_attn_f32_f16_turbo2_0_cm1_data; spv_size = flash_attn_f32_f16_turbo2_0_cm1_len; }
+                    else if (is_turbo3) { spv_data = flash_attn_f32_f16_turbo3_0_cm1_data; spv_size = flash_attn_f32_f16_turbo3_0_cm1_len; }
+                    else                { spv_data = flash_attn_f32_f16_turbo4_0_cm1_data; spv_size = flash_attn_f32_f16_turbo4_0_cm1_len; }
+                } else {
+                    if (is_turbo2)      { spv_data = flash_attn_f32_f16_turbo2_0_f16acc_cm1_data; spv_size = flash_attn_f32_f16_turbo2_0_f16acc_cm1_len; }
+                    else if (is_turbo3) { spv_data = flash_attn_f32_f16_turbo3_0_f16acc_cm1_data; spv_size = flash_attn_f32_f16_turbo3_0_f16acc_cm1_len; }
+                    else                { spv_data = flash_attn_f32_f16_turbo4_0_f16acc_cm1_data; spv_size = flash_attn_f32_f16_turbo4_0_f16acc_cm1_len; }
+                }
                 name = aligned ? "flash_attn_f32_f16_aligned_cm1" : "flash_attn_f32_f16_cm1";
             } else if (bf16_kv) {
 #if defined(VK_KHR_shader_bfloat16) && defined(GGML_VULKAN_BFLOAT16_GLSLC_SUPPORT)
@@ -17627,8 +17646,14 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 if ((op->src[1]->type == GGML_TYPE_BF16) != (op->src[2]->type == GGML_TYPE_BF16)) {
                     return false;
                 }
-                // dedicated turbo3 FA SPIR-V decodes both K and V as turbo3
+                // dedicated turbo FA SPIR-V decodes both K and V as the same turbo tier
+                if ((op->src[1]->type == GGML_TYPE_TURBO2_0) != (op->src[2]->type == GGML_TYPE_TURBO2_0)) {
+                    return false;
+                }
                 if ((op->src[1]->type == GGML_TYPE_TURBO3_0) != (op->src[2]->type == GGML_TYPE_TURBO3_0)) {
+                    return false;
+                }
+                if ((op->src[1]->type == GGML_TYPE_TURBO4_0) != (op->src[2]->type == GGML_TYPE_TURBO4_0)) {
                     return false;
                 }
                 if (!coopmat2 && !(device->subgroup_shuffle && device->subgroup_vote)) {
