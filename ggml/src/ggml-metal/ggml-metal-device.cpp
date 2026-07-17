@@ -668,6 +668,23 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_solve_tri(ggml_m
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_turbo_wht(ggml_metal_library_t lib) {
+    const char * name = "kernel_turbo_wht";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        // No function constants needed — compile with empty cv
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+        res = ggml_metal_library_compile_pipeline(lib, name, name, cv);
+        ggml_metal_cv_free(cv);
+    }
+
+    res.nsg = 1;
+    res.smem = 0;
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext(ggml_metal_library_t lib, const ggml_tensor * op, int nsg, int nxpsg, int r1ptg) {
     char base[256];
     char name[256];
@@ -1415,9 +1432,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
     // do bounds checks for the mask?
     const bool bc_mask = op->src[3] && (op->src[3]->ne[1] % 8 != 0);
 
-    snprintf(base, 256, "kernel_%s_%s_dk%d_dv%d",
+    // Asymmetric K/V: always encode both K and V types in the pipeline name.
+    // Symmetric case: ktype == vtype, so the name just has the type twice.
+    // This avoids ambiguity if a type name contains underscores (e.g. q4_0).
+    snprintf(base, 256, "kernel_%s_k%s_v%s_dk%d_dv%d",
             "flash_attn_ext",
             ggml_type_name(op->src[1]->type),
+            ggml_type_name(op->src[2]->type),
             dk,
             dv);
 
@@ -1478,9 +1499,12 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
     const int32_t ns10 = op->src[1]->nb[1]/op->src[1]->nb[0];
     const int32_t ns20 = op->src[2]->nb[1]/op->src[2]->nb[0];
 
-    snprintf(base, 256, "kernel_%s_%s_dk%d_dv%d",
+    // Asymmetric K/V: always encode both K and V types in the pipeline name.
+    // Uses k/v prefix to avoid ambiguity with type names containing underscores.
+    snprintf(base, 256, "kernel_%s_k%s_v%s_dk%d_dv%d",
             "flash_attn_ext_vec",
             ggml_type_name(op->src[1]->type),
+            ggml_type_name(op->src[2]->type),
             dk,
             dv);
 
