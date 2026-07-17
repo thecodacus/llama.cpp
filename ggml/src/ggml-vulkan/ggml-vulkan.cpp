@@ -966,6 +966,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_snake_f16;
     vk_pipeline pipeline_snake_bf16;
     vk_pipeline pipeline_pool2d_f32;
+    vk_pipeline pipeline_turbo_wht;
     vk_pipeline pipeline_rwkv_wkv6_f32;
     vk_pipeline pipeline_rwkv_wkv7_f32;
     // [size_idx][kda] where size_idx: 0=d16, 1=d32, 2=d64, 3=d128
@@ -3601,6 +3602,13 @@ static vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_
         path = FA_COOPMAT2;
     }
 
+    // turbo K/V dequant is implemented in the scalar and coopmat1 FA shaders only.
+    const bool turbo_kv = k_type == GGML_TYPE_TURBO2_0 || k_type == GGML_TYPE_TURBO3_0 || k_type == GGML_TYPE_TURBO4_0 ||
+                          v_type == GGML_TYPE_TURBO2_0 || v_type == GGML_TYPE_TURBO3_0 || v_type == GGML_TYPE_TURBO4_0;
+    if (turbo_kv && path == FA_COOPMAT2) {
+        path = FA_SCALAR;
+    }
+
     switch (path) {
     case FA_SCALAR:
         return get_fa_tuning_params_scalar(device, hsk, hsv, n_rows, n_kv, k_type, v_type, f32acc);
@@ -4185,10 +4193,22 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
         const bool bf16_kv = fa.first.k_type == GGML_TYPE_BF16;
         const bool use_mmq = ggml_vk_fa_scalar_uses_mmq(device, fa.first.k_type);
+        const bool is_turbo3 = (fa.first.k_type == GGML_TYPE_TURBO3_0);
         const void * spv_data = nullptr;
         size_t spv_size = 0;
         const char *name = nullptr;
-        if (bf16_kv) {
+        if (is_turbo3) {
+            // Dedicated SPIR-V built with DATA_A_TURBO3_0: turbo3-only K/V
+            // bindings and per-element centroid dequant.
+            if (device->fp16) {
+                if (f32acc) { spv_data = flash_attn_f32_f16_turbo3_0_data;        spv_size = flash_attn_f32_f16_turbo3_0_len; }
+                else        { spv_data = flash_attn_f32_f16_turbo3_0_f16acc_data; spv_size = flash_attn_f32_f16_turbo3_0_f16acc_len; }
+            } else {
+                spv_data = flash_attn_f32_f16_turbo3_0_fp32_data;
+                spv_size = flash_attn_f32_f16_turbo3_0_fp32_len;
+            }
+            name = aligned ? "flash_attn_f32_f16_aligned" : "flash_attn_f32_f16";
+        } else if (bf16_kv) {
             spv_data = flash_attn_f32_f16_fp32_data;
             spv_size = flash_attn_f32_f16_fp32_len;
             name = aligned ? "flash_attn_f32_bf16_aligned" : "flash_attn_f32_bf16";
@@ -4236,11 +4256,16 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             const bool fa_ds = fa.first.subgroup_size == 0;
 
             const bool bf16_kv = fa.first.k_type == GGML_TYPE_BF16;
+            const bool is_turbo3 = (fa.first.k_type == GGML_TYPE_TURBO3_0);
 
             const void * spv_data;
             size_t spv_size;
             const char *name;
-            if (bf16_kv) {
+            if (is_turbo3) {
+                if (f32acc) { spv_data = flash_attn_f32_f16_turbo3_0_cm1_data;        spv_size = flash_attn_f32_f16_turbo3_0_cm1_len; }
+                else        { spv_data = flash_attn_f32_f16_turbo3_0_f16acc_cm1_data; spv_size = flash_attn_f32_f16_turbo3_0_f16acc_cm1_len; }
+                name = aligned ? "flash_attn_f32_f16_aligned_cm1" : "flash_attn_f32_f16_cm1";
+            } else if (bf16_kv) {
 #if defined(VK_KHR_shader_bfloat16) && defined(GGML_VULKAN_BFLOAT16_GLSLC_SUPPORT)
                 if (!device->coopmat_bf16_support) continue;
                 spv_data = flash_attn_f32_f16_bf16_cm1_data;
@@ -5241,7 +5266,10 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [src_idx][GGML_TYPE_Q5_0], "set_rows_" #src "_q5_0" #itype, set_rows_ ## src ## _q5_0 ## itype ## _len, set_rows_ ## src ## _q5_0 ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
         ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [src_idx][GGML_TYPE_Q5_1], "set_rows_" #src "_q5_1" #itype, set_rows_ ## src ## _q5_1 ## itype ## _len, set_rows_ ## src ## _q5_1 ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
         ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [src_idx][GGML_TYPE_Q8_0], "set_rows_" #src "_q8_0" #itype, set_rows_ ## src ## _q8_0 ## itype ## _len, set_rows_ ## src ## _q8_0 ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
-        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [src_idx][GGML_TYPE_IQ4_NL], "set_rows_" #src "_iq4_nl" #itype, set_rows_ ## src ## _iq4_nl ## itype ## _len, set_rows_ ## src ## _iq4_nl ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true);
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [src_idx][GGML_TYPE_IQ4_NL], "set_rows_" #src "_iq4_nl" #itype, set_rows_ ## src ## _iq4_nl ## itype ## _len, set_rows_ ## src ## _iq4_nl ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [src_idx][GGML_TYPE_TURBO2_0], "set_rows_" #src "_turbo2_0" #itype, set_rows_ ## src ## _turbo2_0 ## itype ## _len, set_rows_ ## src ## _turbo2_0 ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true, true, 32u); \
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [src_idx][GGML_TYPE_TURBO3_0], "set_rows_" #src "_turbo3_0" #itype, set_rows_ ## src ## _turbo3_0 ## itype ## _len, set_rows_ ## src ## _turbo3_0 ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true, true, 32u); \
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [src_idx][GGML_TYPE_TURBO4_0], "set_rows_" #src "_turbo4_0" #itype, set_rows_ ## src ## _turbo4_0 ## itype ## _len, set_rows_ ## src ## _turbo4_0 ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true, true, 32u);
 
     SET_ROWS(0, f32, _i32)
     SET_ROWS(0, f32, _i64)
@@ -5513,6 +5541,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_snake_bf16, "snake_bf16", snake_bf16_len, snake_bf16_data, "main", 4, sizeof(vk_op_snake_push_constants), {256, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_pool2d_f32, "pool2d_f32", pool2d_f32_len, pool2d_f32_data, "main", 2, sizeof(vk_op_pool2d_push_constants), {512, 1, 1}, {}, 1);
+
+    // TurboQuant WHT (forward / inverse rotation, 128-element block)
+    ggml_vk_create_pipeline(device, device->pipeline_turbo_wht, "turbo_wht", turbo_wht_len, turbo_wht_data, "main", 2, 3 * sizeof(uint32_t), {128, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_rwkv_wkv6_f32, "rwkv_wkv6_f32", rwkv_wkv6_f32_len, rwkv_wkv6_f32_data, "main", 7, sizeof(vk_op_rwkv_wkv6_push_constants), {1, 1, 1}, {device->subgroup_size}, 1);
 
@@ -11824,7 +11855,10 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
     case GGML_OP_SET_ROWS:
         {
             uint32_t ne = ggml_nelements(src0);
-            if (ggml_is_quantized(dst->type)) {
+            if (dst->type == GGML_TYPE_TURBO2_0 || dst->type == GGML_TYPE_TURBO3_0 || dst->type == GGML_TYPE_TURBO4_0) {
+                // turbo set_rows shaders: 128 threads per WG, one full QK=128 block per WG
+                ne = ne / 128;
+            } else if (ggml_is_quantized(dst->type)) {
                 // quants run 32 threads each doing QUANT_K elements
                 ne = CEIL_DIV(ne, 32 * ggml_blck_size(dst->type));
             } else {
@@ -12647,6 +12681,34 @@ static void ggml_vk_set_rows(ggml_backend_vk_context * ctx, vk_context& subctx, 
         0,
         0.0f, 0.0f, 0,
     });
+}
+
+static void ggml_vk_turbo_wht(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
+    int direction, group_size;
+    memcpy(&direction, dst->op_params + 0, sizeof(int));
+    memcpy(&group_size, dst->op_params + sizeof(int), sizeof(int));
+    struct { uint32_t ne; uint32_t direction; uint32_t group_size; } pc = {
+        (uint32_t)ggml_nelements(src0), (uint32_t)direction, (uint32_t)group_size,
+    };
+    vk_pipeline pipeline = ctx->device->pipeline_turbo_wht;
+    GGML_ASSERT(pipeline != nullptr);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    vk_subbuffer src_buf = ggml_vk_tensor_subbuffer(ctx, src0, false);
+    vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst, false);
+    // Spread workgroups across Y/Z to stay within maxComputeWorkGroupCount[0].
+    const uint32_t n_groups = pc.ne / (uint32_t)group_size;
+    std::array<uint32_t, 3> elements;
+    if (n_groups > 262144) {
+        elements = { 512 * (uint32_t)group_size, 512, CEIL_DIV(n_groups, 262144) };
+    } else if (n_groups > 512) {
+        elements = { 512 * (uint32_t)group_size, CEIL_DIV(n_groups, 512), 1 };
+    } else {
+        elements = { pc.ne, 1, 1 };
+    }
+    // Compute-to-compute RAW/WAW ordering must be explicit on Vulkan.
+    ggml_vk_sync_buffers(ctx, subctx);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src_buf, dst_buf }, pc, elements);
+    ggml_vk_sync_buffers(ctx, subctx);
 }
 
 static void ggml_vk_silu_back(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -14972,6 +15034,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         break;
     case GGML_OP_SET_ROWS:
         ggml_vk_set_rows(ctx, compute_ctx, src0, src1, node);
+
+        break;
+    case GGML_OP_TURBO_WHT:
+        ggml_vk_turbo_wht(ctx, compute_ctx, src0, node);
 
         break;
     case GGML_OP_SILU_BACK:
@@ -17545,6 +17611,10 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     case GGML_TYPE_Q4_1:
                     case GGML_TYPE_Q4_0:
                         return true;
+                    case GGML_TYPE_TURBO2_0:
+                    case GGML_TYPE_TURBO3_0:
+                    case GGML_TYPE_TURBO4_0:
+                        return true;
                     case GGML_TYPE_Q1_0:
                         return coopmat2;
                     default:
@@ -17555,6 +17625,10 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     return false;
                 }
                 if ((op->src[1]->type == GGML_TYPE_BF16) != (op->src[2]->type == GGML_TYPE_BF16)) {
+                    return false;
+                }
+                // dedicated turbo3 FA SPIR-V decodes both K and V as turbo3
+                if ((op->src[1]->type == GGML_TYPE_TURBO3_0) != (op->src[2]->type == GGML_TYPE_TURBO3_0)) {
                     return false;
                 }
                 if (!coopmat2 && !(device->subgroup_shuffle && device->subgroup_vote)) {
@@ -17606,6 +17680,11 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     (op->src[1]->type != GGML_TYPE_I32 && op->src[1]->type != GGML_TYPE_I64)) {
                     return false;
                 }
+                // turbo shaders use a 128-element block: head_dim must be divisible by 128
+                if ((op->type == GGML_TYPE_TURBO2_0 || op->type == GGML_TYPE_TURBO3_0 || op->type == GGML_TYPE_TURBO4_0)
+                    && (op->src[0]->ne[0] % 128 != 0)) {
+                    return false;
+                }
                 switch (op->type) {
                     case GGML_TYPE_F32:
                     case GGML_TYPE_F16:
@@ -17618,6 +17697,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:
                     case GGML_TYPE_IQ4_NL:
+                    case GGML_TYPE_TURBO2_0:
+                    case GGML_TYPE_TURBO3_0:
+                    case GGML_TYPE_TURBO4_0:
                         return true;
                     default:
                         return false;
@@ -17856,6 +17938,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 && op->src[1]->type == GGML_TYPE_F32;
         case GGML_OP_POOL_2D:
             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
+        case GGML_OP_TURBO_WHT:
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[0]->ne[0] % 128 == 0;
         case GGML_OP_RWKV_WKV6:
         case GGML_OP_RWKV_WKV7:
             return true; // all inputs are contiguous, see ggml.c
