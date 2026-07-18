@@ -86,10 +86,10 @@ static float dot_product(const float * a1, const float * a2, size_t test_size) {
 static float dot_product_error(const ggml_type_traits * qfns, const ggml_type_traits_cpu * qfns_cpu, size_t test_size, const float * test_data1, const float * test_data2) {
     GGML_UNUSED(qfns);
 
-    std::vector<uint8_t> tmp_q1(2*test_size);
-    std::vector<uint8_t> tmp_q2(2*test_size);
-
     const auto * vdot = ggml_get_type_traits_cpu(qfns_cpu->vec_dot_type);
+
+    std::vector<uint8_t> tmp_q1(2*test_size);
+    std::vector<uint8_t> tmp_q2(ggml_row_size(qfns_cpu->vec_dot_type, test_size));
 
     qfns_cpu->from_float(test_data1, tmp_q1.data(), test_size);
     vdot->from_float(test_data2, tmp_q2.data(), test_size);
@@ -147,6 +147,13 @@ static int test_vec_dot_q(bool verbose) {
             continue;
         }
 
+        // turbo KV-cache types quantize in the WHT-rotated domain and dequantization
+        // intentionally does not undo the rotation (the attention path applies it),
+        // so a direct quantize/dequantize round trip does not reproduce the input
+        if (type == GGML_TYPE_TURBO2_0 || type == GGML_TYPE_TURBO3_0 || type == GGML_TYPE_TURBO4_0) {
+            continue;
+        }
+
         const ggml_type ei = (ggml_type)i;
 
         printf("Testing %s\n", ggml_type_name((ggml_type) i));
@@ -162,6 +169,7 @@ static int test_vec_dot_q(bool verbose) {
                 type == GGML_TYPE_Q2_K    ? MAX_QUANTIZATION_TOTAL_ERROR_2BITS :
                 type == GGML_TYPE_IQ2_S   ? MAX_QUANTIZATION_TOTAL_ERROR_2BITS :
                 type == GGML_TYPE_Q3_K    ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS :
+                type == GGML_TYPE_TQ3_1S  ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS :
                 type == GGML_TYPE_IQ3_S   ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS :
                 type == GGML_TYPE_IQ3_XXS ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS_XXS :
                 type == GGML_TYPE_NVFP4   ? MAX_QUANTIZATION_TOTAL_ERROR_FP4 : MAX_QUANTIZATION_TOTAL_ERROR;
@@ -180,7 +188,8 @@ static int test_vec_dot_q(bool verbose) {
 
             const float vec_dot_error = dot_product_error(qfns, qfns_cpu, test_size, test_data.data(), test_data2.data());
             const float max_allowed_error = type == GGML_TYPE_Q2_K || type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ2_XXS ||
-                type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ2_S
+                type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ2_S ||
+                type == GGML_TYPE_TQ3_1S
                 ? MAX_DOT_PRODUCT_ERROR_LOWBIT
                 : type == GGML_TYPE_Q1_0
                 ? MAX_DOT_PRODUCT_ERROR_BINARY
