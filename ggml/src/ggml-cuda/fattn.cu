@@ -469,9 +469,33 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
 #ifndef GGML_CUDA_FA_ALL_QUANTS
     if (K->type != V->type) {
-        return BEST_FATTN_KERNEL_NONE;
+        // Allow the mixed KV type pairs that have FA template instances compiled in:
+        // every turbo2/3/4 combination with q8_0 or f16 (turbo KV cache work).
+        auto is_turbo = [](ggml_type t) {
+            return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0;
+        };
+        auto is_turbo_compat = [&](ggml_type t) {
+            return is_turbo(t) || t == GGML_TYPE_Q8_0 || t == GGML_TYPE_F16;
+        };
+        if (!(is_turbo(K->type) || is_turbo(V->type)) ||
+            !is_turbo_compat(K->type) || !is_turbo_compat(V->type)) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
     }
 #endif // GGML_CUDA_FA_ALL_QUANTS
+
+    // turbo kernels are instantiated only for head dims that are multiples of 64
+    // (turbo4: multiples of 128, matching its block size).
+    {
+        auto turbo_geom_ok = [](ggml_type t, int64_t ne0) {
+            if (t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0) return ne0 % 64 == 0;
+            if (t == GGML_TYPE_TURBO4_0) return ne0 % 128 == 0;
+            return true;
+        };
+        if (!turbo_geom_ok(K->type, K->ne[0]) || !turbo_geom_ok(V->type, V->ne[0])) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
+    }
 
     if (!ggml_cuda_fattn_kv_type_supported(K->type) || !ggml_cuda_fattn_kv_type_supported(V->type)) {
         return BEST_FATTN_KERNEL_NONE;
