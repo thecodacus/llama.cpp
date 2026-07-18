@@ -527,7 +527,7 @@ static __global__ void k_dequantize_tq4_1s_warp(
 
     #pragma unroll
     for (int h = 1; h < 32; h <<= 1) {
-        float o = __shfl_xor_sync(0xffffffff, val, h);
+        float o = __shfl_xor_sync(0xffffffff, val, h, 32);
         val = (lane & h) ? (o - val) : (val + o);
     }
     val *= 0.17677669529663688f * TQ_WEIGHT_SIGNS[lane];
