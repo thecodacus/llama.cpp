@@ -5,14 +5,13 @@
 #include "binary-ops.h"
 #include "simd-gemm.h"
 #include "ggml.h"
+#include "ggml-quants.h"
 #include "unary-ops.h"
 #include "vec.h"
 
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
-
-extern "C" int turbo3_cpu_wht_group_size;
 
 // ggml_compute_forward_dup
 
