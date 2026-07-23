@@ -61,9 +61,11 @@ def top_by_freq(steps_by_layer, S):
 
 
 def sim_lru(decode, S):
-    hits = total = 0
+    hits = total = ins = 0
+    n_steps = 0
     for layer, steps in decode.items():
         cache, clock = {}, 0
+        n_steps = max(n_steps, len(steps))
         for ids in steps:
             for e in ids:
                 clock += 1
@@ -72,16 +74,18 @@ def sim_lru(decode, S):
                 else:
                     if len(cache) >= S:
                         cache.pop(min(cache, key=cache.get))
-                    # inserted AFTER the miss (upload happens post-hoc)
+                    ins += 1
                 cache[e] = clock
                 total += 1
-    return hits / max(total, 1)
+    return hits / max(total, 1), ins / max(n_steps, 1)
 
 
 def sim_lfu_decay(decode, S, alpha=0.95):
-    hits = total = 0
+    hits = total = ins = 0
+    n_steps = 0
     for layer, steps in decode.items():
         score, cache = defaultdict(float), set()
+        n_steps = max(n_steps, len(steps))
         for ids in steps:
             for k in score:
                 score[k] *= alpha
@@ -89,21 +93,26 @@ def sim_lfu_decay(decode, S, alpha=0.95):
                 score[e] += 1.0
                 if e in cache:
                     hits += 1
-                elif len(cache) < S:
-                    cache.add(e)
                 else:
-                    victim = min(cache, key=lambda k: score[k])
-                    if score[e] >= score[victim]:
-                        cache.discard(victim)
+                    if len(cache) < S:
                         cache.add(e)
+                        ins += 1
+                    else:
+                        victim = min(cache, key=lambda k: score[k])
+                        if score[e] >= score[victim]:
+                            cache.discard(victim)
+                            cache.add(e)
+                            ins += 1
                 total += 1
-    return hits / max(total, 1)
+    return hits / max(total, 1), ins / max(n_steps, 1)
 
 
 def sim_reelect(decode, prefill, S, K, alpha=0.98):
-    hits = total = 0
+    hits = total = ins = 0
+    n_steps = 0
     for layer, steps in decode.items():
         score = defaultdict(float)
+        n_steps = max(n_steps, len(steps))
         for ids in prefill.get(layer, []):        # free warm-up from prompt routing
             for e in ids:
                 score[e] += 1.0
@@ -116,8 +125,10 @@ def sim_reelect(decode, prefill, S, K, alpha=0.98):
             if step % K == K - 1:
                 for k in score:
                     score[k] *= alpha
-                cache = set(sorted(score, key=score.get, reverse=True)[:S])
-    return hits / max(total, 1)
+                new = set(sorted(score, key=score.get, reverse=True)[:S])
+                ins += len(new - cache)
+                cache = new
+    return hits / max(total, 1), ins / max(n_steps, 1)
 
 
 def main():
@@ -126,6 +137,8 @@ def main():
     ap.add_argument("--budgets", default="0.0625,0.125,0.25,0.5",
                     help="cache size as fraction of expert count")
     ap.add_argument("--reelect", type=int, default=32)
+    ap.add_argument("--slab-mb", type=float, default=1.9,
+                    help="MB per (layer,expert) gate+up+down slab")
     args = ap.parse_args()
 
     prefill, decode, n_expert = load(args.trace)
@@ -149,19 +162,35 @@ def main():
               f"{sum(ranked[:k])/tot:.1%} of decode routing")
     print()
 
-    hdr = f"{'budget':>8} {'slots':>6} | {'st-oracle':>9} {'st-prefill':>10} " \
-          f"{'lru':>7} {'lfu-decay':>9} {'reelect-'+str(args.reelect):>10}"
+    # cost model: expert slab MB, RAM GB/s (CPU miss read), PCIe GB/s (upload)
+    SLAB_MB, RAM_GBS, PCIE_GBS = args.slab_mb, 45.0, 12.4
+    reads_per_step = sum(len(s2[0]) for s2 in decode.values())  # experts touched/step
+
+    def cost_ms(hit, ins_per_step):
+        miss_mb   = reads_per_step * (1 - hit) * SLAB_MB
+        upload_mb = ins_per_step * SLAB_MB
+        return miss_mb / RAM_GBS, upload_mb / PCIE_GBS   # ms if GB/s and MB
+
+    hdr = f"{'budget':>7} {'slots':>6} | {'policy':>10} {'hit':>7} {'up-MB/tok':>9} " \
+          f"{'miss-ms':>8} {'up-ms':>6}"
     print(hdr)
     print("-" * len(hdr))
     for frac in [float(x) for x in args.budgets.split(",")]:
         S = max(1, int(n_expert * frac))
-        oracle = sim_static(decode, top_by_freq(decode, S))
-        st_pre = sim_static(decode, top_by_freq(prefill, S)) if prefill else float("nan")
-        lru = sim_lru(decode, S)
-        lfu = sim_lfu_decay(decode, S)
-        re = sim_reelect(decode, prefill, S, args.reelect)
-        print(f"{frac:>8.4f} {S:>6} | {oracle:>9.1%} {st_pre:>10.1%} "
-              f"{lru:>7.1%} {lfu:>9.1%} {re:>10.1%}")
+        rows = [
+            ("st-oracle",  sim_static(decode, top_by_freq(decode, S)),  0.0),
+            ("st-prefill", sim_static(decode, top_by_freq(prefill, S)) if prefill else float("nan"), 0.0),
+        ]
+        for name, fn in (("lru", sim_lru), ("lfu-decay", sim_lfu_decay)):
+            h, i = fn(decode, S)
+            rows.append((name, h, i))
+        h, i = sim_reelect(decode, prefill, S, args.reelect)
+        rows.append((f"reelect-{args.reelect}", h, i))
+        for name, h, i in rows:
+            miss_ms, up_ms = cost_ms(h, i)
+            print(f"{frac:>7.4f} {S:>6} | {name:>10} {h:>7.1%} {i*SLAB_MB:>9.2f} "
+                  f"{miss_ms:>8.2f} {up_ms:>6.2f}")
+        print()
 
 
 if __name__ == "__main__":
