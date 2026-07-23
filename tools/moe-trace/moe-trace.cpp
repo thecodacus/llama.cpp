@@ -67,16 +67,18 @@ int main(int argc, char ** argv) {
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_PERPLEXITY)) {
         return 1;
     }
-    if (params.out_file.empty()) {
-        params.out_file = "moe-trace.csv";
+    // output path via env — the arg registry has no free slot for this example
+    const char * out_path = getenv("MOE_TRACE_OUT");
+    if (!out_path) {
+        out_path = "moe-trace.csv";
     }
 
     common_init();
 
     trace_ctx tc;
-    tc.out = fopen(params.out_file.c_str(), "w");
+    tc.out = fopen(out_path, "w");
     if (!tc.out) {
-        LOG_ERR("failed to open %s for writing\n", params.out_file.c_str());
+        LOG_ERR("failed to open %s for writing\n", out_path);
         return 1;
     }
 
@@ -136,7 +138,7 @@ int main(int argc, char ** argv) {
     llama_sampler_free(smpl);
 
     fclose(tc.out);
-    LOG_INF("trace written to %s\n", params.out_file.c_str());
+    LOG_INF("trace written to %s\n", out_path);
 
     llama_backend_free();
     return 0;
