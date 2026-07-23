@@ -12,6 +12,7 @@
 //   llama-moe-trace -m model.gguf -ngl 99 -ncmoe 26 -fa on \
 //       -p "prompt text" -n 512 -o trace.csv
 
+#include "arg.h"
 #include "common.h"
 #include "log.h"
 #include "llama.h"
