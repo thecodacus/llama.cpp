@@ -86,9 +86,9 @@ int main(int argc, char ** argv) {
     llama_backend_init();
     llama_numa_init(params.numa);
 
-    common_init_result llama_init = common_init_from_params(params);
-    llama_model   * model = llama_init.model.get();
-    llama_context * lctx  = llama_init.context.get();
+    common_init_result_ptr llama_init = common_init_from_params(params);
+    llama_model   * model = llama_init ? llama_init->model()   : nullptr;
+    llama_context * lctx  = llama_init ? llama_init->context() : nullptr;
     if (model == nullptr || lctx == nullptr) {
         LOG_ERR("failed to load model\n");
         return 1;
