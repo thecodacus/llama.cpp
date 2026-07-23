@@ -44,15 +44,21 @@ static bool trace_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     const int n_used   = (int) t->ne[0];
     const int n_tokens = (int) t->ne[1];
 
-    tc->buf.resize((size_t) n_used * n_tokens);
-    ggml_backend_tensor_get(t, tc->buf.data(), 0, ggml_nbytes(t));
+    // topk is a non-contiguous view over the argsort rows: copy the full
+    // strided byte range, then index by nb[] — sizing by n_used*n_tokens
+    // would under-allocate and tensor_get would smash the heap.
+    const size_t nbytes = ggml_nbytes(t);
+    tc->buf.resize((nbytes + sizeof(int32_t) - 1) / sizeof(int32_t));
+    ggml_backend_tensor_get(t, tc->buf.data(), 0, nbytes);
+    const char * base = (const char *) tc->buf.data();
 
     for (int j = 0; j < n_tokens; j++) {
         // prefill batches carry n_tokens > 1; decode steps carry 1
         const int pos = tc->in_prompt ? -(tc->pos + n_tokens - j) : tc->pos;
         fprintf(tc->out, "%d,%d", pos, layer);
         for (int i = 0; i < n_used; i++) {
-            fprintf(tc->out, ",%d", tc->buf[(size_t) j * n_used + i]);
+            const int32_t id = *(const int32_t *)(base + j*t->nb[1] + i*t->nb[0]);
+            fprintf(tc->out, ",%d", id);
         }
         fputc('\n', tc->out);
     }
