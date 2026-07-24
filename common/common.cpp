@@ -1564,6 +1564,11 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;
 
+    if (!params.moe_cache_profile.empty()) {
+        mparams.moe_cache_profile = params.moe_cache_profile.c_str();
+    }
+    mparams.moe_cache_slots = params.moe_cache_slots;
+
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;
     } else {

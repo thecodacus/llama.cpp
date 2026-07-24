@@ -1659,13 +1659,17 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 }
 
 void llama_model_base::init_moe_expert_cache() {
-    const char * profile_path = getenv("GGML_MOE_CACHE_PROFILE");
-    const char * slots_env    = getenv("GGML_MOE_CACHE_SLOTS");
-    if (profile_path == nullptr || slots_env == nullptr) {
-        return;
+    // flags take precedence; env vars kept as a fallback
+    const char * profile_path = params.moe_cache_profile;
+    int n_slots = params.moe_cache_slots;
+    if (profile_path == nullptr || profile_path[0] == '\0') {
+        profile_path = getenv("GGML_MOE_CACHE_PROFILE");
     }
-    const int n_slots = atoi(slots_env);
     if (n_slots <= 0) {
+        const char * slots_env = getenv("GGML_MOE_CACHE_SLOTS");
+        n_slots = slots_env ? atoi(slots_env) : 0;
+    }
+    if (profile_path == nullptr || profile_path[0] == '\0' || n_slots <= 0) {
         return;
     }
 
@@ -2477,6 +2481,8 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
+        /*.moe_cache_profile           =*/ nullptr,
+        /*.moe_cache_slots             =*/ 0,
         /*.vocab_only                  =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,
