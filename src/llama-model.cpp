@@ -1653,7 +1653,159 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    init_moe_expert_cache();
+
     return true;
+}
+
+void llama_model_base::init_moe_expert_cache() {
+    const char * profile_path = getenv("GGML_MOE_CACHE_PROFILE");
+    const char * slots_env    = getenv("GGML_MOE_CACHE_SLOTS");
+    if (profile_path == nullptr || slots_env == nullptr) {
+        return;
+    }
+    const int n_slots = atoi(slots_env);
+    if (n_slots <= 0) {
+        return;
+    }
+
+    // routing profile: moe-trace CSV (pos,layer,id0,...), decode rows only
+    std::map<int, std::map<int, int64_t>> freq; // layer -> expert -> count
+    {
+        FILE * f = fopen(profile_path, "r");
+        if (!f) {
+            LLAMA_LOG_WARN("%s: cannot open profile '%s' - expert cache disabled\n", __func__, profile_path);
+            return;
+        }
+        char line[4096];
+        while (fgets(line, sizeof(line), f)) {
+            char * p = line;
+            const long pos = strtol(p, &p, 10);
+            if (*p != ',' || pos < 0) { continue; }
+            p++;
+            const long il = strtol(p, &p, 10);
+            while (*p == ',') {
+                p++;
+                const long e = strtol(p, &p, 10);
+                if (e >= 0) {
+                    freq[(int) il][(int) e]++;
+                }
+            }
+        }
+        fclose(f);
+    }
+    if (freq.empty()) {
+        LLAMA_LOG_WARN("%s: profile '%s' has no decode rows - expert cache disabled\n", __func__, profile_path);
+        return;
+    }
+
+    ggml_backend_dev_t dev = nullptr;
+    for (const auto & d : devices) {
+        if (!d.is_meta) { dev = d.dev; break; }
+    }
+    if (dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+        LLAMA_LOG_WARN("%s: no GPU device - expert cache disabled\n", __func__);
+        return;
+    }
+    ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+
+    // candidate layers: routed experts resident in host memory
+    std::vector<int> pack_layers;
+    for (int il = 0; il < (int) layers.size(); il++) {
+        const auto & l = layers[il];
+        if (l.ffn_gate_exps && l.ffn_up_exps && l.ffn_down_exps && freq.count(il) &&
+            l.ffn_gate_exps->buffer && ggml_backend_buft_is_host(ggml_backend_buffer_get_type(l.ffn_gate_exps->buffer))) {
+            pack_layers.push_back(il);
+        }
+    }
+    if (pack_layers.empty()) {
+        LLAMA_LOG_INFO("%s: no CPU-resident MoE layers - expert cache not built\n", __func__);
+        return;
+    }
+
+    ggml_init_params ctx_params = {
+        /*.mem_size   =*/ (5*pack_layers.size() + 1)*ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx = ggml_init(ctx_params);
+
+    for (int il : pack_layers) {
+        auto & l = layers[il];
+        const ggml_tensor * g = l.ffn_gate_exps;
+        const ggml_tensor * u = l.ffn_up_exps;
+        const ggml_tensor * d = l.ffn_down_exps;
+        const int64_t n_expert = g->ne[2];
+        const int64_t S = std::min<int64_t>(n_slots, n_expert);
+        l.ffn_gate_exps_hot = ggml_new_tensor_3d(ctx, g->type, g->ne[0], g->ne[1], S);
+        l.ffn_up_exps_hot   = ggml_new_tensor_3d(ctx, u->type, u->ne[0], u->ne[1], S);
+        l.ffn_down_exps_hot = ggml_new_tensor_3d(ctx, d->type, d->ne[0], d->ne[1], S);
+        l.moe_map_hot       = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_expert);
+        l.moe_map_cold      = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_expert);
+        ggml_format_name(l.ffn_gate_exps_hot, "blk.%d.ffn_gate_exps_hot", il);
+        ggml_format_name(l.ffn_up_exps_hot,   "blk.%d.ffn_up_exps_hot",   il);
+        ggml_format_name(l.ffn_down_exps_hot, "blk.%d.ffn_down_exps_hot", il);
+        ggml_format_name(l.moe_map_hot,  "blk.%d.moe_map_hot",  il);
+        ggml_format_name(l.moe_map_cold, "blk.%d.moe_map_cold", il);
+    }
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (buf == nullptr) {
+        LLAMA_LOG_WARN("%s: pack allocation failed - expert cache disabled\n", __func__);
+        ggml_free(ctx);
+        for (int il : pack_layers) {
+            auto & l = layers[il];
+            l.ffn_gate_exps_hot = l.ffn_up_exps_hot = l.ffn_down_exps_hot = nullptr;
+            l.moe_map_hot = l.moe_map_cold = nullptr;
+        }
+        return;
+    }
+
+    // fill packs (expert dim is outermost: one contiguous slab per expert)
+    std::vector<uint8_t> slab;
+    std::vector<int32_t> map_hot, map_cold;
+    size_t total_bytes = 0;
+    for (int il : pack_layers) {
+        auto & l = layers[il];
+        const int64_t n_expert = l.ffn_gate_exps->ne[2];
+        const int64_t S = l.ffn_gate_exps_hot->ne[2];
+
+        std::vector<std::pair<int64_t, int32_t>> ranked; // (-count, expert)
+        for (const auto & [e, c] : freq[il]) {
+            if (e < n_expert) {
+                ranked.push_back({-c, e});
+            }
+        }
+        std::sort(ranked.begin(), ranked.end());
+
+        map_hot.assign(n_expert, -1);
+        map_cold.resize(n_expert);
+        for (int64_t e = 0; e < n_expert; e++) {
+            map_cold[e] = (int32_t) e;
+        }
+        for (int64_t s = 0; s < S && s < (int64_t) ranked.size(); s++) {
+            const int32_t e = ranked[s].second;
+            map_hot[e]  = (int32_t) s;
+            map_cold[e] = -1;
+            const ggml_tensor * srcs[3] = { l.ffn_gate_exps, l.ffn_up_exps, l.ffn_down_exps };
+            ggml_tensor * dsts[3] = { l.ffn_gate_exps_hot, l.ffn_up_exps_hot, l.ffn_down_exps_hot };
+            for (int t = 0; t < 3; t++) {
+                const size_t nb = srcs[t]->nb[2];
+                slab.resize(nb);
+                ggml_backend_tensor_get(srcs[t], slab.data(), e*nb, nb);
+                ggml_backend_tensor_set(dsts[t], slab.data(), s*nb, nb);
+                total_bytes += nb;
+            }
+        }
+        ggml_backend_tensor_set(l.moe_map_hot,  map_hot.data(),  0, n_expert*sizeof(int32_t));
+        ggml_backend_tensor_set(l.moe_map_cold, map_cold.data(), 0, n_expert*sizeof(int32_t));
+    }
+
+    pimpl->ctxs_bufs.emplace_back(ggml_context_ptr{ctx}, std::vector<ggml_backend_buffer_ptr>{});
+    pimpl->ctxs_bufs.back().second.emplace_back(buf);
+
+    LLAMA_LOG_INFO("%s: expert cache: %zu layers x %d slots, %.2f MiB uploaded to %s\n",
+        __func__, pack_layers.size(), n_slots, total_bytes/1024.0/1024.0, ggml_backend_buft_name(buft));
 }
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
