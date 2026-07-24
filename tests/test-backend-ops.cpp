@@ -4479,7 +4479,7 @@ struct test_mul_mat_id : public test_case {
         if (skip_ids) {
             // announce that ids may contain -1 so backends route around
             // kernels without skip support (mirrors llama's pack nodes)
-            ggml_set_op_params_i32(out, 0, 1);
+            out->op_params[0] = 1;
         }
 
         return out;
