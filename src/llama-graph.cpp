@@ -1926,7 +1926,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const bool use_moe_packs = moe_cache && moe_cache->moe_map_hot && !gate_up_exps &&
         !up_exps_s && !gate_exps_s && !down_exps_s;
     if (use_moe_packs) {
-        ggml_tensor * ids_flat = ggml_reshape_1d(ctx0, selected_experts, n_expert_used*n_tokens);
+        ggml_tensor * ids_flat = ggml_cont_1d(ctx0, selected_experts, n_expert_used*n_tokens); // topk ids are a strided view
         ids_hot  = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, moe_cache->moe_map_hot,  ids_flat), n_expert_used, n_tokens);
         ids_cold = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, moe_cache->moe_map_cold, ids_flat), n_expert_used, n_tokens);
         cb(ids_hot,  "ffn_moe_ids_hot",  il);
