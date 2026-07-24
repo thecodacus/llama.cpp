@@ -88,6 +88,11 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
             static_cast<int>(n_experts), static_cast<int>(n_tokens), static_cast<int>(n_expert_used), static_cast<int>(ne11), si1, sis1, /*write_inverse =*/ false, ctx.stream());
         CUDA_CHECK(cudaGetLastError());
 
+        // slots with expert id -1 (hot/cold expert split) are never scattered to; zero their dst rows
+        ggml_cuda_launch_mm_ids_zero_skipped_rows(ids_d, dst_d,
+            dst->ne[0], static_cast<int>(n_tokens), static_cast<int>(n_expert_used), si1, s1, s2, ctx.stream());
+        CUDA_CHECK(cudaGetLastError());
+
         ids_info.ids_src_compact   = ids_src_compact_dev.get();
         ids_info.ids_dst_compact   = ids_dst_compact_dev.get();
         ids_info.expert_bounds_dev = expert_bounds_dev.get();

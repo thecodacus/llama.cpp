@@ -200,6 +200,11 @@ void ggml_cuda_mul_mat_q(
         ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
             ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
         CUDA_CHECK(cudaGetLastError());
+
+        // slots with expert id -1 (hot/cold expert split) are never scattered to; zero their dst rows
+        ggml_cuda_launch_mm_ids_zero_skipped_rows((const int32_t *) ids->data, (float *) dst->data,
+            dst->ne[0], ne12, n_expert_used, si1, dst->nb[1]/sizeof(float), dst->nb[2]/sizeof(float), stream);
+        CUDA_CHECK(cudaGetLastError());
     }
 
     const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * y_block_size/y_values_per_block +

@@ -1,4 +1,5 @@
 #include "mmvq.cuh"
+#include "mmid.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -513,6 +514,9 @@ static __global__ void mul_mat_vec_q(
     uint32_t sample_dst;
 
     ggml_cuda_pdl_sync();
+    if (ncols_dst == 1 && ids && ids[channel_dst] < 0) {
+        return; // expert not owned by this pack; dst row pre-zeroed host-side
+    }
     channel_x  = ncols_dst == 1 && ids ? ids[channel_dst]                     : fastdiv(channel_dst, channel_ratio);
     channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
     sample_dst = blockIdx.z;
@@ -737,7 +741,11 @@ static __global__ void mul_mat_vec_q_moe(
     }
 
     ggml_cuda_pdl_sync();
-    const uint32_t channel_x = ids[channel_dst + token_idx * ids_stride];
+    const int32_t id_used = ids[channel_dst + token_idx * ids_stride];
+    if (id_used < 0) {
+        return; // expert not owned by this pack; dst row pre-zeroed host-side
+    }
+    const uint32_t channel_x = id_used;
     const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;
@@ -1174,6 +1182,14 @@ void ggml_cuda_mul_mat_vec_q(
 
     const float   * src1_d =       (const float   *) src1->data;
     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;
+
+    if (ids) {
+        // slots with expert id -1 (hot/cold expert split) are skipped by the kernels; zero their dst rows
+        ggml_cuda_launch_mm_ids_zero_skipped_rows(ids_d, (float *) dst->data,
+            dst->ne[0], ids->ne[1], ids->ne[0], ids->nb[1]/sizeof(int32_t),
+            dst->nb[1]/sizeof(float), dst->nb[2]/sizeof(float), ctx.stream());
+        CUDA_CHECK(cudaGetLastError());
+    }
     float         *  dst_d =       (float         *)  dst->data;
 
     ggml_cuda_mm_fusion_args_device fusion_local{};

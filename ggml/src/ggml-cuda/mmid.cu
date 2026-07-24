@@ -140,6 +140,35 @@ static void launch_mm_ids_helper(
         (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used_var, nchannels_y, si1, sis1, write_inverse);
 }
 
+// Zero the dst rows of (token, slot) pairs whose expert id is -1 ("expert not owned by
+// this pack", hot/cold expert split). The matrix multiplication kernels skip these slots
+// entirely, so without this the corresponding dst rows would contain garbage. With zeros
+// the outputs of multiple expert packs can be merged additively.
+static __global__ void mm_ids_zero_skipped_rows(
+        const int32_t * __restrict__ ids, float * __restrict__ dst, const int64_t ne0,
+        const int n_tokens, const int si1, const int64_t s_slot, const int64_t s_token) {
+    const int iex = blockIdx.y;
+    for (int it = blockIdx.z; it < n_tokens; it += gridDim.z) {
+        if (ids[it*si1 + iex] >= 0) {
+            continue;
+        }
+        float * dst_row = dst + it*s_token + iex*s_slot;
+        for (int64_t i = blockIdx.x*int64_t(blockDim.x) + threadIdx.x; i < ne0; i += int64_t(gridDim.x)*blockDim.x) {
+            dst_row[i] = 0.0f;
+        }
+    }
+}
+
+void ggml_cuda_launch_mm_ids_zero_skipped_rows(
+        const int32_t * ids, float * dst, const int64_t ne0, const int n_tokens, const int n_expert_used,
+        const int si1, const int64_t s_slot, const int64_t s_token, cudaStream_t stream) {
+    constexpr int block_size = 256;
+    const int blocks_x = (ne0 + block_size - 1) / block_size;
+    const dim3 num_blocks(blocks_x, n_expert_used, n_tokens < 65535 ? n_tokens : 65535);
+    const dim3 block_dims(block_size, 1, 1);
+    mm_ids_zero_skipped_rows<<<num_blocks, block_dims, 0, stream>>>(ids, dst, ne0, n_tokens, si1, s_slot, s_token);
+}
+
 void ggml_cuda_launch_mm_ids_helper(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
         const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int si1, const int sis1, const bool write_inverse, cudaStream_t stream) {
