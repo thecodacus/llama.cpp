@@ -4476,6 +4476,11 @@ struct test_mul_mat_id : public test_case {
 
         ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
         ggml_set_name(out, "out");
+        if (skip_ids) {
+            // announce that ids may contain -1 so backends route around
+            // kernels without skip support (mirrors llama's pack nodes)
+            ggml_set_op_params_i32(out, 0, 1);
+        }
 
         return out;
     }
