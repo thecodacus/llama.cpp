@@ -197,6 +197,9 @@ void ggml_cuda_mul_mat_q(
         // sentinel-fill: compact slots belonging to skipped ids (-1, hot/cold expert
         // split) are never written by mm_ids_helper; quantize kernels skip on i < 0
         CUDA_CHECK(cudaMemsetAsync(ids_src1.get(), 0xFF, ne_get_rows*sizeof(int32_t), stream));
+        // ids_dst tail likewise: unwritten compact slots must hold a safe row index,
+        // not pool garbage — tile-padded reads in the mm kernel touch them
+        CUDA_CHECK(cudaMemsetAsync(ids_dst.get(), 0, ne_get_rows*sizeof(int32_t), stream));
         const int si1  = ids->nb[1] / ggml_element_size(ids);
         const int sis1 = nb12 / nb11;
 
