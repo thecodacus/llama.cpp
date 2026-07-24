@@ -2,6 +2,7 @@
 #include "common.cuh"
 #include "unary.cuh"
 #include "mmvf.cuh"
+#include "mmid.cuh"
 #include "convert.cuh"
 
 template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false>
@@ -37,6 +38,10 @@ static __global__ void mul_mat_vec_f(
         channel_x  = ids ? ids[blockIdx.y + token_idx * ids_stride]            : fastdiv((uint32_t) channel_dst, channel_ratio);
         channel_y  = ids ? fastmodulo(blockIdx.y, nchannels_y)                 : channel_dst;
         sample_dst = ids ? 0                                                   : blockIdx.z;
+    }
+
+    if (ids && channel_x < 0) {
+        return; // expert not owned by this pack; dst row pre-zeroed host-side
     }
 
     const int sample_x    = fastdiv((uint32_t) sample_dst, sample_ratio);
@@ -651,6 +656,14 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
 
     const float   * src1_d =       (const float   *) src1->data;
     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;
+
+    if (ids) {
+        // slots with expert id -1 (hot/cold expert split) are skipped by the kernels; zero their dst rows
+        ggml_cuda_launch_mm_ids_zero_skipped_rows(ids_d, (float *) dst->data,
+            dst->ne[0], ids->ne[1], ids->ne[0], ids->nb[1]/sizeof(int32_t),
+            dst->nb[1]/sizeof(float), dst->nb[2]/sizeof(float), ctx.stream());
+        CUDA_CHECK(cudaGetLastError());
+    }
     float         *  dst_d =       (float         *)  dst->data;
 
     ggml_cuda_mm_fusion_args_device fusion_local{};
