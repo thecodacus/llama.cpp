@@ -8812,7 +8812,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 128, false, 8192, 2, 5120)); // Llama-4-Maverick-17B-128E-PAB-Q8_0
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 128, false, 8192, 1, 5120)); // Llama-4-Maverick-17B-128E-PAB-Q8_0
-
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 1, 5120, {128, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
+#endif
     // hot/cold expert-pack split: ids may be -1 ("expert not owned by this pack") and the
     // op must emit zero rows for those slots — cover mmvq (n=1), mmq (n=64), mmf (f16) and
     // the general fallback across quantized/float types
@@ -8821,9 +8823,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(ta, GGML_TYPE_F32, 16, 8, false, 256, 4, 256, /*skip_ids=*/true));
         test_cases.emplace_back(new test_mul_mat_id(ta, GGML_TYPE_F32, 16, 8, false, 256, 64, 256, /*skip_ids=*/true));
     }
-    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 1, 5120, {128, 1}, {1, 1}));
-    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
-#endif
 
     for (ggml_type type_a : all_types) {
         for (int i = 1; i < 10; ++i) {
