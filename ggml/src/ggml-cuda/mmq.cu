@@ -194,6 +194,9 @@ void ggml_cuda_mul_mat_q(
 
     {
         GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));
+        // sentinel-fill: compact slots belonging to skipped ids (-1, hot/cold expert
+        // split) are never written by mm_ids_helper; quantize kernels skip on i < 0
+        CUDA_CHECK(cudaMemsetAsync(ids_src1.get(), 0xFF, ne_get_rows*sizeof(int32_t), stream));
         const int si1  = ids->nb[1] / ggml_element_size(ids);
         const int sis1 = nb12 / nb11;
 
