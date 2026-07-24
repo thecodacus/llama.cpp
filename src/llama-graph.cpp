@@ -1771,7 +1771,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
-         ggml_tensor * selected_experts_in) const {
+         ggml_tensor * selected_experts_in,
+         const llama_layer * moe_cache) const {
     return build_moe_ffn(
         cur,
         gate_inp,  /* gate_inp_b  */ nullptr,
@@ -1793,7 +1794,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         gate_exps_s,
         down_exps_s,
         selected_experts_in
-    );
+    ,
+        moe_cache);
 }
 
 ggml_tensor * llm_graph_context::build_moe_ffn(
@@ -1820,7 +1822,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
-         ggml_tensor * selected_experts_in) const {
+         ggml_tensor * selected_experts_in,
+         const llama_layer * moe_cache) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
@@ -1917,6 +1920,28 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
     cb(selected_experts, "ffn_moe_topk", il);
 
+    // MoE expert cache: split routed ids into hot-pack ids and cold ids
+    ggml_tensor * ids_hot  = nullptr;
+    ggml_tensor * ids_cold = nullptr;
+    const bool use_moe_packs = moe_cache && moe_cache->moe_map_hot && !gate_up_exps &&
+        !up_exps_s && !gate_exps_s && !down_exps_s;
+    if (use_moe_packs) {
+        ids_hot  = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, moe_cache->moe_map_hot,  selected_experts), n_expert_used, n_tokens);
+        ids_cold = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, moe_cache->moe_map_cold, selected_experts), n_expert_used, n_tokens);
+        cb(ids_hot,  "ffn_moe_ids_hot",  il);
+        cb(ids_cold, "ffn_moe_ids_cold", il);
+    }
+
+    // dual mul_mat_id over hot pack (GPU) + cold originals; zero rows from the
+    // skipped (-1) side make the outputs sum to exactly the single-tensor result
+    auto build_packed_mm_id = [&](ggml_tensor * w_cold, ggml_tensor * w_hot, ggml_tensor * x) {
+        ggml_tensor * h = ggml_mul_mat_id(ctx0, w_hot, x, ids_hot);
+        h->op_params[0] = 1; // ids may contain -1
+        ggml_tensor * c = ggml_mul_mat_id(ctx0, w_cold, x, ids_cold);
+        c->op_params[0] = 1;
+        return ggml_add(ctx0, h, c);
+    };
+
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
         // TODO: Use scalar div instead when/if implemented
         ggml_tensor * f_sel = ggml_cast(ctx0, selected_experts, GGML_TYPE_F32);
@@ -1993,7 +2018,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(up, "ffn_moe_up", il);
     } else {
         // separate gate and up path
-        up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
+        up = use_moe_packs ? build_packed_mm_id(up_exps, moe_cache->ffn_up_exps_hot, cur)
+                           : build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
 
         if (up_exps_s) {
@@ -2006,7 +2032,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (gate_exps) {
-            cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
+            cur = use_moe_packs ? build_packed_mm_id(gate_exps, moe_cache->ffn_gate_exps_hot, cur)
+                                : build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
         } else {
             cur = up;
@@ -2095,7 +2122,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
-    experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
+    experts = use_moe_packs ? build_packed_mm_id(down_exps, moe_cache->ffn_down_exps_hot, cur)
+                            : build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
     cb(experts, "ffn_moe_down", il);
 
     if (down_exps_s) {
