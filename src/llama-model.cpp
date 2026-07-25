@@ -1755,7 +1755,21 @@ void llama_model_base::init_moe_expert_cache() {
 
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
     if (buf == nullptr) {
-        LLAMA_LOG_WARN("%s: pack allocation failed - expert cache disabled\n", __func__);
+        size_t need = 0;
+        for (int il : pack_layers) {
+            const auto & l = layers[il];
+            need += ggml_nbytes(l.ffn_gate_exps_hot) + ggml_nbytes(l.ffn_up_exps_hot) + ggml_nbytes(l.ffn_down_exps_hot)
+                  + ggml_nbytes(l.moe_map_hot) + ggml_nbytes(l.moe_map_cold);
+        }
+        size_t free_mem = 0, total_mem = 0;
+        ggml_backend_dev_memory(dev, &free_mem, &total_mem);
+        const size_t per_slot = need / std::max(1, n_slots);
+        const int    max_fit  = per_slot > 0 ? (int) (free_mem / per_slot) : 0;
+        LLAMA_LOG_WARN("%s: pack allocation failed - expert cache disabled "
+            "(%d slots need %.0f MiB, device has %.0f MiB free; ~%.0f MiB/slot -> at most %d slots fit, "
+            "and KV/compute buffers still allocate after this)\n",
+            __func__, n_slots, need/1024.0/1024.0, free_mem/1024.0/1024.0,
+            per_slot/1024.0/1024.0, max_fit);
         ggml_free(ctx);
         for (int il : pack_layers) {
             auto & l = layers[il];
