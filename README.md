@@ -40,6 +40,97 @@ Result: **~1143 → ~1880 t/s** prefill (**+64%**) — same GPU, same settings, 
 
 Branches: [`fable5/host-register`](https://github.com/thecodacus/llama.cpp/tree/fable5/host-register) (pinning only) · [`fable5/prefetch-experts`](https://github.com/thecodacus/llama.cpp/tree/fable5/prefetch-experts) (both — this branch).
 
+## ⚡ This fork — MoE expert cache (VRAM-resident hot experts)
+
+For MoE models whose routed experts live in system RAM (`--n-cpu-moe`), this fork can keep the
+most-frequently-routed experts of each layer **resident in VRAM**. Decode runs the hot experts on
+GPU and only the cold remainder on CPU; the two halves are merged exactly, so output is
+**bit-identical** to baseline. Opt-in, off by default.
+
+Measured on an RTX 3060 12GB (`-ngl 99 -ncmoe 99 -fa 1`):
+
+| Model | Baseline tg | Cached tg | Prefill |
+| --- | --- | --- | --- |
+| Qwen3.6-35B-A3B Q4_K_M (256 experts/layer) | 42.3 | **51.3 (+21%)** @ 124 slots | +14% |
+| — same, stacked with `--spec-type draft-mtp` | 41.7 | **69.3 (+66%)** @ 112 slots | — |
+| GLM-4.7-Flash Q4_K_M (64 experts/layer) | 32.1 | **46.3 (+44%)** @ 40 slots | +64% |
+| Laguna-S-2.1-118B-A8B IQ4_XS (256 experts/layer) | 11.5 | **12.1 (+5%)** @ 36 slots | +12% |
+
+Supported architectures: `qwen35moe`, `deepseek2`, `laguna` (plain fused-SILU gated expert FFN,
+separate gate/up/down tensors). Other architectures run unchanged.
+
+### Quick start
+
+**1. Capture a routing profile** (one time per model — records which experts the router picks):
+
+```bash
+MOE_TRACE_OUT=mymodel-code.csv ./build/bin/llama-moe-trace -m model.gguf \
+  -ngl 99 -ncmoe 99 -fa 1 -c 4096 -n 512 -p "<a code-flavored prompt>"
+
+MOE_TRACE_OUT=mymodel-chat.csv ./build/bin/llama-moe-trace -m model.gguf \
+  -ngl 99 -ncmoe 99 -fa 1 -c 4096 -n 512 -p "<a chat-flavored prompt>"
+
+cat mymodel-code.csv mymodel-chat.csv > mymodel-merged.csv
+```
+
+512 generated tokens per prompt is enough. Merge traces from contrasting workloads — a merged
+profile measures within 1% of per-workload specialist profiles, so one merged CSV per model is
+all you need.
+
+**2. Serve with the cache:**
+
+```bash
+./build/bin/llama-server -m model.gguf -ngl 99 -ncmoe 99 -fa 1 \
+  --moe-cache-profile mymodel-merged.csv --moe-cache-slots 112
+```
+
+Also works per model in a `--models-preset` INI section (`moe-cache-profile = ...`,
+`moe-cache-slots = ...`), and as env vars `LLAMA_ARG_MOE_CACHE_PROFILE` / `LLAMA_ARG_MOE_CACHE_SLOTS`
+(or legacy `GGML_MOE_CACHE_PROFILE` / `GGML_MOE_CACHE_SLOTS`, which `llama-bench` also accepts).
+
+**3. Confirm it engaged** — look for this line at load:
+
+```
+init_moe_expert_cache: expert cache: 40 layers x 112 slots, 8164.00 MiB uploaded to CUDA0
+```
+
+A warning instead of this line means the cache fell back to baseline (see Tuning).
+
+### Tuning
+
+- **`--moe-cache-slots` is the main knob** — experts cached per layer. Throughput rises with slot
+  count until the pack no longer fits in VRAM. The pack is all-or-nothing: an oversized request
+  logs `pack allocation failed - expert cache disabled` and runs at baseline speed (it does not
+  partially fill). The warning reports the per-slot cost and the maximum count that could fit —
+  set slots to that, minus headroom for KV/compute buffers which allocate afterwards.
+- **Fill VRAM to just under the ceiling, don't sweat the split.** Near the maximum, a marginal MB
+  is worth about the same as cache slots or as fully-resident layers (lower `--n-cpu-moe`).
+  Pure `-ncmoe 99` + max slots is the simple default; a hybrid (e.g. `-ncmoe 30` + fewer slots)
+  buys ~1% decode and ~3% prefill at best.
+- **Context size competes with the pack.** KV grows with `-c` and shrinks the viable slot count.
+  Compressing the KV cache (`-ctk`/`-ctv`, e.g. TurboQuant types) frees VRAM that converts
+  directly into slots — often worth more than the KV precision costs.
+- **Speculative decoding stacks multiplicatively.** `--spec-type draft-mtp` composes with the
+  cache (+48% cache × +12% MTP ≈ +66% on Qwen); reserve ~1 GB for the draft context by dropping
+  a few slots.
+- **Expert size decides the payoff.** Big experts (GLM: ~5 MiB each) gain the most per slot;
+  small experts need high slot counts before the win beats the dual-path overhead (~25% traffic
+  coverage is roughly break-even). If VRAM only fits <15% of the expert count, expect single-digit
+  gains (Laguna above).
+- **Profiles are model-specific, workload-tolerant.** A wrong-workload profile still helps
+  (+28% measured on Qwen worst-case) but loses about half the win; the merged profile recovers
+  nearly all of it. Regenerate only if your usage changes character entirely.
+
+### Troubleshooting
+
+| Symptom | Cause |
+| --- | --- |
+| `cannot open profile '...'` | Path not visible to the process (e.g. not mounted into the container). |
+| `pack allocation failed` | Slot count too big — read the fit math in the warning and reduce. |
+| `no CPU-resident MoE layers` | Experts are already on GPU (no `--n-cpu-moe`) — nothing to cache. |
+| No init line, no warning | Architecture not wired for the cache — model runs unchanged. |
+| Model loads, then context creation OOMs | Pack fits but KV/compute don't — drop a few slots or shrink/compress KV. |
+
 ## Recent API changes
 
 - [Changelog for `libllama` API](https://github.com/ggml-org/llama.cpp/issues/9289)
