@@ -332,6 +332,10 @@ extern "C" {
     GGML_API size_t                     ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);
 
     GGML_API void                 ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend);
+
+    // when enabled, CPU splits run on a worker thread so that independent splits
+    // on other backends execute concurrently with them
+    GGML_API void                 ggml_backend_sched_set_async_cpu(ggml_backend_sched_t sched, bool enable);
     GGML_API ggml_backend_t       ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node);
 
     // Split graph without allocating it

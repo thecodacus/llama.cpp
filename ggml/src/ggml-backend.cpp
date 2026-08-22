@@ -2063,10 +2063,6 @@ ggml_backend_sched_t ggml_backend_sched_new(
     // default of 3 covers the gate/up/down expert tensors of one MoE layer
     sched->prefetch_n_slots = prefetch_n_slots <= 1 ? 3 : std::min(prefetch_n_slots, GGML_SCHED_MAX_PREFETCH_SLOTS);
 
-    const char * GGML_SCHED_ASYNC_CPU = getenv("GGML_SCHED_ASYNC_CPU");
-    if (GGML_SCHED_ASYNC_CPU && atoi(GGML_SCHED_ASYNC_CPU) > 0) {
-        sched->cpu_async = new ggml_sched_cpu_async();
-    }
 
     ggml_backend_sched_reset(sched);
 
@@ -2190,6 +2186,17 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
     }
 
     return ggml_backend_sched_compute_splits(sched);
+}
+
+void ggml_backend_sched_set_async_cpu(ggml_backend_sched_t sched, bool enable) {
+    GGML_ASSERT(sched);
+    if (enable && sched->cpu_async == NULL) {
+        sched->cpu_async = new ggml_sched_cpu_async();
+    } else if (!enable && sched->cpu_async != NULL) {
+        sched->cpu_async->join();
+        delete sched->cpu_async;
+        sched->cpu_async = NULL;
+    }
 }
 
 void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {

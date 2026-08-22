@@ -2011,16 +2011,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
         // cold chain is built first so its nodes precede the hot chain in the
         // graph: the scheduler then emits [cold split, hot split] and, with
-        // GGML_SCHED_ASYNC_CPU, computes the cold chain on a worker while the
+        // async CPU splits, computes the cold chain on a worker while the
         // hot chain (which has no CPU inputs) runs concurrently on the GPU.
         // pinning the merge to CPU keeps it out of the hot split so the hot
         // split stays free of cross-backend inputs.
-        // 1 = worker + graph restructure (overlap); 2 = sched worker only (diagnostic)
-        static const bool sched_async_cpu = [] {
-            const char * v = getenv("GGML_SCHED_ASYNC_CPU");
-            return v && atoi(v) == 1;
-        }();
-
         ggml_tensor * cold = build_pack_chain(gate_exps, up_exps, down_exps, ids_cold);
         cb(cold, "ffn_moe_down_cold", il);
 
@@ -2029,7 +2023,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
         experts = ggml_add(ctx0, cold, hot);
         cb(experts, "ffn_moe_down", il);
-        if (sched_async_cpu) {
+        if (cparams.sched_async_cpu) {
             ggml_backend_sched_set_tensor_backend(sched, experts, backend_cpu);
         }
     } else if (gate_up_exps) {
