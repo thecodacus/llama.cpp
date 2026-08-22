@@ -53,6 +53,7 @@ Measured on an RTX 3060 12GB (`-ngl 99 -ncmoe 99 -fa 1`):
 | --- | --- | --- | --- |
 | Qwen3.6-35B-A3B Q4_K_M (256 experts/layer) | 42.3 | **51.3 (+21%)** @ 124 slots | +14% |
 | — same, stacked with `--spec-type draft-mtp` | 41.7 | **69.3 (+66%)** @ 112 slots | — |
+| — same, plus async CPU splits (default on) | 41.7 | **74.2 (+78%)** @ 88 slots | — |
 | GLM-4.7-Flash Q4_K_M (64 experts/layer) | 32.1 | **46.3 (+44%)** @ 40 slots | +64% |
 | Laguna-S-2.1-118B-A8B IQ4_XS (256 experts/layer) | 11.5 | **12.1 (+5%)** @ 36 slots | +12% |
 
@@ -103,6 +104,13 @@ A warning instead of this line means the cache fell back to baseline (see Tuning
   logs `pack allocation failed - expert cache disabled` and runs at baseline speed (it does not
   partially fill). The warning reports the per-slot cost and the maximum count that could fit —
   set slots to that, minus headroom for KV/compute buffers which allocate afterwards.
+- **The cold and hot chains overlap by default.** CPU graph splits run on a worker thread so the
+  GPU hot chain executes concurrently with the CPU cold chain (`--no-sched-async-cpu` to disable;
+  `llama-bench --sched-async-cpu 0,1` benches both). Worth +4-5% with speculative decoding, ~±2%
+  without it; outputs stay bit-identical either way.
+- **Leave ~900 MB of VRAM free beyond the pack.** A slot count that loads can still crash on the
+  first large prompt: runtime CUDA pool growth allocates beyond what the load-time check sees.
+  Size slots against the biggest prompt you will serve, not against "it loaded".
 - **Fill VRAM to just under the ceiling, don't sweat the split.** Near the maximum, a marginal MB
   is worth about the same as cache slots or as fully-resident layers (lower `--n-cpu-moe`).
   Pure `-ncmoe 99` + max slots is the simple default; a hybrid (e.g. `-ncmoe 30` + fewer slots)
