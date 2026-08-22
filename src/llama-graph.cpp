@@ -2015,9 +2015,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // hot chain (which has no CPU inputs) runs concurrently on the GPU.
         // pinning the merge to CPU keeps it out of the hot split so the hot
         // split stays free of cross-backend inputs.
+        // 1 = worker + graph restructure (overlap); 2 = sched worker only (diagnostic)
         static const bool sched_async_cpu = [] {
             const char * v = getenv("GGML_SCHED_ASYNC_CPU");
-            return v && atoi(v) > 0;
+            return v && atoi(v) == 1;
         }();
 
         ggml_tensor * cold = build_pack_chain(gate_exps, up_exps, down_exps, ids_cold);
