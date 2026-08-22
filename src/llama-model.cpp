@@ -1764,6 +1764,10 @@ void llama_model_base::init_moe_expert_cache() {
         }
         return;
     }
+    // weights usage pins the pack tensors to their backend during graph
+    // assignment - without it a CPU-assigned consumer can drag the hot
+    // matmuls (and a per-layer weight copy) onto the CPU
+    ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
     // fill packs (expert dim is outermost: one contiguous slab per expert)
     std::vector<uint8_t> slab;
