@@ -2023,7 +2023,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
         experts = ggml_add(ctx0, cold, hot);
         cb(experts, "ffn_moe_down", il);
-        if (cparams.sched_async_cpu) {
+        // decode-size batches only: for large (prefill) batches the CPU merge
+        // and its per-layer activation copies cost more than the overlap hides
+        if (cparams.sched_async_cpu && n_tokens <= 8) {
             ggml_backend_sched_set_tensor_backend(sched, experts, backend_cpu);
         }
     } else if (gate_up_exps) {
