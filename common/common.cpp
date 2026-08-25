@@ -1564,6 +1564,110 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;
 
+    // --cpu-tp: add the CPU as a tensor-parallel device and size the split to saturate VRAM.
+    // every weight matrix is split by rows; the meta device dispatches the GPU subgraph
+    // asynchronously before the CPU one, so the two backends compute concurrently.
+    if (params.cpu_tp) {
+        if (mparams.split_mode != LLAMA_SPLIT_MODE_TENSOR) {
+            LOG_WRN("%s: --cpu-tp requires --split-mode tensor, ignoring\n", __func__);
+        } else {
+            ggml_backend_load_all();
+
+            std::vector<ggml_backend_dev_t> devs;
+            for (ggml_backend_dev_t d : params.devices) {
+                if (d != nullptr && ggml_backend_dev_type(d) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    devs.push_back(d);
+                }
+            }
+            if (devs.empty()) {
+                for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                    ggml_backend_dev_t d = ggml_backend_dev_get(i);
+                    const enum ggml_backend_dev_type t = ggml_backend_dev_type(d);
+                    if (t == GGML_BACKEND_DEVICE_TYPE_GPU || t == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                        devs.push_back(d);
+                    }
+                }
+            }
+
+            ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+
+            size_t model_bytes = 0;
+            {
+                std::ifstream f(params.model.path, std::ios::binary | std::ios::ate);
+                if (f.good()) {
+                    model_bytes = (size_t) f.tellg();
+                }
+            }
+
+            if (cpu_dev == nullptr) {
+                LOG_WRN("%s: --cpu-tp: no CPU backend found, ignoring\n", __func__);
+            } else if (devs.empty()) {
+                LOG_WRN("%s: --cpu-tp: no GPU devices found, ignoring\n", __func__);
+            } else if (model_bytes == 0) {
+                LOG_WRN("%s: --cpu-tp: could not determine model size from '%s', ignoring\n",
+                        __func__, params.model.path.c_str());
+            } else if (devs.size() + 1 > llama_max_devices()) {
+                LOG_WRN("%s: --cpu-tp: too many devices, ignoring\n", __func__);
+            } else {
+                const size_t margin = (size_t) params.cpu_tp_margin * 1024 * 1024;
+
+                std::vector<size_t> budget(devs.size());
+                size_t budget_total = 0;
+                for (size_t i = 0; i < devs.size(); ++i) {
+                    size_t dev_free  = 0;
+                    size_t dev_total = 0;
+                    ggml_backend_dev_memory(devs[i], &dev_free, &dev_total);
+                    budget[i] = dev_free > margin ? dev_free - margin : 0;
+                    budget_total += budget[i];
+                }
+
+                if (budget_total >= model_bytes) {
+                    LOG_INF("%s: --cpu-tp: model (%.2f GiB) fits in VRAM (%.2f GiB usable), "
+                            "not adding the CPU\n", __func__,
+                            model_bytes / 1024.0 / 1024.0 / 1024.0,
+                            budget_total / 1024.0 / 1024.0 / 1024.0);
+                } else {
+                    const size_t cpu_bytes = model_bytes - budget_total;
+
+                    // relative weights; the meta device normalises by their sum
+                    for (size_t i = 0; i < devs.size(); ++i) {
+                        params.tensor_split[i] = (float) budget[i];
+                    }
+                    params.tensor_split[devs.size()] = (float) cpu_bytes;
+
+                    LOG_INF("%s: --cpu-tp: model %.2f GiB, splitting by rows across %zu device(s) + CPU:\n",
+                            __func__, model_bytes / 1024.0 / 1024.0 / 1024.0, devs.size());
+                    for (size_t i = 0; i < devs.size(); ++i) {
+                        LOG_INF("%s:   - %-8s %6.2f GiB (%4.1f%%)\n", __func__,
+                                ggml_backend_dev_name(devs[i]),
+                                budget[i] / 1024.0 / 1024.0 / 1024.0,
+                                100.0 * budget[i] / model_bytes);
+                    }
+                    LOG_INF("%s:   - %-8s %6.2f GiB (%4.1f%%)\n", __func__,
+                            ggml_backend_dev_name(cpu_dev),
+                            cpu_bytes / 1024.0 / 1024.0 / 1024.0,
+                            100.0 * cpu_bytes / model_bytes);
+
+                    // CPU goes last: the meta device launches each backend in order and only the
+                    // CPU backend blocks, so the GPU work is already in flight when it starts
+                    devs.push_back(cpu_dev);
+                    devs.push_back(nullptr);
+                    params.devices = devs;
+
+                    mparams.devices      = params.devices.data();
+                    mparams.tensor_split = params.tensor_split;
+
+                    // the split above is already sized to the measured free memory; let the
+                    // auto-fitter run and it would overwrite tensor_split with its own estimate
+                    if (params.fit_params) {
+                        LOG_INF("%s: --cpu-tp: disabling --fit, the split is sized explicitly\n", __func__);
+                        params.fit_params = false;
+                    }
+                }
+            }
+        }
+    }
+
     if (!params.moe_cache_profile.empty()) {
         mparams.moe_cache_profile = params.moe_cache_profile.c_str();
     }

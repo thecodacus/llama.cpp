@@ -587,6 +587,9 @@ struct common_params {
     std::string moe_cache_profile = ""; // MoE expert cache routing profile CSV (empty = disabled)
     int32_t     moe_cache_slots   = 0;  // MoE expert cache slots per layer (0 = disabled)
 
+    bool    cpu_tp        = false;      // include the CPU as a tensor-parallel device (--split-mode tensor)
+    int32_t cpu_tp_margin = 1024;       // MiB of VRAM to leave free per GPU for KV cache + compute buffers
+
     bool single_turn       = false; // single turn chat conversation
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
