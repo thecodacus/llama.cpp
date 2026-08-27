@@ -57,8 +57,68 @@ Measured on an RTX 3060 12GB (`-ngl 99 -ncmoe 99 -fa 1`):
 | GLM-4.7-Flash Q4_K_M (64 experts/layer) | 32.1 | **46.3 (+44%)** @ 40 slots | +64% |
 | Laguna-S-2.1-118B-A8B IQ4_XS (256 experts/layer) | 11.5 | **12.1 (+5%)** @ 36 slots | +12% |
 
-Supported architectures: `qwen35moe`, `deepseek2`, `laguna` (plain fused-SILU gated expert FFN,
+Supported architectures: `qwen35moe`, `deepseek2`, `laguna`, `qwen4exp` (plain fused-SILU gated expert FFN,
 separate gate/up/down tensors). Other architectures run unchanged.
+
+### Note for a future upstream sync (and one caveat on "bit-identical")
+
+**After syncing past ggml-org `ebb546b7e` (#26802, 2026-08-11), the pack chains trip a new
+assert.** That commit adds `ggml_cuda_mul_mat_id_needs_sync(dst, cc)` and asserts it at the
+single `mul_mat_id` caller. The cache sets `op_params[0] = 1` ("ids may contain -1"), which
+correctly disqualifies both the MMQ and MMF fast paths — so the op reaches the sync path — but
+the new predicate predates the flag and answers *"no sync needed"* for a small quantized batch.
+Result, on the first decode, every time:
+
+```
+ggml-cuda.cu:1948: GGML_ASSERT(ggml_cuda_mul_mat_id_needs_sync(dst, cc)) failed
+```
+
+Two lines, at the top of `ggml_cuda_mul_mat_id_needs_sync` — the caller has already established
+the fast paths are unavailable, so this agrees with it rather than overriding it:
+
+```c
+if (dst->op_params[0] != 0) {
+    return true;
+}
+```
+
+Not sent as a code PR because this branch does not carry `needs_sync` yet, so the patch has
+nothing to apply to. Ready when you take the sync:
+[`cpuchip/llama.cpp@threadchip/mul-mat-id-needs-sync-fix`](https://github.com/cpuchip/llama.cpp/tree/threadchip/mul-mat-id-needs-sync-fix).
+
+**The caveat:** on `qwen4exp` the cached output is **not** bit-identical to baseline. At
+temperature 0 it diverges from the uncached build — coherent, on-topic, consistent with a
+single argmax flip, which is what float non-associativity between one fused chain and two
+summed pack chains would produce. **Quality is unaffected, on two corpora with opposite signs**:
+paired over 64 chunks each, with the cached arm's peak VRAM (15,544 MiB vs 6,286) confirming
+it engaged rather than silently no-op'ing —
+
+| corpus | baseline PPL | cache-64 ΔPPL | t | detection floor |
+| --- | --- | --- | --- | --- |
+| technical prose (NASA SP-4205 OCR) | 8.2438 | **−0.047%** | −0.85 | 0.112% |
+| *Pride and Prejudice* | 1.0594 | +0.113% | +1.68 | 0.107% |
+
+Neither is detectable, and **the sign flips between corpora** — a real quality cost would keep
+its sign. The Austen row is included only for completeness: at PPL 1.06 the model is
+near-certain of every token, which we take as memorisation rather than a usable discriminator,
+and it is why the technical corpus was run as a control. The claim that holds on this architecture is *statistically indistinguishable*, not
+*bit-identical* — worth softening the wording above for architectures beyond the three you
+measured.
+
+### Measured on `qwen4exp` (Qwen3.8-Flash-Next, 177B, 512 experts/layer), single RTX 3090
+
+| arm | VRAM | decode |
+| --- | --- | --- |
+| `--n-cpu-moe 48`, no cache | 6,284 MiB | 16.00 tok/s |
+| `--n-cpu-moe 48` + `--moe-cache-slots 64` + profile | 15,522 MiB | **21.52 tok/s (+34.5%)** |
+| `--n-cpu-moe 40` (whole layers on GPU instead) | 18,784 MiB | 17.63 tok/s (+10%) |
+
+The comparison that surprised us: moving *whole layers* onto the card spent **12.5 GB to buy
+10%**, while the cache spent **9.2 GB to buy 34.5%** — because it picks hot experts across all
+48 layers rather than every expert of a few. Oracle hit rates from `llama-moe-trace` +
+`simulate.py`: 68.2% at 64 slots/layer, 88.0% at 128 (128 OOMs on 24 GB). We expected the
+routing to be too flat for a cache to help — 512 fine-grained experts with load balancing look
+designed against one — and it is not.
 
 ### Quick start
 
@@ -137,6 +197,7 @@ A warning instead of this line means the cache fell back to baseline (see Tuning
 | `pack allocation failed` | Slot count too big — read the fit math in the warning and reduce. |
 | `no CPU-resident MoE layers` | Experts are already on GPU (no `--n-cpu-moe`) — nothing to cache. |
 | No init line, no warning | Architecture not wired for the cache — model runs unchanged. |
+| `--moe-cache-slots` set but nothing changes | **No `--moe-cache-profile`.** `moe_map_hot` stays null, `use_moe_packs` is false, everything reports clean and tok/s reads as a small *regression*. VRAM is the only tell — it does not move a megabyte. |
 | Model loads, then context creation OOMs | Pack fits but KV/compute don't — drop a few slots or shrink/compress KV. |
 
 ## Recent API changes
