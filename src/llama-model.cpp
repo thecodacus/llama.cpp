@@ -1705,7 +1705,24 @@ void llama_model_base::init_moe_expert_cache() {
 
     ggml_backend_dev_t dev = nullptr;
     for (const auto & d : devices) {
-        if (!d.is_meta) { dev = d.dev; break; }
+        if (!d.is_meta && ggml_backend_dev_type(d.dev) == GGML_BACKEND_DEVICE_TYPE_GPU) { dev = d.dev; break; }
+    }
+    if (dev == nullptr) {
+        // fallback: enumerate every backend registry, including dynamically
+        // loaded ones (e.g. libggml-cuda) absent from the default registry
+        for (size_t r = 0; r < ggml_backend_reg_count() && dev == nullptr; ++r) {
+            auto * reg = ggml_backend_reg_get(r);
+            for (size_t i = 0; i < ggml_backend_reg_dev_count(reg); ++i) {
+                auto * d = ggml_backend_reg_dev_get(reg, i);
+                if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU) { dev = d; break; }
+            }
+        }
+        if (dev == nullptr) {
+            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                auto * d = ggml_backend_dev_get(i);
+                if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU) { dev = d; break; }
+            }
+        }
     }
     if (dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
         LLAMA_LOG_WARN("%s: no GPU device - expert cache disabled\n", __func__);
