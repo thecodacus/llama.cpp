@@ -2583,15 +2583,9 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
     return use_cuda_graph;
 }
 
-// the key identifies both the split (its first node) and the shapes it was called with.
-// a captured cuda graph hard-codes the shapes, so a caller that alternates shapes - a
-// speculative verify batch, for example - needs a separate instance per shape. with a
-// single key per split, every shape change resets the warmup and no graph is ever used.
-//
-// this stays O(1) on purpose: walking every node undoes the point of a cuda graph, which is
-// to not touch per-node data on the hot path. the first and last node carry the batch
-// dimension, which is what changes when a verify batch changes size. a shape this does not
-// separate just shares an entry and re-captures, exactly as before, so it can only help.
+// a captured graph hard-codes its shapes, so with one key per split an alternating shape
+// (a speculative verify batch) resets warmup forever. O(1) on purpose: walking nodes undoes the
+// point of a cuda graph. A shape this fails to separate re-captures as before, so it cannot regress.
 static uint64_t ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
     uint64_t key = (uint64_t) (uintptr_t) cgraph->nodes[0];
 

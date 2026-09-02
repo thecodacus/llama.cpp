@@ -1425,13 +1425,8 @@ struct ggml_backend_cuda_context {
     int curr_stream_no = 0;
 
 #ifdef USE_CUDA_GRAPH
-    // Map from graph key to cuda_graph - allows multiple graphs per context when the
-    // computation is split across CPU/GPU (e.g., with --n-cpu-moe), and when the same
-    // split is called with different tensor shapes (e.g. a speculative verify batch)
     std::unordered_map<uint64_t, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
 
-    // a cuda graph instance is only valid for the shapes it captured, so a caller that
-    // alternates shapes needs one instance per shape to stay on the graph path
     static const size_t max_cuda_graphs = 64;
 
     int64_t last_graph_eviction_sweep = 0;
@@ -1453,7 +1448,6 @@ struct ggml_backend_cuda_context {
 
         auto it = cuda_graphs.find(graph_key);
         if (it == cuda_graphs.end()) {
-            // a workload with many distinct shapes must not grow this without bound
             while (cuda_graphs.size() >= max_cuda_graphs) {
                 auto lru = cuda_graphs.begin();
                 for (auto c = cuda_graphs.begin(); c != cuda_graphs.end(); ++c) {
