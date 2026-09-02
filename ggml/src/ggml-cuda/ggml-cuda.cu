@@ -2587,6 +2587,11 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 // (a speculative verify batch) resets warmup forever. O(1) on purpose: walking nodes undoes the
 // point of a cuda graph. A shape this fails to separate re-captures as before, so it cannot regress.
 static uint64_t ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
+    // unlike the previous key this dereferences nodes[0], so an empty graph is not safe here
+    if (cgraph->n_nodes <= 0) {
+        return 0;
+    }
+
     uint64_t key = (uint64_t) (uintptr_t) cgraph->nodes[0];
 
     auto mix = [&key](uint64_t v) {
