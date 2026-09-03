@@ -483,14 +483,10 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -embd, --embeddings <0|1>                         (default: %s)\n", join(cmd_params_defaults.embeddings, ",").c_str());
     printf("  -ts, --tensor-split <ts0/ts1/..>                  (default: 0)\n");
     printf("  -ot --override-tensor <tensor name pattern>=<buffer type>;...\n");
-    printf("                                                    (default: disabled)
-");
-    printf("  -nopo, --no-op-offload <0|1>                      (default: 0)
-");
-    printf("  --sched-async-cpu <0|1>                           (default: 1)
-");
-    printf("  --no-host <0|1>                                   (default: %s)
-", join(cmd_params_defaults.no_host, ",").c_str());
+    printf("                                                    (default: disabled)\n");
+    printf("  -nopo, --no-op-offload <0|1>                      (default: 0)\n");
+    printf("  --sched-async-cpu <0|1>                           (default: 1)\n");
+    printf("  --no-host <0|1>                                   (default: %s)\n", join(cmd_params_defaults.no_host, ",").c_str());
     printf("\n");
     printf(
         "Multiple values can be given for each parameter by separating them with ','\n"
