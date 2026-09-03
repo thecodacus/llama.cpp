@@ -1892,11 +1892,16 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
         }
     }
 
-    if (ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[2], /*n_experts=*/src0->ne[2])) {
+    // ids containing -1 (hot/cold expert-pack split, op_params[0] != 0) are supported by the
+    // mmvq and general paths only; mmq/mmf are skipped, so those nodes take the syncing
+    // fallback and must not be captured in a CUDA graph. Mirrors ggml_cuda_mul_mat_id().
+    const bool ids_may_skip = dst->op_params[0] != 0;
+
+    if (!ids_may_skip && ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[2], /*n_experts=*/src0->ne[2])) {
         return false;
     }
 
-    if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
+    if (!ids_may_skip && ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
         return false;
     }
 
