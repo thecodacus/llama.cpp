@@ -120,6 +120,7 @@ class ModelBase:
     supports_mtp_export: bool = False
     mtp_only: bool = False
     no_mtp: bool = False
+    mtp_shared_embd: bool = False
 
     def __init__(self, dir_model: Path, ftype: gguf.LlamaFileType, fname_out: Path, *, is_big_endian: bool = False,
                  use_temp_file: bool = False, eager: bool = False,
@@ -1031,6 +1032,10 @@ class ModelBase:
         self.gguf_writer.add_type(gguf.GGUFType.MODEL)
 
     def prepare_metadata(self, vocab_only: bool):
+
+        # tells the loader they are missing on purpose
+        if self.mtp_only and self.mtp_shared_embd:
+            self.gguf_writer.add_nextn_shared_target_tensors(True)
 
         total_params, shared_params, expert_params, expert_count = self.gguf_writer.get_total_parameter_count()
 

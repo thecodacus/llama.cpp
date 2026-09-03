@@ -343,6 +343,8 @@ extern "C" {
         // MoE expert cache: keep the hottest routed experts per layer resident in GPU memory
         const char * moe_cache_profile; // routing profile CSV from llama-moe-trace (NULL = disabled)
         int32_t      moe_cache_slots;   // experts cached per layer (0 = disabled)
+        // target for a draft head that declares nextn_shared_target_tensors; must outlive this model
+        const struct llama_model * model_shared;
 
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
