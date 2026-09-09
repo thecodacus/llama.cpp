@@ -754,6 +754,7 @@ struct llama_model_base : public llama_model {
     // stable per-layer userdata for the ring prefetch graph node
     struct moe_prefetch_ud { llama_model_base * model; int il; };
     std::vector<moe_prefetch_ud> moe_prefetch_ud_slots;
+    ggml_backend_t        moe_copy_backend = nullptr; // dedicated stream for ring refills
     ggml_backend_buffer_t moe_stage_buf  = nullptr;   // pinned staging for ring refills
     size_t                moe_stage_size = 0;
     int  moe_cache_prefetch(int il, const int32_t * ids, int n_ids);

@@ -1677,7 +1677,7 @@ int llama_model_base::moe_cache_prefetch(int il, const int32_t * ids, int n_ids)
 
     // profiling: LLAMA_MOE_RING_PROFILE=1 prints where the refill time goes
     static const bool prof = getenv("LLAMA_MOE_RING_PROFILE") != nullptr;
-    static int64_t p_get = 0, p_set = 0, p_map = 0, p_all = 0;
+    static int64_t p_get = 0, p_set = 0, p_map = 0, p_all = 0, p_sync = 0;
     static int64_t p_calls = 0, p_pulls = 0, p_skips = 0, p_bytes = 0;
     const int64_t t_all0 = prof ? ggml_time_us() : 0;
 
@@ -1698,6 +1698,16 @@ int llama_model_base::moe_cache_prefetch(int il, const int32_t * ids, int n_ids)
             moe_stage_buf = ggml_backend_buft_alloc_buffer(hbuft, need);
         }
         moe_stage_size = need;
+
+        // a separate backend gives the refills their own stream, so the copies
+        // pipeline against each other and against compute instead of the caller
+        // blocking once per tensor
+        if (sdev != nullptr) {
+            moe_copy_backend = ggml_backend_dev_init(sdev, nullptr);
+        }
+        if (moe_copy_backend == nullptr) {
+            LLAMA_LOG_WARN("%s: no copy stream available - ring refills will block\n", __func__);
+        }
     }
     uint8_t * stage = moe_stage_buf ? (uint8_t *) ggml_backend_buffer_get_base(moe_stage_buf) : nullptr;
 
@@ -1735,7 +1745,11 @@ int llama_model_base::moe_cache_prefetch(int il, const int32_t * ids, int n_ids)
                 src_host = slab.data();
             }
             const int64_t t1 = prof ? ggml_time_us() : 0;
-            ggml_backend_tensor_set(dsts[t], src_host, slot*nb, nb);
+            if (moe_copy_backend != nullptr) {
+                ggml_backend_tensor_set_async(moe_copy_backend, dsts[t], src_host, slot*nb, nb);
+            } else {
+                ggml_backend_tensor_set(dsts[t], src_host, slot*nb, nb);
+            }
             if (prof) { p_get += t1 - t0; p_set += ggml_time_us() - t1; p_bytes += nb; }
         }
 
@@ -1746,6 +1760,11 @@ int llama_model_base::moe_cache_prefetch(int il, const int32_t * ids, int n_ids)
     }
 
     if (n_copied > 0) {
+        const int64_t t_s0 = prof ? ggml_time_us() : 0;
+        if (moe_copy_backend != nullptr) {
+            ggml_backend_synchronize(moe_copy_backend);
+        }
+        if (prof) { p_sync += ggml_time_us() - t_s0; }
         const int64_t t_m0 = prof ? ggml_time_us() : 0;
         ggml_backend_tensor_set(l.moe_map_hot,  l.moe_map_hot_host.data(),  0, n_expert*sizeof(int32_t));
         ggml_backend_tensor_set(l.moe_map_cold, l.moe_map_cold_host.data(), 0, n_expert*sizeof(int32_t));
@@ -1758,9 +1777,9 @@ int llama_model_base::moe_cache_prefetch(int il, const int32_t * ids, int n_ids)
         if (++p_calls % 4000 == 0) {          // ~100 tokens at 40 layers
             const double tok = (double) p_calls / (double) layers.size();
             LLAMA_LOG_INFO("moe-ring-profile: %.0f tokens | pulls %.2f/tok skips %.2f/tok | "
-                           "total %.3f ms/tok = host-read %.3f + dma %.3f + maps %.3f | %.1f MB/tok\n",
+                           "total %.3f ms/tok = host-read %.3f + issue %.3f + sync %.3f + maps %.3f | %.1f MB/tok\n",
                            tok, p_pulls/tok, p_skips/tok,
-                           p_all/1000.0/tok, p_get/1000.0/tok, p_set/1000.0/tok,
+                           p_all/1000.0/tok, p_get/1000.0/tok, p_set/1000.0/tok, p_sync/1000.0/tok,
                            p_map/1000.0/tok,
                            p_bytes/1048576.0/tok);
         }
