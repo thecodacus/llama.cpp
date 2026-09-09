@@ -1682,6 +1682,24 @@ int llama_model_base::moe_cache_prefetch(int il, const int32_t * ids, int n_ids)
     const int64_t t_all0 = prof ? ggml_time_us() : 0;
 
     int n_copied = 0;
+
+    // pinned staging buffer: pageable transfers run at ~13 GB/s on this link,
+    // page-locked ones at ~25 GB/s, and the copy into it costs far less than
+    // the bandwidth it recovers
+    if (moe_stage_buf == nullptr) {
+        size_t need = 0;
+        for (int t = 0; t < 3; t++) {
+            need = std::max(need, srcs[t]->nb[2]);
+        }
+        ggml_backend_dev_t sdev = ggml_backend_buffer_get_device(l.ffn_gate_exps_hot->buffer);
+        ggml_backend_buffer_type_t hbuft = sdev ? ggml_backend_dev_host_buffer_type(sdev) : nullptr;
+        if (hbuft) {
+            moe_stage_buf = ggml_backend_buft_alloc_buffer(hbuft, need);
+        }
+        moe_stage_size = need;
+    }
+    uint8_t * stage = moe_stage_buf ? (uint8_t *) ggml_backend_buffer_get_base(moe_stage_buf) : nullptr;
+
     std::vector<uint8_t> slab;
     for (int i = 0; i < n_ids; i++) {
         const int32_t e = ids[i];
@@ -1700,26 +1718,37 @@ int llama_model_base::moe_cache_prefetch(int il, const int32_t * ids, int n_ids)
         if (victim >= 0) {
             l.moe_map_hot_host [victim] = -1;
             l.moe_map_cold_host[victim] = victim;
-            ggml_backend_tensor_set(l.moe_map_hot,  &l.moe_map_hot_host [victim], victim*sizeof(int32_t), sizeof(int32_t));
-            ggml_backend_tensor_set(l.moe_map_cold, &l.moe_map_cold_host[victim], victim*sizeof(int32_t), sizeof(int32_t));
         }
 
         for (int t = 0; t < 3; t++) {
             const size_t nb = srcs[t]->nb[2];
             slab.resize(nb);
             const int64_t t0 = prof ? ggml_time_us() : 0;
-            ggml_backend_tensor_get(srcs[t], slab.data(), e*nb, nb);
+            uint8_t * src_host = stage;
+            if (stage != nullptr && nb <= moe_stage_size) {
+                // the expert weights are host-resident, so read straight from them
+                memcpy(stage, (const uint8_t *) srcs[t]->data + e*nb, nb);
+            } else {
+                slab.resize(nb);
+                ggml_backend_tensor_get(srcs[t], slab.data(), e*nb, nb);
+                src_host = slab.data();
+            }
             const int64_t t1 = prof ? ggml_time_us() : 0;
-            ggml_backend_tensor_set(dsts[t], slab.data(), slot*nb, nb);
+            ggml_backend_tensor_set(dsts[t], src_host, slot*nb, nb);
             if (prof) { p_get += t1 - t0; p_set += ggml_time_us() - t1; p_bytes += nb; }
         }
 
         l.moe_ring_expert[slot - l.moe_ring_base] = e;
         l.moe_map_hot_host [e] = slot;
         l.moe_map_cold_host[e] = -1;
-        ggml_backend_tensor_set(l.moe_map_hot,  &l.moe_map_hot_host [e], e*sizeof(int32_t), sizeof(int32_t));
-        ggml_backend_tensor_set(l.moe_map_cold, &l.moe_map_cold_host[e], e*sizeof(int32_t), sizeof(int32_t));
         n_copied++;
+    }
+
+    if (n_copied > 0) {
+        const int64_t t_m0 = prof ? ggml_time_us() : 0;
+        ggml_backend_tensor_set(l.moe_map_hot,  l.moe_map_hot_host.data(),  0, n_expert*sizeof(int32_t));
+        ggml_backend_tensor_set(l.moe_map_cold, l.moe_map_cold_host.data(), 0, n_expert*sizeof(int32_t));
+        if (prof) { p_map += ggml_time_us() - t_m0; }
     }
 
     if (prof) {
@@ -1731,7 +1760,7 @@ int llama_model_base::moe_cache_prefetch(int il, const int32_t * ids, int n_ids)
                            "total %.3f ms/tok = host-read %.3f + dma %.3f + maps %.3f | %.1f MB/tok\n",
                            tok, p_pulls/tok, p_skips/tok,
                            p_all/1000.0/tok, p_get/1000.0/tok, p_set/1000.0/tok,
-                           (p_all - p_get - p_set)/1000.0/tok,
+                           p_map/1000.0/tok,
                            p_bytes/1048576.0/tok);
         }
     }
