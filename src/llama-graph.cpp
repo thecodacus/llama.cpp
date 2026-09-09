@@ -1773,9 +1773,12 @@ static void llm_moe_prefetch_op(struct ggml_tensor * dst, const struct ggml_tens
     }
     ud->model->moe_cache_prefetch(ud->il, ids.data(), n_ids);
 
-    // the prefetch mutated the map in place on the device; mirror the host copy out
+    // publish both maps as this node's output: the hot and cold lookups read views
+    // of it, which orders them after the refill
     const auto & l = ud->model->layers[ud->il];
-    memcpy(dst->data, l.moe_map_hot_host.data(), ggml_nbytes(dst));
+    const size_t half = l.moe_map_hot_host.size()*sizeof(int32_t);
+    memcpy((char *) dst->data,        l.moe_map_hot_host.data(),  half);
+    memcpy((char *) dst->data + half, l.moe_map_cold_host.data(), half);
     GGML_UNUSED(map_hot);
 }
 
@@ -1962,16 +1965,20 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // Dynamic ring: refresh residency from the speculative router before the
         // map is read. Expressed as a CPU graph node rather than an eval callback
         // so CUDA graphs and the scheduler's own prefetch path stay enabled.
-        ggml_tensor * map_hot = moe_cache->moe_map_hot;
-        if (moe_spec_ids != nullptr && moe_cache->moe_ring_size > 0 &&
+        ggml_tensor * map_hot  = moe_cache->moe_map_hot;
+        ggml_tensor * map_cold = moe_cache->moe_map_cold;
+        if (moe_spec_ids != nullptr && moe_cache->moe_ring_size > 0 && moe_cache->moe_map_both != nullptr &&
                 moe_cache->moe_prefetch_ud_ptr != nullptr && n_tokens == 1) {
-            map_hot = ggml_map_custom2(ctx0, map_hot, moe_spec_ids, llm_moe_prefetch_op, 1,
-                                       moe_cache->moe_prefetch_ud_ptr);
-            cb(map_hot, "ffn_moe_map_hot_live", il);
+            ggml_tensor * both = ggml_map_custom2(ctx0, moe_cache->moe_map_both, moe_spec_ids, llm_moe_prefetch_op, 1,
+                                                  moe_cache->moe_prefetch_ud_ptr);
+            cb(both, "ffn_moe_map_live", il);
+            const int64_t ne = both->ne[1] / 2;
+            map_hot  = ggml_view_2d(ctx0, both, 1, ne, both->nb[1], 0);
+            map_cold = ggml_view_2d(ctx0, both, 1, ne, both->nb[1], ne*both->nb[1]);
         }
 
         ids_hot  = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, map_hot,  ids_flat), n_expert_used, n_tokens);
-        ids_cold = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, moe_cache->moe_map_cold, ids_flat), n_expert_used, n_tokens);
+        ids_cold = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, map_cold, ids_flat), n_expert_used, n_tokens);
         cb(ids_hot,  "ffn_moe_ids_hot",  il);
         cb(ids_cold, "ffn_moe_ids_cold", il);
     }

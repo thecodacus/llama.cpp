@@ -312,6 +312,7 @@ struct llama_layer {
     struct ggml_tensor * ffn_up_exps_hot   = nullptr;
     struct ggml_tensor * moe_map_hot       = nullptr; // i32[n_expert]: pack slot or -1
     struct ggml_tensor * moe_map_cold      = nullptr; // i32[n_expert]: global id or -1
+    struct ggml_tensor * moe_map_both      = nullptr; // i32[2*n_expert]: hot map then cold map, input of the ring refill node
 
     // dynamic ring: pack slots [moe_ring_base, moe_ring_base + moe_ring_size) are
     // refilled at runtime from the speculative router's predictions, the slots
@@ -757,6 +758,7 @@ struct llama_model_base : public llama_model {
     ggml_backend_t        moe_copy_backend = nullptr; // dedicated stream for ring refills
     ggml_backend_buffer_t moe_stage_buf  = nullptr;   // pinned staging for ring refills
     size_t                moe_stage_size = 0;
+    size_t                moe_stage_region = 0; // bytes per staging region
     int  moe_cache_prefetch(int il, const int32_t * ids, int n_ids);
 
     // model must define these
