@@ -1675,6 +1675,12 @@ int llama_model_base::moe_cache_prefetch(int il, const int32_t * ids, int n_ids)
     ggml_tensor       * dsts[3] = { l.ffn_gate_exps_hot, l.ffn_up_exps_hot, l.ffn_down_exps_hot };
     const int64_t n_expert = l.ffn_gate_exps->ne[2];
 
+    // profiling: LLAMA_MOE_RING_PROFILE=1 prints where the refill time goes
+    static const bool prof = getenv("LLAMA_MOE_RING_PROFILE") != nullptr;
+    static int64_t p_get = 0, p_set = 0, p_map = 0, p_all = 0;
+    static int64_t p_calls = 0, p_pulls = 0, p_skips = 0, p_bytes = 0;
+    const int64_t t_all0 = prof ? ggml_time_us() : 0;
+
     int n_copied = 0;
     std::vector<uint8_t> slab;
     for (int i = 0; i < n_ids; i++) {
@@ -1683,6 +1689,7 @@ int llama_model_base::moe_cache_prefetch(int il, const int32_t * ids, int n_ids)
             continue;
         }
         if (l.moe_map_hot_host[e] >= 0) {
+            if (prof) { p_skips++; }
             continue;                       // already resident, nothing to do
         }
 
@@ -1700,8 +1707,11 @@ int llama_model_base::moe_cache_prefetch(int il, const int32_t * ids, int n_ids)
         for (int t = 0; t < 3; t++) {
             const size_t nb = srcs[t]->nb[2];
             slab.resize(nb);
+            const int64_t t0 = prof ? ggml_time_us() : 0;
             ggml_backend_tensor_get(srcs[t], slab.data(), e*nb, nb);
+            const int64_t t1 = prof ? ggml_time_us() : 0;
             ggml_backend_tensor_set(dsts[t], slab.data(), slot*nb, nb);
+            if (prof) { p_get += t1 - t0; p_set += ggml_time_us() - t1; p_bytes += nb; }
         }
 
         l.moe_ring_expert[slot - l.moe_ring_base] = e;
@@ -1710,6 +1720,20 @@ int llama_model_base::moe_cache_prefetch(int il, const int32_t * ids, int n_ids)
         ggml_backend_tensor_set(l.moe_map_hot,  &l.moe_map_hot_host [e], e*sizeof(int32_t), sizeof(int32_t));
         ggml_backend_tensor_set(l.moe_map_cold, &l.moe_map_cold_host[e], e*sizeof(int32_t), sizeof(int32_t));
         n_copied++;
+    }
+
+    if (prof) {
+        p_all += ggml_time_us() - t_all0;
+        p_pulls += n_copied;
+        if (++p_calls % 4000 == 0) {          // ~100 tokens at 40 layers
+            const double tok = (double) p_calls / (double) layers.size();
+            LLAMA_LOG_INFO("moe-ring-profile: %.0f tokens | pulls %.2f/tok skips %.2f/tok | "
+                           "total %.3f ms/tok = host-read %.3f + dma %.3f + maps %.3f | %.1f MB/tok\n",
+                           tok, p_pulls/tok, p_skips/tok,
+                           p_all/1000.0/tok, p_get/1000.0/tok, p_set/1000.0/tok,
+                           (p_all - p_get - p_set)/1000.0/tok,
+                           p_bytes/1048576.0/tok);
+        }
     }
     return n_copied;
 }
