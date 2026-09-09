@@ -759,6 +759,7 @@ struct llama_model_base : public llama_model {
     ggml_backend_buffer_t moe_stage_buf  = nullptr;   // pinned staging for ring refills
     size_t                moe_stage_size = 0;
     size_t                moe_stage_region = 0; // bytes per staging region
+    bool                  moe_src_pinned = false; // cold experts already page-locked: DMA in place
     int  moe_cache_prefetch(int il, const int32_t * ids, int n_ids);
 
     // model must define these

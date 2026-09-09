@@ -1713,6 +1713,14 @@ int llama_model_base::moe_cache_prefetch(int il, const int32_t * ids, int n_ids)
         if (moe_copy_backend == nullptr) {
             LLAMA_LOG_WARN("%s: no copy stream available - ring refills will block\n", __func__);
         }
+
+        // is the cold-expert memory already pinned? then skip staging entirely
+        moe_src_pinned = hbuft != nullptr && l.ffn_gate_exps->buffer != nullptr &&
+                         ggml_backend_buffer_get_type(l.ffn_gate_exps->buffer) == hbuft &&
+                         ggml_backend_buffer_get_type(l.ffn_up_exps->buffer)   == hbuft &&
+                         ggml_backend_buffer_get_type(l.ffn_down_exps->buffer) == hbuft;
+        LLAMA_LOG_INFO("%s: ring refill source is %s host memory\n", __func__,
+                       moe_src_pinned ? "pinned - copying in place" : "pageable - staging through a pinned buffer");
     }
     uint8_t * stage = moe_stage_buf ? (uint8_t *) ggml_backend_buffer_get_base(moe_stage_buf) : nullptr;
     int n_staged = 0;
@@ -1743,7 +1751,12 @@ int llama_model_base::moe_cache_prefetch(int il, const int32_t * ids, int n_ids)
             slab.resize(nb);
             const int64_t t0 = prof ? ggml_time_us() : 0;
             uint8_t * src_host = nullptr;
-            if (stage != nullptr && nb <= moe_stage_region && n_staged < 3*STAGE_EXPERTS) {
+            if (moe_src_pinned) {
+                // the expert weights already live in page-locked host memory
+                // (--no-mmap puts CPU-offloaded weights in the device host buffer),
+                // so the DMA can read them in place: no staging copy at all
+                src_host = (uint8_t *) srcs[t]->data + e*nb;
+            } else if (stage != nullptr && nb <= moe_stage_region && n_staged < 3*STAGE_EXPERTS) {
                 src_host = stage + (size_t) n_staged * moe_stage_region;
                 n_staged++;
                 memcpy(src_host, (const uint8_t *) srcs[t]->data + e*nb, nb);
