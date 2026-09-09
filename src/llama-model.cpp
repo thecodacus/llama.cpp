@@ -1691,7 +1691,8 @@ int llama_model_base::moe_cache_prefetch(int il, const int32_t * ids, int n_ids)
         for (int t = 0; t < 3; t++) {
             need = std::max(need, srcs[t]->nb[2]);
         }
-        ggml_backend_dev_t sdev = ggml_backend_buffer_get_device(l.ffn_gate_exps_hot->buffer);
+        ggml_backend_buffer_type_t sbuft = ggml_backend_buffer_get_type(l.ffn_gate_exps_hot->buffer);
+        ggml_backend_dev_t sdev = sbuft ? ggml_backend_buft_get_device(sbuft) : nullptr;
         ggml_backend_buffer_type_t hbuft = sdev ? ggml_backend_dev_host_buffer_type(sdev) : nullptr;
         if (hbuft) {
             moe_stage_buf = ggml_backend_buft_alloc_buffer(hbuft, need);
