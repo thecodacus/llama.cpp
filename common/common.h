@@ -586,6 +586,7 @@ struct common_params {
 
     std::string moe_cache_profile = ""; // MoE expert cache routing profile CSV (empty = disabled)
     int32_t     moe_cache_slots   = 0;  // MoE expert cache slots per layer (0 = disabled)
+    int32_t     moe_cache_ring    = 0;  // dynamic ring slots per layer refilled by the speculative router
 
     bool single_turn       = false; // single turn chat conversation
 

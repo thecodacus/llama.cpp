@@ -1883,6 +1883,13 @@ void llama_model_base::init_moe_expert_cache() {
         l.moe_map_cold_host = map_cold;
     }
 
+    // stable userdata for the prefetch graph node, one entry per layer
+    moe_prefetch_ud_slots.resize(layers.size());
+    for (size_t i = 0; i < layers.size(); i++) {
+        moe_prefetch_ud_slots[i].model = this;
+        moe_prefetch_ud_slots[i].il    = (int) i;
+    }
+
     pimpl->ctxs_bufs.emplace_back(ggml_context_ptr{ctx}, std::vector<ggml_backend_buffer_ptr>{});
     pimpl->ctxs_bufs.back().second.emplace_back(buf);
 

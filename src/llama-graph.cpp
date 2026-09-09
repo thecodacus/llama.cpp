@@ -1752,6 +1752,30 @@ ggml_tensor * llm_graph_context::build_ffn(
     return cur;
 }
 
+
+// Runs on the CPU during graph execution: pull any predicted expert that is not
+// already resident into the layer's ring, then publish the refreshed hot map as
+// this node's output so the consuming get_rows is ordered after it.
+static void llm_moe_prefetch_op(struct ggml_tensor * dst, const struct ggml_tensor * map_hot,
+                                const struct ggml_tensor * spec_ids, int ith, int nth, void * userdata) {
+    GGML_UNUSED(nth);
+    if (ith != 0) {
+        return;
+    }
+    auto * ud = (llama_model_base::moe_prefetch_ud *) userdata;
+
+    // only the first token's predictions are acted on: at decode there is one,
+    // and during prefill the routing is too broad for a ring to help
+    const int32_t * ids = (const int32_t *) spec_ids->data;
+    const int n_ids = (int) spec_ids->ne[0];
+    ud->model->moe_cache_prefetch(ud->il, ids, n_ids);
+
+    // the prefetch mutated the map in place on the device; mirror the host copy out
+    const auto & l = ud->model->layers[ud->il];
+    memcpy(dst->data, l.moe_map_hot_host.data(), ggml_nbytes(dst));
+    GGML_UNUSED(map_hot);
+}
+
 ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * cur,
          ggml_tensor * gate_inp,
@@ -1931,7 +1955,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         (il < 0 || hparams.swiglu_clamp_exp[il] <= 1e-6f);
     if (use_moe_packs) {
         ggml_tensor * ids_flat = ggml_cont_1d(ctx0, selected_experts, n_expert_used*n_tokens); // topk ids are a strided view
-        ids_hot  = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, moe_cache->moe_map_hot,  ids_flat), n_expert_used, n_tokens);
+
+        // Dynamic ring: refresh residency from the speculative router before the
+        // map is read. Expressed as a CPU graph node rather than an eval callback
+        // so CUDA graphs and the scheduler's own prefetch path stay enabled.
+        ggml_tensor * map_hot = moe_cache->moe_map_hot;
+        if (moe_spec_ids != nullptr && moe_cache->moe_ring_size > 0 && il >= 0 &&
+                il < (int) model.moe_prefetch_ud_slots.size() && n_tokens == 1) {
+            map_hot = ggml_map_custom2(ctx0, map_hot, moe_spec_ids, llm_moe_prefetch_op, 1,
+                                       (void *) &model.moe_prefetch_ud_slots[il]);
+            cb(map_hot, "ffn_moe_map_hot_live", il);
+        }
+
+        ids_hot  = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, map_hot,  ids_flat), n_expert_used, n_tokens);
         ids_cold = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, moe_cache->moe_map_cold, ids_flat), n_expert_used, n_tokens);
         cb(ids_hot,  "ffn_moe_ids_hot",  il);
         cb(ids_cold, "ffn_moe_ids_cold", il);

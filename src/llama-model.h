@@ -750,6 +750,9 @@ struct llama_model_base : public llama_model {
     // GGML_MOE_CACHE_PROFILE + GGML_MOE_CACHE_SLOTS: build GPU-resident hot
     // expert packs for CPU-offloaded MoE layers (see llama_layer::*_exps_hot)
     void init_moe_expert_cache();
+    // stable per-layer userdata for the ring prefetch graph node
+    struct moe_prefetch_ud { llama_model_base * model; int il; };
+    std::vector<moe_prefetch_ud> moe_prefetch_ud_slots;
     int  moe_cache_prefetch(int il, const int32_t * ids, int n_ids);
 
     // model must define these

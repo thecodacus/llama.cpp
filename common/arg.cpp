@@ -2638,6 +2638,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.moe_cache_slots = value;
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_SLOTS"));
+    add_opt(common_arg(
+        {"--moe-cache-ring"}, "N",
+        "dynamic expert cache slots per layer, refilled at runtime from the speculative\n"
+        "pre-attention router (default: 0 = fully static cache)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_cache_ring = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_RING"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",

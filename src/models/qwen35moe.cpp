@@ -196,6 +196,9 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
                 ggml_tensor * spec_id = ggml_argsort_top_k(ctx0, spec_lg, spec_k);
                 cb(spec_id, "ffn_moe_spec_topk", il);
                 ggml_build_forward_expand(gf, spec_id);
+                moe_spec_ids = spec_id;   // consumed by build_moe_ffn to drive the ring
+            } else {
+                moe_spec_ids = nullptr;
             }
         }
 

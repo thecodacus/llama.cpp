@@ -998,6 +998,10 @@ struct llm_graph_context {
                      int   il) const;
 
     // build MoE FFN without bias tensors
+    // speculative (pre-attention) expert ids for the current layer, if the
+    // arch builder produced them; consumed by build_moe_ffn to drive the ring
+    mutable ggml_tensor * moe_spec_ids = nullptr;
+
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
              ggml_tensor * gate_inp,
