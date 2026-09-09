@@ -18,6 +18,7 @@
 #include "llama.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -27,14 +28,58 @@ struct trace_ctx {
     int      pos       = 0;     // current decode position (negative = prefill)
     bool     in_prompt = true;
     std::vector<int32_t> buf;
+
+    // optional hidden-state capture, for offline router-prediction experiments.
+    // records: pos(i32) layer(i32) tag(i32) n_embd(i32) then n_embd f32 values.
+    // tag 0 = l_out (layer output = next layer's pre-attention input)
+    //     1 = attn_residual (h + attn, pre-norm)
+    //     2 = attn_post_norm (the actual router input)
+    FILE * hid       = nullptr;
+    int    hid_limit = 0;       // capture at most this many decode positions
+    std::vector<float> fbuf;
 };
+
+// capture one f32 hidden-state row per token in the batch
+static void capture_hidden(trace_ctx * tc, struct ggml_tensor * t, int tag, int layer) {
+    if (tc->hid == nullptr || t->type != GGML_TYPE_F32) {
+        return;
+    }
+    // only decode steps, and only the first hid_limit of them
+    if (tc->in_prompt || tc->pos >= tc->hid_limit) {
+        return;
+    }
+    const int n_embd   = (int) t->ne[0];
+    const int n_tokens = (int) t->ne[1];
+    const size_t nbytes = ggml_nbytes(t);
+    tc->fbuf.resize((nbytes + sizeof(float) - 1) / sizeof(float));
+    ggml_backend_tensor_get(t, tc->fbuf.data(), 0, nbytes);
+    const char * base = (const char *) tc->fbuf.data();
+    for (int j = 0; j < n_tokens; j++) {
+        const int32_t hdr[4] = { tc->pos, layer, tag, n_embd };
+        fwrite(hdr, sizeof(int32_t), 4, tc->hid);
+        fwrite(base + j*t->nb[1], sizeof(float), n_embd, tc->hid);
+    }
+}
 
 static bool trace_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     trace_ctx * tc = (trace_ctx *) user_data;
 
     const bool is_topk = strncmp(t->name, "ffn_moe_topk-", 13) == 0;
+
+    // hidden-state taps for the router-prediction experiment
+    int hid_tag = -1;
+    if (tc->hid != nullptr) {
+        if      (strncmp(t->name, "l_out-",           6) == 0) hid_tag = 0;
+        else if (strncmp(t->name, "attn_residual-",  14) == 0) hid_tag = 1;
+        else if (strncmp(t->name, "attn_post_norm-", 15) == 0) hid_tag = 2;
+    }
+
     if (ask) {
-        return is_topk;
+        return is_topk || hid_tag >= 0;
+    }
+    if (hid_tag >= 0) {
+        const char * dash = strrchr(t->name, '-');
+        capture_hidden(tc, t, hid_tag, dash ? atoi(dash + 1) : -1);
     }
     if (!is_topk || t->type != GGML_TYPE_I32) {
         return true;
@@ -86,6 +131,18 @@ int main(int argc, char ** argv) {
     if (!tc.out) {
         LOG_ERR("failed to open %s for writing\n", out_path);
         return 1;
+    }
+
+    // optional hidden-state dump for the router-prediction experiment
+    if (const char * hid_path = getenv("MOE_TRACE_HIDDEN")) {
+        tc.hid = fopen(hid_path, "wb");
+        if (!tc.hid) {
+            LOG_ERR("failed to open %s for writing\n", hid_path);
+            return 1;
+        }
+        const char * lim = getenv("MOE_TRACE_HIDDEN_N");
+        tc.hid_limit = lim ? atoi(lim) : 64;
+        LOG_INF("capturing hidden states for the first %d decode steps -> %s\n", tc.hid_limit, hid_path);
     }
 
     params.cb_eval           = trace_cb;
@@ -144,6 +201,7 @@ int main(int argc, char ** argv) {
     llama_sampler_free(smpl);
 
     fclose(tc.out);
+    if (tc.hid) { fclose(tc.hid); }
     LOG_INF("trace written to %s\n", out_path);
 
     llama_backend_free();
