@@ -333,6 +333,7 @@ extern "C" {
         // MoE expert cache: keep the hottest routed experts per layer resident in GPU memory
         const char * moe_cache_profile; // routing profile CSV from llama-moe-trace (NULL = disabled)
         int32_t      moe_cache_slots;   // experts cached per layer (0 = disabled)
+        int32_t      moe_cache_ring;    // dynamic ring slots per layer, refilled by the speculative router (0 = static only)
 
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights

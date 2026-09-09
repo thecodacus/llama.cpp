@@ -312,6 +312,16 @@ struct llama_layer {
     struct ggml_tensor * ffn_up_exps_hot   = nullptr;
     struct ggml_tensor * moe_map_hot       = nullptr; // i32[n_expert]: pack slot or -1
     struct ggml_tensor * moe_map_cold      = nullptr; // i32[n_expert]: global id or -1
+
+    // dynamic ring: pack slots [moe_ring_base, moe_ring_base + moe_ring_size) are
+    // refilled at runtime from the speculative router's predictions, the slots
+    // below moe_ring_base are pinned by profile frequency and never move.
+    int32_t moe_ring_base = 0;
+    int32_t moe_ring_size = 0;
+    std::vector<int32_t> moe_ring_expert;             // expert currently in each ring slot, -1 empty
+    int32_t moe_ring_cursor = 0;                      // round-robin eviction cursor
+    std::vector<int32_t> moe_map_hot_host;            // host mirror of moe_map_hot
+    std::vector<int32_t> moe_map_cold_host;           // host mirror of moe_map_cold
     struct ggml_tensor * ffn_gate_inp_b    = nullptr;
     struct ggml_tensor * ffn_gate_exps_b   = nullptr;
     struct ggml_tensor * ffn_down_exps_b   = nullptr;
@@ -740,6 +750,7 @@ struct llama_model_base : public llama_model {
     // GGML_MOE_CACHE_PROFILE + GGML_MOE_CACHE_SLOTS: build GPU-resident hot
     // expert packs for CPU-offloaded MoE layers (see llama_layer::*_exps_hot)
     void init_moe_expert_cache();
+    int  moe_cache_prefetch(int il, const int32_t * ids, int n_ids);
 
     // model must define these
     void load_arch_hparams(llama_model_loader & ml) override = 0;

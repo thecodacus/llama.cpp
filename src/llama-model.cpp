@@ -1658,6 +1658,62 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     return true;
 }
 
+// Refill the dynamic ring of layer `il` from a set of predicted expert ids.
+// Experts already resident (static or ring) are skipped, so the transferred
+// volume is the prediction's miss set, not the whole prediction.
+// Returns the number of experts actually copied.
+int llama_model_base::moe_cache_prefetch(int il, const int32_t * ids, int n_ids) {
+    if (il < 0 || il >= (int) layers.size()) {
+        return 0;
+    }
+    auto & l = layers[il];
+    if (l.moe_ring_size <= 0 || l.moe_map_hot == nullptr) {
+        return 0;
+    }
+
+    const ggml_tensor * srcs[3] = { l.ffn_gate_exps,     l.ffn_up_exps,     l.ffn_down_exps     };
+    ggml_tensor       * dsts[3] = { l.ffn_gate_exps_hot, l.ffn_up_exps_hot, l.ffn_down_exps_hot };
+    const int64_t n_expert = l.ffn_gate_exps->ne[2];
+
+    int n_copied = 0;
+    std::vector<uint8_t> slab;
+    for (int i = 0; i < n_ids; i++) {
+        const int32_t e = ids[i];
+        if (e < 0 || e >= n_expert) {
+            continue;
+        }
+        if (l.moe_map_hot_host[e] >= 0) {
+            continue;                       // already resident, nothing to do
+        }
+
+        // round-robin over the ring; evicting returns that expert to the cold path
+        const int32_t slot = l.moe_ring_base + (l.moe_ring_cursor % l.moe_ring_size);
+        l.moe_ring_cursor++;
+        const int32_t victim = l.moe_ring_expert[slot - l.moe_ring_base];
+        if (victim >= 0) {
+            l.moe_map_hot_host [victim] = -1;
+            l.moe_map_cold_host[victim] = victim;
+            ggml_backend_tensor_set(l.moe_map_hot,  &l.moe_map_hot_host [victim], victim*sizeof(int32_t), sizeof(int32_t));
+            ggml_backend_tensor_set(l.moe_map_cold, &l.moe_map_cold_host[victim], victim*sizeof(int32_t), sizeof(int32_t));
+        }
+
+        for (int t = 0; t < 3; t++) {
+            const size_t nb = srcs[t]->nb[2];
+            slab.resize(nb);
+            ggml_backend_tensor_get(srcs[t], slab.data(), e*nb, nb);
+            ggml_backend_tensor_set(dsts[t], slab.data(), slot*nb, nb);
+        }
+
+        l.moe_ring_expert[slot - l.moe_ring_base] = e;
+        l.moe_map_hot_host [e] = slot;
+        l.moe_map_cold_host[e] = -1;
+        ggml_backend_tensor_set(l.moe_map_hot,  &l.moe_map_hot_host [e], e*sizeof(int32_t), sizeof(int32_t));
+        ggml_backend_tensor_set(l.moe_map_cold, &l.moe_map_cold_host[e], e*sizeof(int32_t), sizeof(int32_t));
+        n_copied++;
+    }
+    return n_copied;
+}
+
 void llama_model_base::init_moe_expert_cache() {
     // flags take precedence; env vars kept as a fallback
     const char * profile_path = params.moe_cache_profile;
@@ -1668,6 +1724,14 @@ void llama_model_base::init_moe_expert_cache() {
     if (n_slots <= 0) {
         const char * slots_env = getenv("GGML_MOE_CACHE_SLOTS");
         n_slots = slots_env ? atoi(slots_env) : 0;
+    }
+    int n_ring = params.moe_cache_ring;
+    if (n_ring <= 0) {
+        const char * ring_env = getenv("GGML_MOE_CACHE_RING");
+        n_ring = ring_env ? atoi(ring_env) : 0;
+    }
+    if (n_ring < 0) {
+        n_ring = 0;
     }
     if (profile_path == nullptr || profile_path[0] == '\0' || n_slots <= 0) {
         return;
@@ -1740,7 +1804,7 @@ void llama_model_base::init_moe_expert_cache() {
         const ggml_tensor * u = l.ffn_up_exps;
         const ggml_tensor * d = l.ffn_down_exps;
         const int64_t n_expert = g->ne[2];
-        const int64_t S = std::min<int64_t>(n_slots, n_expert);
+        const int64_t S = std::min<int64_t>(n_slots + n_ring, n_expert);
         l.ffn_gate_exps_hot = ggml_new_tensor_3d(ctx, g->type, g->ne[0], g->ne[1], S);
         l.ffn_up_exps_hot   = ggml_new_tensor_3d(ctx, u->type, u->ne[0], u->ne[1], S);
         l.ffn_down_exps_hot = ggml_new_tensor_3d(ctx, d->type, d->ne[0], d->ne[1], S);
@@ -1791,7 +1855,9 @@ void llama_model_base::init_moe_expert_cache() {
         for (int64_t e = 0; e < n_expert; e++) {
             map_cold[e] = (int32_t) e;
         }
-        for (int64_t s = 0; s < S && s < (int64_t) ranked.size(); s++) {
+        // the static fill stops at n_slots; anything above that is ring space
+        const int64_t S_static = std::min<int64_t>(S, n_slots > 0 ? n_slots : S);
+        for (int64_t s = 0; s < S_static && s < (int64_t) ranked.size(); s++) {
             const int32_t e = ranked[s].second;
             map_hot[e]  = (int32_t) s;
             map_cold[e] = -1;
@@ -1807,6 +1873,14 @@ void llama_model_base::init_moe_expert_cache() {
         }
         ggml_backend_tensor_set(l.moe_map_hot,  map_hot.data(),  0, n_expert*sizeof(int32_t));
         ggml_backend_tensor_set(l.moe_map_cold, map_cold.data(), 0, n_expert*sizeof(int32_t));
+
+        // slots the static fill did not consume become the dynamic ring
+        const int64_t n_static = std::min<int64_t>(S_static, (int64_t) ranked.size());
+        l.moe_ring_base = (int32_t) n_static;
+        l.moe_ring_size = (int32_t) (S - n_static);
+        l.moe_ring_expert.assign(l.moe_ring_size, -1);
+        l.moe_map_hot_host  = map_hot;
+        l.moe_map_cold_host = map_cold;
     }
 
     pimpl->ctxs_bufs.emplace_back(ggml_context_ptr{ctx}, std::vector<ggml_backend_buffer_ptr>{});
@@ -2487,6 +2561,7 @@ llama_model_params llama_model_default_params() {
         /*.kv_overrides                =*/ nullptr,
         /*.moe_cache_profile           =*/ nullptr,
         /*.moe_cache_slots             =*/ 0,
+        /*.moe_cache_ring              =*/ 0,
         /*.vocab_only                  =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,
