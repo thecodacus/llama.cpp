@@ -183,6 +183,22 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
 
         ggml_tensor * inpSA = inpL;
 
+        // Speculative expert router: run this layer's router on the layer INPUT,
+        // i.e. before attention has been added to the residual stream. The result
+        // is independent of the attention block, so it can be computed in parallel
+        // with it and used to prefetch experts before the real router resolves.
+        // Enabled with LLAMA_MOE_SPEC_ROUTER=<k> (number of candidates to emit).
+        {
+            static const int spec_k = getenv("LLAMA_MOE_SPEC_ROUTER") ? atoi(getenv("LLAMA_MOE_SPEC_ROUTER")) : 0;
+            if (spec_k > 0 && model.layers[il].ffn_gate_inp && model.layers[il].attn_post_norm) {
+                ggml_tensor * spec_in = build_norm(inpL, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
+                ggml_tensor * spec_lg = build_lora_mm(model.layers[il].ffn_gate_inp, spec_in);
+                ggml_tensor * spec_id = ggml_argsort_top_k(ctx0, spec_lg, spec_k);
+                cb(spec_id, "ffn_moe_spec_topk", il);
+                ggml_build_forward_expand(gf, spec_id);
+            }
+        }
+
         cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
 

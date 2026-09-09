@@ -34,6 +34,7 @@ struct trace_ctx {
     // tag 0 = l_out (layer output = next layer's pre-attention input)
     //     1 = attn_residual (h + attn, pre-norm)
     //     2 = attn_post_norm (the actual router input)
+    FILE * spec      = nullptr;   // speculative (pre-attention) router ids
     FILE * hid       = nullptr;
     int    hid_limit = 0;       // capture at most this many decode positions
     std::vector<float> fbuf;
@@ -65,6 +66,7 @@ static bool trace_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     trace_ctx * tc = (trace_ctx *) user_data;
 
     const bool is_topk = strncmp(t->name, "ffn_moe_topk-", 13) == 0;
+    const bool is_spec = tc->spec != nullptr && strncmp(t->name, "ffn_moe_spec_topk-", 18) == 0;
 
     // hidden-state taps for the router-prediction experiment
     int hid_tag = -1;
@@ -75,17 +77,18 @@ static bool trace_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     }
 
     if (ask) {
-        return is_topk || hid_tag >= 0;
+        return is_topk || is_spec || hid_tag >= 0;
     }
     if (hid_tag >= 0) {
         const char * dash = strrchr(t->name, '-');
         capture_hidden(tc, t, hid_tag, dash ? atoi(dash + 1) : -1);
     }
-    if (!is_topk || t->type != GGML_TYPE_I32) {
+    if (!(is_topk || is_spec) || t->type != GGML_TYPE_I32) {
         return true;
     }
 
-    const int layer    = atoi(t->name + 13);
+    FILE * const dst   = is_spec ? tc->spec : tc->out;
+    const int layer    = atoi(strrchr(t->name, '-') + 1);
     const int n_used   = (int) t->ne[0];
     const int n_tokens = (int) t->ne[1];
 
@@ -100,12 +103,12 @@ static bool trace_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     for (int j = 0; j < n_tokens; j++) {
         // prefill batches carry n_tokens > 1; decode steps carry 1
         const int pos = tc->in_prompt ? -(tc->pos + n_tokens - j) : tc->pos;
-        fprintf(tc->out, "%d,%d", pos, layer);
+        fprintf(dst, "%d,%d", pos, layer);
         for (int i = 0; i < n_used; i++) {
             const int32_t id = *(const int32_t *)(base + j*t->nb[1] + i*t->nb[0]);
-            fprintf(tc->out, ",%d", id);
+            fprintf(dst, ",%d", id);
         }
-        fputc('\n', tc->out);
+        fputc('\n', dst);
     }
     return true;
 }
@@ -131,6 +134,14 @@ int main(int argc, char ** argv) {
     if (!tc.out) {
         LOG_ERR("failed to open %s for writing\n", out_path);
         return 1;
+    }
+
+    if (const char * spec_path = getenv("MOE_TRACE_SPEC")) {
+        tc.spec = fopen(spec_path, "w");
+        if (!tc.spec) {
+            LOG_ERR("failed to open %s for writing\n", spec_path);
+            return 1;
+        }
     }
 
     // optional hidden-state dump for the router-prediction experiment
@@ -201,7 +212,8 @@ int main(int argc, char ** argv) {
     llama_sampler_free(smpl);
 
     fclose(tc.out);
-    if (tc.hid) { fclose(tc.hid); }
+    if (tc.hid)  { fclose(tc.hid); }
+    if (tc.spec) { fclose(tc.spec); }
     LOG_INF("trace written to %s\n", out_path);
 
     llama_backend_free();
