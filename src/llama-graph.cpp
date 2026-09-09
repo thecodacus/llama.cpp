@@ -1764,11 +1764,14 @@ static void llm_moe_prefetch_op(struct ggml_tensor * dst, const struct ggml_tens
     }
     auto * ud = (llama_model_base::moe_prefetch_ud *) userdata;
 
-    // only the first token's predictions are acted on: at decode there is one,
-    // and during prefill the routing is too broad for a ring to help
-    const int32_t * ids = (const int32_t *) spec_ids->data;
+    // the ids may live on the device: fetch them through the backend rather than
+    // dereferencing the pointer, which would read device memory from the host
     const int n_ids = (int) spec_ids->ne[0];
-    ud->model->moe_cache_prefetch(ud->il, ids, n_ids);
+    std::vector<int32_t> ids((size_t) n_ids);
+    for (int i = 0; i < n_ids; i++) {
+        ggml_backend_tensor_get(spec_ids, &ids[i], i*spec_ids->nb[0], sizeof(int32_t));
+    }
+    ud->model->moe_cache_prefetch(ud->il, ids.data(), n_ids);
 
     // the prefetch mutated the map in place on the device; mirror the host copy out
     const auto & l = ud->model->layers[ud->il];
