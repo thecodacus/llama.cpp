@@ -1884,7 +1884,7 @@ void llama_model_base::init_moe_expert_cache() {
     }
 
     ggml_init_params ctx_params = {
-        /*.mem_size   =*/ (5*pack_layers.size() + 1)*ggml_tensor_overhead(),
+        /*.mem_size   =*/ (6*pack_layers.size() + 1)*ggml_tensor_overhead(),   // 3 packs + hot/cold/both maps
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
