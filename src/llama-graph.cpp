@@ -1960,10 +1960,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // map is read. Expressed as a CPU graph node rather than an eval callback
         // so CUDA graphs and the scheduler's own prefetch path stay enabled.
         ggml_tensor * map_hot = moe_cache->moe_map_hot;
-        if (moe_spec_ids != nullptr && moe_cache->moe_ring_size > 0 && il >= 0 &&
-                il < (int) model.moe_prefetch_ud_slots.size() && n_tokens == 1) {
+        if (moe_spec_ids != nullptr && moe_cache->moe_ring_size > 0 &&
+                moe_cache->moe_prefetch_ud_ptr != nullptr && n_tokens == 1) {
             map_hot = ggml_map_custom2(ctx0, map_hot, moe_spec_ids, llm_moe_prefetch_op, 1,
-                                       (void *) &model.moe_prefetch_ud_slots[il]);
+                                       moe_cache->moe_prefetch_ud_ptr);
             cb(map_hot, "ffn_moe_map_hot_live", il);
         }
 

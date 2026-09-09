@@ -320,6 +320,7 @@ struct llama_layer {
     int32_t moe_ring_size = 0;
     std::vector<int32_t> moe_ring_expert;             // expert currently in each ring slot, -1 empty
     int32_t moe_ring_cursor = 0;                      // round-robin eviction cursor
+    void *  moe_prefetch_ud_ptr = nullptr;            // &model.moe_prefetch_ud_slots[il]
     std::vector<int32_t> moe_map_hot_host;            // host mirror of moe_map_hot
     std::vector<int32_t> moe_map_cold_host;           // host mirror of moe_map_cold
     struct ggml_tensor * ffn_gate_inp_b    = nullptr;
