@@ -173,9 +173,43 @@ struct decision_field {
 
 // ---------------------------------------------------------------- engine
 
-engine::engine(llama_context * ctx, llama_seq_id seq_base, int n_seqs)
+prefix_state_cache::prefix_state_cache(size_t capacity) : capacity(capacity) {
+}
+
+const std::vector<uint8_t> * prefix_state_cache::find(const tokens_t & tokens) {
+    for (auto it = entries.begin(); it != entries.end(); ++it) {
+        if (it->tokens == tokens) {
+            entries.splice(entries.begin(), entries, it);
+            return &entries.front().state;
+        }
+    }
+    return nullptr;
+}
+
+void prefix_state_cache::put(tokens_t tokens, std::vector<uint8_t> state) {
+    if (capacity == 0 || tokens.empty() || state.empty()) {
+        return;
+    }
+    for (auto it = entries.begin(); it != entries.end(); ++it) {
+        if (it->tokens == tokens) {
+            it->state = std::move(state);
+            entries.splice(entries.begin(), entries, it);
+            return;
+        }
+    }
+    entries.push_front({ std::move(tokens), std::move(state) });
+    while (entries.size() > capacity) {
+        entries.pop_back();
+    }
+}
+
+size_t prefix_state_cache::size() const {
+    return entries.size();
+}
+
+engine::engine(llama_context * ctx, llama_seq_id seq_base, int n_seqs, size_t prefix_cache_entries)
     : ctx(ctx), vocab(llama_model_get_vocab(llama_get_model(ctx))), mem(llama_get_memory(ctx)),
-      seq_snap(seq_base), seq_pool(seq_base + 1), n_pool(n_seqs - 1) {
+      seq_snap(seq_base), seq_pool(seq_base + 1), n_pool(n_seqs - 1), prefix_cache(prefix_cache_entries) {
     if (n_seqs < 3) {
         throw std::invalid_argument("a decision engine needs at least 3 sequences");
     }
@@ -221,15 +255,37 @@ void engine::decode_parts(const std::vector<prompt_part> & parts) {
 bool engine::prepare_prefix(const tokens_t & shared, bool allow_cache) {
     if (allow_cache && !shared.empty() && shared == cached &&
         llama_memory_seq_pos_max(mem, seq_snap) == (llama_pos) cached.size() - 1) {
+        prefix_cache.find(shared); // refresh its LRU position when host snapshots are enabled
         return true;
     }
     for (llama_seq_id s = seq_snap; s < seq_pool + n_pool; ++s) {
         llama_memory_seq_rm(mem, s, -1, -1);
     }
     cached.clear();
+    if (allow_cache && !shared.empty()) {
+        if (const auto * state = prefix_cache.find(shared)) {
+            const size_t restored = llama_state_seq_set_data_ext(
+                ctx, state->data(), state->size(), seq_snap, LLAMA_STATE_SEQ_FLAGS_NONE);
+            if (restored != state->size() ||
+                llama_memory_seq_pos_max(mem, seq_snap) != (llama_pos) shared.size() - 1) {
+                throw std::runtime_error("failed to restore a cached decision prefix");
+            }
+            cached = shared;
+            return true;
+        }
+    }
     if (!shared.empty()) {
         decode_parts({ { &shared, 0, seq_snap } });
         cached = shared;
+        llama_synchronize(ctx);
+        const size_t state_size = llama_state_seq_get_size_ext(ctx, seq_snap, LLAMA_STATE_SEQ_FLAGS_NONE);
+        std::vector<uint8_t> state(state_size);
+        const size_t saved = llama_state_seq_get_data_ext(
+            ctx, state.data(), state.size(), seq_snap, LLAMA_STATE_SEQ_FLAGS_NONE);
+        if (saved != state.size()) {
+            throw std::runtime_error("failed to save a decision prefix state");
+        }
+        prefix_cache.put(shared, std::move(state));
     }
     return false;
 }
@@ -716,6 +772,16 @@ common_json assemble(const compiled_schema & cs, const result & r) {
         decision[sp.name] = sp.values[idx];
         f["value"]        = sp.values[idx];
         f["probability"]  = (double) (fr.probs.size() == sp.values.size() ? fr.probs[idx] : fr.path_score);
+        if (fr.probs.size() == sp.values.size()) {
+            common_json probabilities = common_json::object();
+            for (size_t k = 0; k < sp.values.size(); ++k) {
+                const std::string key = sp.values[k].is_string()
+                    ? sp.values[k].get<std::string>()
+                    : sp.values[k].dump();
+                probabilities[key] = (double) fr.probs[k];
+            }
+            f["probabilities"] = std::move(probabilities);
+        }
         f["scored_nodes"] = fr.scored_nodes;
         f["tree"]         = fr.tree;
         fields[sp.name]   = f;

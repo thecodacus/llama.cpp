@@ -13,6 +13,8 @@
 #include "llama.h"
 #include "json.h"
 
+#include <cstddef>
+#include <list>
 #include <string>
 #include <utility>
 #include <vector>
@@ -22,6 +24,26 @@ struct common_chat_templates;
 namespace llama_decision {
 
 using tokens_t = std::vector<llama_token>;
+
+// Small exact-key LRU used by the engine to retain serialized prefix states in host memory.
+// Keeping snapshots off the KV sequence pool preserves every reserved sequence for scoring.
+class prefix_state_cache {
+  public:
+    explicit prefix_state_cache(size_t capacity);
+
+    const std::vector<uint8_t> * find(const tokens_t & tokens);
+    void put(tokens_t tokens, std::vector<uint8_t> state);
+    size_t size() const;
+
+  private:
+    struct entry {
+        tokens_t            tokens;
+        std::vector<uint8_t> state;
+    };
+
+    size_t           capacity;
+    std::list<entry> entries; // most recently used first
+};
 
 // One field as the scorer sees it: the text before its value and the allowed value texts.
 struct field_input {
@@ -72,7 +94,7 @@ struct batch_result {
 // flight, then branches. The context needs a unified KV cache so branches share the trunk's cells.
 class engine {
   public:
-    engine(llama_context * ctx, llama_seq_id seq_base, int n_seqs);
+    engine(llama_context * ctx, llama_seq_id seq_base, int n_seqs, size_t prefix_cache_entries = 4);
 
     result decide(const std::string & shared_text, const std::string & context_text,
                   const std::vector<field_input> & fields, const options & opt);
@@ -101,6 +123,7 @@ class engine {
     llama_seq_id        seq_snap, seq_pool;
     int                 n_pool;
     tokens_t            cached;
+    prefix_state_cache  prefix_cache;
 
     tokens_t tokenize(const std::string & text, bool add_special) const;
     void     decode_parts(const std::vector<prompt_part> & parts);

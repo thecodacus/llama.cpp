@@ -2557,6 +2557,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.n_seq_decision = value;
             }
         ).set_env("LLAMA_ARG_DECISION_SEQS").set_examples({LLAMA_EXAMPLE_SERVER}));
+        add_opt(common_arg(
+            {"--decision-prefix-cache"}, "N",
+            string_format("decision prompt prefixes retained in host memory (default: %d; 0 = active prefix only)", params.n_cache_decision),
+            [](common_params & params, int value) {
+                if (value < 0) {
+                    throw std::invalid_argument("--decision-prefix-cache cannot be negative");
+                }
+                params.n_cache_decision = value;
+            }
+        ).set_env("LLAMA_ARG_DECISION_PREFIX_CACHE").set_examples({LLAMA_EXAMPLE_SERVER}));
     } else {
         add_opt(common_arg(
             {"-np", "--parallel"}, "N",
