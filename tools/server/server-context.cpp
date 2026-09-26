@@ -2417,29 +2417,42 @@ private:
         opt.mode        = body.value("mode", std::string("auto"));
         opt.tree_max    = (size_t) body.value("tree_max", 128);
         opt.allow_cache = body.value("cache_prompt", true);
+        opt.open_sampling = body.value("open_sampling", std::string("greedy"));
+        opt.open_temp     = (float) body.value("open_temp", 0.7);
+        if (opt.open_sampling != "greedy" && opt.open_sampling != "temperature") {
+            throw std::invalid_argument("\"open_sampling\" must be greedy or temperature");
+        }
+        if (opt.open_temp < 0.0f) {
+            throw std::invalid_argument("\"open_temp\" must be non-negative");
+        }
 
         const auto b = decision_engine->decide_batch(shared, dynamic, cs.inputs, opt);
 
         size_t context_tokens = 0;
+        size_t generated_tokens = 0;
         for (const auto & r : b.items) {
-            context_tokens += r.context_tokens;
+            context_tokens   += r.context_tokens;
+            generated_tokens += r.open_tokens;
         }
         json usage = json::object();
-        usage["prompt_tokens"]  = (long long) (b.shared_tokens + context_tokens);
-        usage["cached_tokens"]  = (long long) (b.cache_hit ? b.shared_tokens : 0);
-        usage["context_tokens"] = (long long) context_tokens;
-        usage["scored_rows"]    = b.rows;
+        usage["prompt_tokens"]    = (long long) (b.shared_tokens + context_tokens);
+        usage["cached_tokens"]    = (long long) (b.cache_hit ? b.shared_tokens : 0);
+        usage["context_tokens"]   = (long long) context_tokens;
+        usage["scored_rows"]      = b.rows;
+        usage["generated_tokens"] = (long long) generated_tokens;
         json timings = json::object();
         timings["prefill_ms"] = b.prefill_ms;
         timings["scoring_ms"] = b.scoring_ms;
-        timings["total_ms"]   = b.prefill_ms + b.scoring_ms;
+        timings["generation_ms"] = b.generation_ms;
+        timings["total_ms"]   = b.prefill_ms + b.scoring_ms + b.generation_ms;
         timings["rounds"]     = b.rounds;
-        timings["per_decision_ms"] = (b.prefill_ms + b.scoring_ms) / (double) b.items.size();
+        timings["per_decision_ms"] = (b.prefill_ms + b.scoring_ms + b.generation_ms) / (double) b.items.size();
 
         json results = json::array();
         for (const auto & r : b.items) {
             json item = llama_decision::assemble(cs, r);
-            item["usage"] = { { "context_tokens", (long long) r.context_tokens }, { "scored_rows", r.rows } };
+            item["usage"] = { { "context_tokens", (long long) r.context_tokens }, { "scored_rows", r.rows },
+                              { "generated_tokens", (long long) r.open_tokens } };
             results.push_back(item);
         }
         json out = json::object();
