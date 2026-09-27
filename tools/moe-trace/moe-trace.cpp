@@ -9,12 +9,13 @@
 // separate prefill routing from decode routing.
 //
 // Usage:
-//   MOE_TRACE_OUT=trace.csv llama-moe-trace -m model.gguf -ngl 99 -ncmoe 26 -fa on \
+//   MOE_TRACE_OUT=trace.csv llama-moe-trace -m model.gguf -ngl 99 -ncmoe 26 -fa on --temp 0 \
 //       -p "prompt text" -n 512
 
 #include "arg.h"
 #include "common.h"
 #include "log.h"
+#include "sampling.h"
 #include "llama.h"
 
 #include <cstdio>
@@ -123,12 +124,14 @@ int main(int argc, char ** argv) {
         tc.pos += n_eval;
     }
 
-    // greedy decode
+    // decode with the sampling flags (--temp, --top-k, --top-p, --min-p, --seed, ...) so the trace
+    // follows the same expert routing a server with those defaults would see
     tc.in_prompt = false;
-    llama_sampler * smpl = llama_sampler_init_greedy();
+    common_sampler * smpl = common_sampler_init(model, params.sampling);
     llama_token tok = 0;
     for (int i = 0; i < params.n_predict; i++) {
-        tok = llama_sampler_sample(smpl, lctx, -1);
+        tok = common_sampler_sample(smpl, lctx, -1);
+        common_sampler_accept(smpl, tok, true);
         if (llama_vocab_is_eog(vocab, tok)) {
             break;
         }
@@ -141,7 +144,7 @@ int main(int argc, char ** argv) {
             LOG_INF("decoded %d/%d\n", i, params.n_predict);
         }
     }
-    llama_sampler_free(smpl);
+    common_sampler_free(smpl);
 
     fclose(tc.out);
     LOG_INF("trace written to %s\n", out_path);
