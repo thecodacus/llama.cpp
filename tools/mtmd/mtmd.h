@@ -507,6 +507,11 @@ struct bitmap {
 struct bitmaps {
     std::vector<bitmap> entries;
     ~bitmaps() = default;
+    bitmaps() = default;
+    bitmaps(bitmaps && other) noexcept = default;
+    bitmaps & operator=(bitmaps && other) noexcept = default;
+    bitmaps(const bitmaps &) = delete;
+    bitmaps & operator=(const bitmaps &) = delete;
     // return list of pointers to mtmd_bitmap
     // example:
     //   auto bitmaps_c_ptr = bitmaps.c_ptr();

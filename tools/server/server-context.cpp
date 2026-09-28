@@ -9,6 +9,7 @@
 
 #include "build-info.h"
 #include "common.h"
+#include "base64.hpp"
 #include "fit.h"
 #include "llama.h"
 #include "log.h"
@@ -38,6 +39,10 @@
 #endif
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+// Toggle debug output with LLAMA_DECISION_DEBUG env var
+namespace { bool decision_debug_enabled() { static bool v = std::getenv("LLAMA_DECISION_DEBUG") != nullptr; return v; } }
+#define DECISION_DEBUG(fmt, ...) do { if (decision_debug_enabled()) { fprintf(stderr, "[decision-debug] " fmt "\n", ##__VA_ARGS__); } } while(0)
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
@@ -2387,21 +2392,99 @@ private:
         if (!body.contains("contexts") || !body.at("contexts").is_array() || body.at("contexts").empty() || body.at("contexts").size() > 256) {
             throw std::invalid_argument("\"contexts\" must be an array of 1-256 strings");
         }
+        // Optional: images array (base64-encoded), one per context, in the same order as contexts.
+        // An empty/null entry in images means "no image for this context".
+        // Each entry can also be an array of base64 strings for multi-image contexts.
         std::vector<std::string> contexts;
-        for (const auto & c : body.at("contexts")) {
+        std::vector<mtmd::bitmaps> context_bitmaps;
+        bool has_images = body.contains("images") && body.at("images").is_array();
+        DECISION_DEBUG("handle_decision: has_images=%d", (int)has_images);
+        if (has_images && body.at("images").size() != body.at("contexts").size()) {
+            throw std::invalid_argument("\"images\" array length must match \"contexts\" length");
+        }
+        contexts.reserve(body.at("contexts").size());
+        context_bitmaps.reserve(body.at("contexts").size());
+        for (size_t i = 0; i < body.at("contexts").size(); ++i) {
+            const auto & c = body.at("contexts")[i];
             if (!c.is_string() || c.get<std::string>().empty()) {
                 throw std::invalid_argument("every entry of \"contexts\" must be a non-empty string");
             }
-            contexts.push_back(c.get<std::string>());
+            std::string ctx_text = c.get<std::string>();
+            mtmd::bitmaps ctx_bitmaps;
+            if (has_images && i < body.at("images").size()) {
+                // images[i] can be a single base64 string OR an array of base64 strings
+                const auto & img_entry = body.at("images")[i];
+                std::vector<std::string> img_list;
+                if (img_entry.is_array()) {
+                    for (const auto & img : img_entry) {
+                        if (img.is_string() && !img.get<std::string>().empty()) {
+                            img_list.push_back(img.get<std::string>());
+                        }
+                    }
+                } else if (img_entry.is_string() && !img_entry.get<std::string>().empty()) {
+                    img_list.push_back(img_entry.get<std::string>());
+                }
+                for (const std::string & b64 : img_list) {
+                    DECISION_DEBUG("handle_decision: decoding image for context %zu", i);
+                    // decode base64 image
+                    std::string raw_b64 = b64;
+                    // strip optional data URL prefix: "data:image/...;base64,...."
+                    if (raw_b64.find("data:") == 0) {
+                        auto pos = raw_b64.find(",base64,");
+                        if (pos != std::string::npos) {
+                            raw_b64 = raw_b64.substr(pos + 8);
+                        } else {
+                            auto pos2 = raw_b64.find(",");
+                            if (pos2 != std::string::npos) {
+                                raw_b64 = raw_b64.substr(pos2 + 1);
+                            }
+                        }
+                    }
+                    std::string raw = base64::decode(raw_b64);
+                    DECISION_DEBUG("handle_decision: image raw size=%zu", raw.size());
+                    if (!raw.empty()) {
+                        auto out = mtmd_helper_bitmap_init_from_buf(mctx, reinterpret_cast<const unsigned char *>(raw.data()), raw.size(), false, init_opt);
+                        DECISION_DEBUG("handle_decision: bitmap init result.bitmap=%p", (void*)out.bitmap);
+                        if (out.bitmap) {
+                            ctx_bitmaps.entries.emplace_back(out.bitmap);
+                        } else {
+                            throw std::runtime_error("failed to decode image at context " + std::to_string(i));
+                        }
+                    }
+                }
+            }
+            if (!ctx_bitmaps.entries.empty()) {
+                // Media markers should already be in the context text at this point.
+                // If the context text doesn't contain any media markers, prepend them
+                // (backward compatibility with single-image contexts).
+                // The harness can now include media markers inline in context text
+                // for multi-image contexts where image order matters relative to text.
+                const char * marker = mctx ? mtmd_get_marker(mctx) : nullptr;
+                if (marker && ctx_text.find(marker) == std::string::npos) {
+                    // No media markers in text, so prepend them (legacy behavior)
+                    std::string markers;
+                    for (size_t j = 0; j < ctx_bitmaps.entries.size(); ++j) {
+                        markers += marker;
+                    }
+                    ctx_text = markers + ctx_text;
+                    DECISION_DEBUG("handle_decision: prepended %zu media markers", ctx_bitmaps.entries.size());
+                }
+                // If markers are already in the text, mtmd_tokenize will find and use them
+            }
+            contexts.push_back(ctx_text);
+            context_bitmaps.emplace_back(std::move(ctx_bitmaps));
         }
         if (!body.contains("schema")) {
             throw std::invalid_argument("\"schema\" must be provided");
         }
         if (!decision_engine) {
+            DECISION_DEBUG("handle_decision: creating decision engine");
             decision_engine = std::make_unique<llama_decision::engine>(ctx_tgt, (llama_seq_id) params_base.n_parallel,
-                                                                        params_base.n_seq_decision);
+                                                                        params_base.n_seq_decision, mctx);
         }
+        DECISION_DEBUG("handle_decision: compiling schema");
         const auto cs = llama_decision::compile_schema(body.at("schema"), body.value("instructions", std::string()));
+        DECISION_DEBUG("handle_decision: rendering prompts");
         std::string shared;
         std::vector<std::string> dynamic;
         for (const auto & c : contexts) {
@@ -2418,6 +2501,8 @@ private:
         opt.tree_max    = (size_t) body.value("tree_max", 128);
         opt.allow_cache = body.value("cache_prompt", true);
 
+        // If any context has images, pass the bitmaps through options for multimodal tokenization
+        opt.context_bitmaps = std::move(context_bitmaps);
         const auto b = decision_engine->decide_batch(shared, dynamic, cs.inputs, opt);
 
         size_t context_tokens = 0;

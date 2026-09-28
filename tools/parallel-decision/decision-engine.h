@@ -11,6 +11,8 @@
 // larger fields walk the trie greedily.
 
 #include "llama.h"
+#include "mtmd.h"
+#include "mtmd-helper.h"
 #include "json.h"
 
 #include <string>
@@ -34,6 +36,10 @@ struct options {
     size_t      tree_max       = 128;
     bool        split_boundary = false;  // legacy: tokenise suffix and values separately
     bool        allow_cache    = true;   // reuse the cached static prefix when it matches
+    // Optional per-context bitmaps for multimodal decision. If non-empty, must have the same
+    // size as the contexts vector in decide_batch. Each entry holds bitmaps to prepend to
+    // that context (the context text should contain media markers at the corresponding positions).
+    std::vector<mtmd::bitmaps> context_bitmaps;
 };
 
 struct field_result {
@@ -72,7 +78,7 @@ struct batch_result {
 // flight, then branches. The context needs a unified KV cache so branches share the trunk's cells.
 class engine {
   public:
-    engine(llama_context * ctx, llama_seq_id seq_base, int n_seqs);
+    engine(llama_context * ctx, llama_seq_id seq_base, int n_seqs, mtmd_context * mctx = nullptr);
 
     result decide(const std::string & shared_text, const std::string & context_text,
                   const std::vector<field_input> & fields, const options & opt);
@@ -83,8 +89,11 @@ class engine {
                               const std::vector<field_input> & fields, const options & opt);
 
   private:
+    // A prompt part can be either a list of text tokens or a media chunk (image/audio).
     struct prompt_part {
-        const tokens_t * toks;
+        enum type { TOKS, CHUNK } kind;
+        const tokens_t * toks     = nullptr;           // when kind == TOKS
+        const mtmd_input_chunk * chunk = nullptr;      // when kind == CHUNK
         llama_pos        pos0;
         llama_seq_id     seq;
     };
@@ -102,7 +111,40 @@ class engine {
     int                 n_pool;
     bool                pad_branches; // recurrent/hybrid model: branches in a decode need equal lengths
     tokens_t            cached;
+    mtmd_context        * mctx;       // optional multimodal context for vision input
 
+    // Tokenize text that may contain media markers, expanding them into chunks via mtmd.
+    // Returns text tokens with LLAMA_TOKEN_NULL at image positions, and the image chunks
+    // that need to be encoded separately in decode_parts.
+    struct multimodal_tokens {
+        tokens_t toks;                              // text tokens, LLAMA_TOKEN_NULL at image positions
+        std::vector<const mtmd_input_chunk *> chunks; // image/audio chunks to decode at those positions
+
+        ~multimodal_tokens() {
+            for (const auto * chunk : chunks) {
+                mtmd_input_chunk_free(const_cast<mtmd_input_chunk *>(chunk));
+            }
+        }
+        multimodal_tokens() = default;
+        multimodal_tokens(multimodal_tokens && other) noexcept
+            : toks(std::move(other.toks)), chunks(std::move(other.chunks)) {}
+        multimodal_tokens & operator=(multimodal_tokens && other) noexcept {
+            if (this != &other) {
+                for (const auto * chunk : chunks) {
+                    mtmd_input_chunk_free(const_cast<mtmd_input_chunk *>(chunk));
+                }
+                toks = std::move(other.toks);
+                chunks = std::move(other.chunks);
+            }
+            return *this;
+        }
+        // non-copyable (chunks are owned)
+        multimodal_tokens(const multimodal_tokens &) = delete;
+        multimodal_tokens & operator=(const multimodal_tokens &) = delete;
+    };
+
+    multimodal_tokens tokenize_mm(const std::string & text, bool add_special,
+                                  const mtmd::bitmaps * bitmaps = nullptr) const;
     tokens_t tokenize(const std::string & text, bool add_special) const;
     void     decode_parts(const std::vector<prompt_part> & parts);
     bool     prepare_prefix(const tokens_t & shared, bool allow_cache);

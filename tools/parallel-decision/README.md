@@ -132,3 +132,36 @@ line). Environment: `DECIDE_TREE`, `DECIDE_TREE_MAX`, `DECIDE_NSEQ`, `DECIDE_SPL
 [decision-playground](https://github.com/thecodacus/decision-playground) is a browser-only playground: it talks
 straight to your llama-server, runs a decision and the same question as a chat completion side by side with live
 timers, and has a small game whose agents decide through the endpoint.
+
+### Vision Decision Harness (Example)
+
+For multimodal decision testing with image support, this directory ships a runnable example under
+`examples/vision-decision-harness/`. It is a small Flask web UI that:
+
+- Accepts image folder uploads and runs them through `/decision` in a batch
+- Adds an image selection mode: every image in a folder is scored in one decision pass and the
+  UI reports the single best match for a question
+- Streams results back over SSE as each file is scored
+- Ships a text test suite for measuring classification accuracy and calibration
+- Ships `tests/scan_for_secrets.py`, which uses the decision endpoint itself to flag files that
+  look like they contain private data before you commit
+
+Build and run the server first:
+
+```bash
+./build/bin/llama-server --host 0.0.0.0 --port 8081 \
+  -m model-Q4_K_M.gguf --mmproj mmproj-model.gguf \
+  --decision-seqs 8
+```
+
+Then the harness:
+
+```bash
+cd tools/parallel-decision/examples/vision-decision-harness
+pip install -r requirements.txt
+python3 app.py
+```
+
+The harness listens on port 5786 and proxies to the server on port 8081. Set `LLAMA_SERVER_URL`
+to point it somewhere else.
+

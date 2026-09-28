@@ -1,0 +1,12 @@
+{
+  "properties": {
+    "sentiment": {
+      "type": "string",
+      "enum": [
+        "positive",
+        "negative",
+        "neutral"
+      ]
+    }
+  }
+}
