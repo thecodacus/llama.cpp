@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+# written by the test runners on each run
+test_results.json
+evaluation_results.json
+original_jev_script.txt
+tests/scan_for_secrets.py

@@ -1,0 +1,159 @@
+{
+  "description": "Answer key for text-based sentiment decision test suite. All 20 files use the same schema and question for consistent batch evaluation.",
+  "question": "What is the sentiment expressed in the following text?",
+  "schema": {
+    "properties": {
+      "sentiment": {
+        "type": "string",
+        "enum": [
+          "positive",
+          "negative",
+          "neutral"
+        ]
+      }
+    }
+  },
+  "total_files": 20,
+  "tests": [
+    {
+      "file": "t01.txt",
+      "expected": "positive",
+      "difficulty": "easy",
+      "category": "sentiment",
+      "preview": "This product is absolutely amazing! I love it and would recommend it to everyone"
+    },
+    {
+      "file": "t02.txt",
+      "expected": "negative",
+      "difficulty": "easy",
+      "category": "sentiment",
+      "preview": "This service was terrible. The staff was rude, the food was cold, and I had to w"
+    },
+    {
+      "file": "t03.txt",
+      "expected": "neutral",
+      "difficulty": "medium",
+      "category": "sentiment",
+      "preview": "The meeting is scheduled for 3 PM in conference room B. Please bring the quarter"
+    },
+    {
+      "file": "t04.txt",
+      "expected": "positive",
+      "difficulty": "easy",
+      "category": "sentiment",
+      "preview": "Excellent experience from start to finish. Highly recommend this to anyone looki"
+    },
+    {
+      "file": "t05.txt",
+      "expected": "negative",
+      "difficulty": "easy",
+      "category": "sentiment",
+      "preview": "Absolutely disappointed with this purchase. The item arrived damaged and custome"
+    },
+    {
+      "file": "t06.txt",
+      "expected": "neutral",
+      "difficulty": "medium",
+      "category": "sentiment",
+      "preview": "The software update was installed successfully. System is functioning normally w"
+    },
+    {
+      "file": "t07.txt",
+      "expected": "positive",
+      "difficulty": "easy",
+      "category": "sentiment",
+      "preview": "The new interface is intuitive and the new features are genuinely useful. Great "
+    },
+    {
+      "file": "t08.txt",
+      "expected": "negative",
+      "difficulty": "easy",
+      "category": "sentiment",
+      "preview": "I'm very frustrated with this app. It keeps crashing and the latest update remov"
+    },
+    {
+      "file": "t09.txt",
+      "expected": "neutral",
+      "difficulty": "medium",
+      "category": "sentiment",
+      "preview": "The package contains 250 units as ordered. Shipping was completed within the agr"
+    },
+    {
+      "file": "t10.txt",
+      "expected": "positive",
+      "difficulty": "medium",
+      "category": "sentiment",
+      "preview": "Despite some initial confusion, the support team was patient and helped resolve "
+    },
+    {
+      "file": "t11.txt",
+      "expected": "negative",
+      "difficulty": "medium",
+      "category": "sentiment",
+      "preview": "The documentation is outdated and incomplete. Half the examples don't work and k"
+    },
+    {
+      "file": "t12.txt",
+      "expected": "neutral",
+      "difficulty": "hard",
+      "category": "sentiment",
+      "preview": "Monthly recurring revenue increased 2.3% quarter-over-quarter. Customer churn ra"
+    },
+    {
+      "file": "t13.txt",
+      "expected": "positive",
+      "difficulty": "hard",
+      "category": "sentiment",
+      "preview": "The subtle improvements to the notification system really make a difference in d"
+    },
+    {
+      "file": "t14.txt",
+      "expected": "negative",
+      "difficulty": "hard",
+      "category": "sentiment",
+      "preview": "The constant notifications are disruptive and I find the new design choices ques"
+    },
+    {
+      "file": "t15.txt",
+      "expected": "positive",
+      "difficulty": "easy",
+      "category": "sentiment",
+      "preview": "I'm thrilled with the results. The quality exceeded expectations and delivery wa"
+    },
+    {
+      "file": "t16.txt",
+      "expected": "negative",
+      "difficulty": "easy",
+      "category": "sentiment",
+      "preview": "Worst experience ever. The product broke within a week and I couldn't get a refu"
+    },
+    {
+      "file": "t17.txt",
+      "expected": "neutral",
+      "difficulty": "hard",
+      "category": "sentiment",
+      "preview": "Temperature reading: 72 degrees Fahrenheit. Humidity: 45%. No anomalies detected"
+    },
+    {
+      "file": "t18.txt",
+      "expected": "positive",
+      "difficulty": "medium",
+      "category": "sentiment",
+      "preview": "The training workshop was well-organized and the instructors were knowledgeable."
+    },
+    {
+      "file": "t19.txt",
+      "expected": "negative",
+      "difficulty": "medium",
+      "category": "sentiment",
+      "preview": "The conference was overcrowded and poorly organized. Sessions started late repea"
+    },
+    {
+      "file": "t20.txt",
+      "expected": "neutral",
+      "difficulty": "hard",
+      "category": "sentiment",
+      "preview": "Server uptime this month: 99.87%. Average response time: 142ms. Number of incide"
+    }
+  ]
+}
