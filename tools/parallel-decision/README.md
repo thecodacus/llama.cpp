@@ -7,8 +7,12 @@ After the context, each field's allowed values are scored as token paths that fo
 fields are answered in one `llama_decode` and cannot see each other. Each answer comes back with a probability, and
 the JSON object is assembled by code, so it always matches the schema.
 
+Contexts can carry images. A prompt part is either a run of text tokens or a media chunk, and the chunks are encoded
+through the same mtmd path the completion endpoint uses, so a decision runs over a screenshot, a document scan, or a
+folder of images without leaving the single-pass scoring model.
+
 This directory holds the engine (`decision-engine.*`), a CLI (`llama-parallel-decision`), and the engine is also
-served by `llama-server` as `POST /v1/decision`.
+served by `llama-server` as `POST /decision`.
 
 ## Build
 
@@ -59,13 +63,13 @@ sequence (about 50 MB each for Qwen3.5 4B and 9B), and llama.cpp only batches th
 the same number of tokens. The engine right-pads each group of branches to its longest one, so they still score in a
 single pass; the padding comes after the token that is read, so it doesn't change the result.
 
-## POST /v1/decision
+## POST /decision
 
 `contexts` is a list of 1-256 strings. They share one schema, one set of instructions, and one cached prefix; results
 come back in the same order.
 
 ```bash
-curl http://localhost:8096/v1/decision -H "Content-Type: application/json" -d '{
+curl http://localhost:8096/decision -H "Content-Type: application/json" -d '{
   "model": "gemma-4-12b",
   "instructions": "Answer each question about this support request from its state.",
   "schema": {
@@ -121,6 +125,35 @@ Numeric fields take `aggregate`: `mode` (default), `median` or `mean`.
 | `mode` | `auto` | `tree` scores every divergence node and returns exact probabilities; `greedy` walks the trie; `auto` picks tree up to `tree_max` values |
 | `tree_max` | 128 | per-field switch between tree and greedy |
 | `cache_prompt` | true | reuse the cached instructions + schema prefix |
+
+## Images
+
+Add `images` alongside `contexts`. It is positional: entry *i* belongs to context *i*. An entry is either one
+base64 string or an array of base64 strings when a single context should see several images. A data URL prefix
+is accepted and stripped.
+
+```bash
+curl http://localhost:8096/decision -H "Content-Type: application/json" -d '{
+  "instructions": "Answer each question about this screenshot.",
+  "schema": {
+    "properties": {
+      "page": {"type": "string", "enum": ["login", "checkout", "settings", "other"]},
+      "error":  {"type": "boolean"}
+    }
+  },
+  "contexts": ["What kind of page is this?"],
+  "images": ["iVBORw0KGgoAAAANSUhEUg..."]
+}'
+```
+
+Images are placed by the media marker that `mtmd` reserves for the loaded projector. If the context text already
+contains that marker, the marker is left where the caller put it, so you can interleave markers with your own labels
+and control which part of the text each image belongs to. If the text has no marker, one is prepended per image.
+
+Because the chunks are encoded in the same batched pass that scores the branches, adding images does not turn a
+decision into a sequence of generate calls.
+
+Set `LLAMA_DECISION_DEBUG` in the environment to trace tokenization, chunk encoding, and decode on this path.
 
 ## CLI
 

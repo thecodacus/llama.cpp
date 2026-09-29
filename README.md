@@ -89,6 +89,13 @@ The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-or
 
 ## Documentation
 
+#### Constrained decisions
+
+- [parallel-decision](tools/parallel-decision/README.md) - answer a JSON schema in one batched
+  pass, with images, over `POST /decision`
+- [vision decision harness](tools/parallel-decision/examples/vision-decision-harness/) - example
+  web UI for driving the endpoint over images and text
+
 #### Tools
 
 - [cli](tools/cli/README.md)
