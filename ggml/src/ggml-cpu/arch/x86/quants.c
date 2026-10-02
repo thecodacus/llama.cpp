@@ -698,6 +698,81 @@ void ggml_vec_dot_q1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
 #endif
 }
 
+void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int qk = QK2_0;
+    const int nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_q2_0 * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+
+    // the codes 0..3 are the weights -1..2, so use dot(codes, y) - sum(y)
+#if defined(__AVX512VBMI__) && defined(__AVX512VNNI__)
+    // multishift puts 2-bit code i of each 16-bit group into byte i
+    const __m512i shifts = _mm512_set1_epi64(0x0E0C0A0806040200LL);
+    const __m512i m3 = _mm512_set1_epi8(3);
+    const __m512i ones = _mm512_set1_epi8(1);
+    const __m512i zero = _mm512_setzero_si512();
+    __m512 acc = _mm512_setzero_ps();
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const __m512i qx = _mm512_cvtepu16_epi64(_mm_loadu_si128((const __m128i *) x[ib].qs));
+        const __m512i codes = _mm512_and_si512(_mm512_multishift_epi64_epi8(shifts, qx), m3);
+        const __m512i qy = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *) y[2*ib + 0].qs)),
+                                              _mm256_loadu_si256((const __m256i *) y[2*ib + 1].qs), 1);
+        const __m512i dot = _mm512_sub_epi32(_mm512_dpbusd_epi32(zero, codes, qy), _mm512_dpbusd_epi32(zero, ones, qy));
+
+        const float d0 = GGML_CPU_FP16_TO_FP32(x[ib].d);
+        const __m512 d = _mm512_mask_mov_ps(_mm512_set1_ps(d0 * GGML_CPU_FP16_TO_FP32(y[2*ib + 0].d)), 0xFF00,
+                                            _mm512_set1_ps(d0 * GGML_CPU_FP16_TO_FP32(y[2*ib + 1].d)));
+        acc = _mm512_fmadd_ps(d, _mm512_cvtepi32_ps(dot), acc);
+    }
+
+    *s = _mm512_reduce_add_ps(acc);
+#elif defined(__AVX2__)
+    const __m128i m3 = _mm_set1_epi8(3);
+    const __m256i ones = _mm256_set1_epi8(1);
+    __m256 acc = _mm256_setzero_ps();
+
+    for (int ib = 0; ib < nb; ++ib) {
+        // byte j holds the weights 4j..4j+3, interleave the four code planes back into that order
+        const __m128i q = _mm_loadu_si128((const __m128i *) x[ib].qs);
+        const __m128i c0 = _mm_and_si128(q, m3);
+        const __m128i c1 = _mm_and_si128(_mm_srli_epi16(q, 2), m3);
+        const __m128i c2 = _mm_and_si128(_mm_srli_epi16(q, 4), m3);
+        const __m128i c3 = _mm_and_si128(_mm_srli_epi16(q, 6), m3);
+        const __m128i c01_lo = _mm_unpacklo_epi8(c0, c1);
+        const __m128i c01_hi = _mm_unpackhi_epi8(c0, c1);
+        const __m128i c23_lo = _mm_unpacklo_epi8(c2, c3);
+        const __m128i c23_hi = _mm_unpackhi_epi8(c2, c3);
+        const __m256i w0 = MM256_SET_M128I(_mm_unpackhi_epi16(c01_lo, c23_lo), _mm_unpacklo_epi16(c01_lo, c23_lo));
+        const __m256i w1 = MM256_SET_M128I(_mm_unpackhi_epi16(c01_hi, c23_hi), _mm_unpacklo_epi16(c01_hi, c23_hi));
+
+        const __m256i qy0 = _mm256_loadu_si256((const __m256i *) y[2*ib + 0].qs);
+        const __m256i qy1 = _mm256_loadu_si256((const __m256i *) y[2*ib + 1].qs);
+        const __m256 p0 = _mm256_sub_ps(mul_sum_us8_pairs_float(w0, qy0), mul_sum_us8_pairs_float(ones, qy0));
+        const __m256 p1 = _mm256_sub_ps(mul_sum_us8_pairs_float(w1, qy1), mul_sum_us8_pairs_float(ones, qy1));
+
+        const float d0 = GGML_CPU_FP16_TO_FP32(x[ib].d);
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(d0 * GGML_CPU_FP16_TO_FP32(y[2*ib + 0].d)), p0, acc);
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(d0 * GGML_CPU_FP16_TO_FP32(y[2*ib + 1].d)), p1, acc);
+    }
+
+    *s = hsum_float_8(acc);
+#else
+    UNUSED(nb);
+    UNUSED(x);
+    UNUSED(y);
+    ggml_vec_dot_q2_0_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
+#endif
+}
+
 void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK8_0;
     const int nb = n / qk;
