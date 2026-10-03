@@ -3202,6 +3202,10 @@ static bool ggml_cuda_match_moe_weighted_reduction(
     if (mul_count == 2) {
         ops[1] = GGML_OP_MUL;
     }
+    // a weighting done in place is itself a view of the expert outputs, and views of it resolve to that base
+    const ggml_tensor * weighted_base = weighted->view_src ? weighted->view_src : weighted;
+    const size_t        weighted_offs = weighted->view_src ? weighted->view_offs : 0;
+
     std::vector<const ggml_tensor *> views;
     views.reserve(n_expert_used);
     const ggml_tensor * previous = nullptr;
@@ -3212,11 +3216,11 @@ static bool ggml_cuda_match_moe_weighted_reduction(
 
         if (candidate->op == GGML_OP_VIEW) {
             const int expert = (int) views.size();
-            if (expert >= n_expert_used || candidate->src[0] != weighted || candidate->view_src != weighted ||
+            if (expert >= n_expert_used || candidate->src[0] != weighted || candidate->view_src != weighted_base ||
                     candidate->type != GGML_TYPE_F32 || candidate->ne[0] != weighted->ne[0] ||
                     candidate->ne[1] != n_tokens || candidate->ne[2] != 1 || candidate->ne[3] != 1 ||
                     candidate->nb[0] != weighted->nb[0] || candidate->nb[1] != weighted->nb[2] ||
-                    candidate->view_offs != (size_t) expert * weighted->nb[1]) {
+                    candidate->view_offs != weighted_offs + (size_t) expert * weighted->nb[1]) {
                 return false;
             }
             views.push_back(candidate);
@@ -3243,8 +3247,31 @@ static bool ggml_cuda_match_moe_weighted_reduction(
         return false;
     }
 
+    // the nodes checked for outside uses: a weighting done in place writes into the expert outputs, so the node that
+    // produced them is part of the check as well (the fused kernel reads them as they are, and nothing else may)
+    std::vector<int>     idxs;
+    std::vector<ggml_op> idx_ops;
+    if (weighted_base != weighted && weighted_base != first) {
+        int base_idx = -1;
+        for (int k = node_idx - 1; k >= 0; --k) {
+            if (cgraph->nodes[k] == weighted_base) {
+                base_idx = k;
+                break;
+            }
+        }
+        if (base_idx < 0) {
+            return false;
+        }
+        idxs.push_back(base_idx);
+        idx_ops.push_back(weighted_base->op);
+    }
+    for (int k = 0; k < node_count; ++k) {
+        idxs.push_back(node_idx + k);
+        idx_ops.push_back(ops[k]);
+    }
+
     const int output_idx = node_idx + node_count - 1;
-    if (!ggml_can_fuse_subgraph(cgraph, node_idx, node_count, ops.data(), &output_idx, 1)) {
+    if (!ggml_can_fuse_subgraph_ext(cgraph, idxs.data(), (int) idxs.size(), idx_ops.data(), &output_idx, 1)) {
         return false;
     }
 

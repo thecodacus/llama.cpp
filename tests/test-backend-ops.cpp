@@ -6522,16 +6522,19 @@ struct test_moe_weighted_reduction : public test_case {
     const bool unaligned_experts;
     const bool with_expert_scale;
     const bool interleaved_views_adds;
+    const bool inplace_weights;
 
     test_moe_weighted_reduction(
             int64_t n_embd, int64_t n_expert_used, int64_t n_tokens,
-            bool unaligned_experts = false, bool with_expert_scale = false, bool interleaved_views_adds = false) :
+            bool unaligned_experts = false, bool with_expert_scale = false, bool interleaved_views_adds = false,
+            bool inplace_weights = false) :
         n_embd(n_embd), n_expert_used(n_expert_used), n_tokens(n_tokens),
         unaligned_experts(unaligned_experts), with_expert_scale(with_expert_scale),
-        interleaved_views_adds(interleaved_views_adds) {}
+        interleaved_views_adds(interleaved_views_adds), inplace_weights(inplace_weights) {}
 
     std::string vars() override {
-        return VARS_TO_STR6(n_embd, n_expert_used, n_tokens, unaligned_experts, with_expert_scale, interleaved_views_adds);
+        return VARS_TO_STR7(n_embd, n_expert_used, n_tokens, unaligned_experts, with_expert_scale, interleaved_views_adds,
+            inplace_weights);
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -6553,6 +6556,11 @@ struct test_moe_weighted_reduction : public test_case {
             experts = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_expert_used, n_tokens);
         }
         ggml_set_name(experts, "experts");
+        if (inplace_weights) {
+            // as from a matrix multiplication: a weighting in place writes into a node, never into an input
+            experts = ggml_scale(ctx, experts, 1.0f);
+            ggml_set_name(experts, "experts_out");
+        }
         ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_expert_used, n_tokens);
         ggml_set_name(weights, "weights");
 
@@ -6564,7 +6572,7 @@ struct test_moe_weighted_reduction : public test_case {
             ggml_set_name(scaled, "scaled_experts");
         }
 
-        ggml_tensor * weighted = ggml_mul(ctx, scaled, weights);
+        ggml_tensor * weighted = inplace_weights ? ggml_mul_inplace(ctx, scaled, weights) : ggml_mul(ctx, scaled, weights);
         ggml_set_name(weighted, "weighted_experts");
 
         std::vector<ggml_tensor *> views(n_expert_used);
@@ -10463,6 +10471,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_weighted_reduction(63,   12, 33, true,  true, true));
     test_cases.emplace_back(new test_moe_weighted_reduction(2048, 15, 40, false, true));
     test_cases.emplace_back(new test_moe_weighted_reduction(2048, 16, 32, false, true));
+    test_cases.emplace_back(new test_moe_weighted_reduction(2560, 10, 64, false, false, false, true));
+    test_cases.emplace_back(new test_moe_weighted_reduction(63,   12, 33, true,  true,  true,  true));
+    test_cases.emplace_back(new test_moe_weighted_reduction(2048, 8, 128, false, true,  false, true));
 
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
