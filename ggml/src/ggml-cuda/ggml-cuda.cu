@@ -2611,6 +2611,18 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
     return use_cuda_graph;
 }
 
+// a matmul over many tokens: prompt processing, not a decode step
+static bool ggml_cuda_graph_is_large_batch(const ggml_cgraph * cgraph) {
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if ((node->op == GGML_OP_MUL_MAT    && node->src[1]->ne[1] >= 512) ||
+            (node->op == GGML_OP_MUL_MAT_ID && node->src[1]->ne[2] >= 512)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // a captured graph hard-codes its shapes, so with one key per split an alternating shape
 // (a speculative verify batch) resets warmup forever. O(1) on purpose: walking nodes undoes the
 // point of a cuda graph. A shape this fails to separate re-captures as before, so it cannot regress.
@@ -4481,7 +4493,13 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
-            if (!graph->warmup_complete) {
+            if (ggml_cuda_graph_is_large_batch(cgraph)) {
+                // captured on every call: a large batch's shapes change from one call to the next (the context
+                // grows), so it never passes the warm-up, and its thousands of kernels launched one by one fill the
+                // device queue and hold the host, which then cannot feed another device (pipeline parallelism)
+                use_cuda_graph = true;
+                cuda_graph_update_required = properties_changed || graph->instance == nullptr;
+            } else if (!graph->warmup_complete) {
                 // Warmup: need at least 2 calls with no property change on the 2nd call
                 if (!properties_changed) {
                     graph->warmup_complete = true;
