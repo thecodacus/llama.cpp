@@ -616,8 +616,9 @@ void llama_context::sched_reserve() {
     const uint32_t n_seqs = cparams.n_seq_max;
     uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
 
-    // with the expert cache resident only batches below the borrow size run, larger ones free the packs first
-    if (cparams.moe_cache_borrow > 0 && !cparams.moe_packs_off) {
+    // with the expert cache resident only batches below the borrow size run, larger ones free the packs first; before
+    // fitted packs are built the same holds, so the large buffers do not take the memory a draft model loads into
+    if (cparams.moe_cache_borrow > 0 && (!cparams.moe_packs_off || (moe_cache_on && !model.moe_cache_built()))) {
         n_tokens = std::max(n_seqs, std::min(n_tokens, cparams.moe_cache_borrow - 1));
     }
 

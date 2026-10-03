@@ -750,6 +750,7 @@ struct llama_model {
     // are built at load for a fixed slot count, or on first use when the slots are fitted to the free memory
     bool    moe_cache_has_layers()   const;
     bool    moe_cache_resident()     const;
+    bool    moe_cache_built()        const; // packs were built at least once (at load for a fixed slot count)
     bool    moe_cache_auto()         const;
     int32_t moe_cache_borrow_param() const;
 

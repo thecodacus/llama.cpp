@@ -1187,6 +1187,7 @@ struct llama_model::impl {
     std::vector<moe_group> moe_groups;
     std::vector<moe_pack>  moe_packs;
     int32_t                moe_slots = 0; // > 0 fixed, < 0 fitted to the free memory
+    bool                   moe_built = false;
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
@@ -2045,6 +2046,10 @@ bool llama_model::moe_cache_resident() const {
     return !pimpl->moe_packs.empty();
 }
 
+bool llama_model::moe_cache_built() const {
+    return pimpl->moe_built;
+}
+
 bool llama_model::moe_cache_auto() const {
     return pimpl->moe_slots < 0;
 }
@@ -2202,6 +2207,7 @@ bool llama_model::moe_cache_build(bool probe) const {
         }
 
         const size_t total_bytes = moe_pack_upload(pimpl->moe_packs.size() - 1);
+        pimpl->moe_built = true;
         LLAMA_LOG_INFO("%s: expert cache: %zu layers x %d slots, %.2f MiB uploaded to %s\n",
             __func__, group.layers.size(), n_slots, total_bytes/1024.0/1024.0, ggml_backend_dev_name(group.dev));
     }
