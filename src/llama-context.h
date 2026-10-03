@@ -357,10 +357,6 @@ private:
     // the KV cells the lent buffers are reserved for: the batch that lent them reaches far fewer cells than n_ctx
     uint32_t lend_cells = 0;
 
-    // per device, the matrix multiplication scratch of the largest ubatch run on the lent memory so far: the backends'
-    // scratch pools keep what they took, so a later lend needs free memory only for what goes beyond it
-    std::map<ggml_backend_dev_t, size_t> lend_scratch;
-
     // set while the lent memory is fitted: a pipelined reserve that does not fit fails instead of falling back, or
     // the reserve does not pipeline at all
     bool pipeline_required = false;

@@ -811,28 +811,26 @@ void llama_context::moe_cache_switch(bool off) {
                 try {
                     sched_reserve();
                     // the scratch is not in the compute buffers: a ubatch whose buffers fill the lent memory fails at
-                    // its first matrix multiplication
-                    std::map<ggml_backend_dev_t, size_t> need;
+                    // its first matrix multiplication. all of it has to be free: a scratch pool grows to what the
+                    // ubatches it ran needed, which says nothing about this size. every GPU of the context is held to
+                    // the largest one (the reserve resets the node assignments, and splitting again is slow)
+                    size_t need = 0;
                     ggml_cgraph * gf = gf_res_reserve->get_gf();
                     for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
-                        ggml_tensor * node = ggml_graph_node(gf, i);
-                        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), node);
-                        ggml_backend_dev_t dev = backend ? ggml_backend_get_device(backend) : nullptr;
-                        if (dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
-                            need[dev] = std::max(need[dev], llama_mul_mat_scratch(node));
-                        }
+                        need = std::max(need, llama_mul_mat_scratch(ggml_graph_node(gf, i)));
                     }
-                    for (const auto & [dev, n_need] : need) {
+                    for (ggml_backend_t backend : backend_ptrs) {
+                        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+                        if (!dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                            continue;
+                        }
                         size_t free = 0;
                         size_t total = 0;
                         ggml_backend_dev_memory(dev, &free, &total);
-                        if (n_need > lend_scratch[dev] && n_need - lend_scratch[dev] > free) {
+                        if (need > free) {
                             throw std::runtime_error(format("%zu MiB of matrix multiplication scratch is not free on %s",
-                                (n_need - lend_scratch[dev])/(1024*1024), ggml_backend_dev_name(dev)));
+                                need/(1024*1024), ggml_backend_dev_name(dev)));
                         }
-                    }
-                    for (const auto & [dev, n_need] : need) {
-                        lend_scratch[dev] = std::max(lend_scratch[dev], n_need);
                     }
                     ok = true;
                     break;
