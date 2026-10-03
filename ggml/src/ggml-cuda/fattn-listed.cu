@@ -345,8 +345,23 @@ static __global__ void flash_attn_ext_listed_q8(
         __syncthreads();
 
         // P V: warp w owns dims 64w..64w+63, which are q8_0 blocks 2w and 2w+1: p is packed once per block with the
-        // block's V scale folded in
+        // block's V scale folded in, relative to the block's largest scale in the chunk and times 2^14, so that the
+        // f16 product keeps p's own precision (a small p times a small scale would fall below f16's normal range);
+        // the factor is taken back out in f32
         {
+            float vdown[2];
+            float vup[2];
+#pragma unroll
+            for (int g = 0; g < 2; ++g) {
+                float vmax = fabsf(__half2float(*reinterpret_cast<const half *>(&S.kv[b][1][lane][(2*warp + g)*sizeof(block_q8_0)])));
+#pragma unroll
+                for (int o = WARP_SIZE/2; o > 0; o >>= 1) {
+                    vmax = fmaxf(vmax, __shfl_xor_sync(0xFFFFFFFF, vmax, o));
+                }
+                vup[g]   = vmax > 0.0f ? 16384.0f/vmax : 0.0f;
+                vdown[g] = vmax*(1.0f/16384.0f);
+            }
+
             float tmp[8][4];
 #pragma unroll
             for (int j = 0; j < 8; ++j) {
@@ -360,10 +375,10 @@ static __global__ void flash_attn_ext_listed_q8(
                 for (int g = 0; g < 2; ++g) {
                     const int blk  = 2*warp + g;
                     const int boff = blk*int(sizeof(block_q8_0));
-                    const float dA0 = __half2float(*reinterpret_cast<const half *>(&S.kv[b][1][cA    ][boff]));
-                    const float dA1 = __half2float(*reinterpret_cast<const half *>(&S.kv[b][1][cA + 1][boff]));
-                    const float dB0 = __half2float(*reinterpret_cast<const half *>(&S.kv[b][1][cB    ][boff]));
-                    const float dB1 = __half2float(*reinterpret_cast<const half *>(&S.kv[b][1][cB + 1][boff]));
+                    const float dA0 = __half2float(*reinterpret_cast<const half *>(&S.kv[b][1][cA    ][boff]))*vup[g];
+                    const float dA1 = __half2float(*reinterpret_cast<const half *>(&S.kv[b][1][cA + 1][boff]))*vup[g];
+                    const float dB0 = __half2float(*reinterpret_cast<const half *>(&S.kv[b][1][cB    ][boff]))*vup[g];
+                    const float dB1 = __half2float(*reinterpret_cast<const half *>(&S.kv[b][1][cB + 1][boff]))*vup[g];
                     uint32_t pf[4];
                     pf[0] = fattn_listed_pack(S.s[gid    ][cA]*dA0, S.s[gid    ][cA + 1]*dA1);
                     pf[1] = fattn_listed_pack(S.s[gid + 8][cA]*dA0, S.s[gid + 8][cA + 1]*dA1);
@@ -384,10 +399,11 @@ static __global__ void flash_attn_ext_listed_q8(
             const float a1 = S.alpha[gid + 8];
 #pragma unroll
             for (int j = 0; j < 8; ++j) {
-                acc[j][0] = acc[j][0]*a0 + tmp[j][0];
-                acc[j][1] = acc[j][1]*a0 + tmp[j][1];
-                acc[j][2] = acc[j][2]*a1 + tmp[j][2];
-                acc[j][3] = acc[j][3]*a1 + tmp[j][3];
+                const float down = vdown[j/4];
+                acc[j][0] = acc[j][0]*a0 + tmp[j][0]*down;
+                acc[j][1] = acc[j][1]*a0 + tmp[j][1]*down;
+                acc[j][2] = acc[j][2]*a1 + tmp[j][2]*down;
+                acc[j][3] = acc[j][3]*a1 + tmp[j][3]*down;
             }
         }
 
