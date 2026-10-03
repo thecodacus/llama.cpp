@@ -703,6 +703,14 @@ public:
     void set_input(const llama_ubatch * ubatch) override {
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
         mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
+
+        GGML_ASSERT(ggml_backend_buffer_is_host(tok_rows->buffer));
+        int32_t * rows = (int32_t *) tok_rows->data;
+        for (int64_t s = 0; s < tok_rows->ne[1]; ++s) {
+            for (int64_t t = 0; t < tok_rows->ne[0]; ++t) {
+                rows[s*tok_rows->ne[0] + t] = (int32_t) t;
+            }
+        }
     }
 
     bool can_reuse(const llm_graph_params & params) override {
@@ -728,6 +736,7 @@ public:
         res &= blk_pos->ne[0]   == 4*n_blocks*n_stream;
         res &= bias->ne[0]      == (blk_bias ? n_blocks : n_kv);
         res &= bias->ne[1]      == params.ubatch.n_tokens/n_stream;
+        res &= tok_rows->ne[0]  == params.ubatch.n_tokens/n_stream;
 
         return res;
     }
@@ -738,6 +747,7 @@ public:
     ggml_tensor * blk_cells = nullptr;   // I32 [ratio*n_blocks, n_stream]
     ggml_tensor * blk_pos   = nullptr;   // I32 [4*n_blocks*n_stream]
     ggml_tensor * bias      = nullptr;   // F32 [n_blocks or n_kv, n_tokens/n_stream, n_stream]
+    ggml_tensor * tok_rows  = nullptr;   // I32 [n_tokens/n_stream, n_stream]: 0..n-1, the chunks gather their token rows
 
     const llama_memory_hybrid_idx_context * mctx;
     const uint32_t ratio;
@@ -791,11 +801,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
         qsa->blk_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);
         qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
+        qsa->tok_rows  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_tps, n_stream);
 
         ggml_set_input(qsa->cell_blk);
         ggml_set_input(qsa->blk_cells);
         ggml_set_input(qsa->blk_pos);
         ggml_set_input(qsa->bias);
+        ggml_set_input(qsa->tok_rows);
 
         inp = qsa.get();
         res->add_input(std::move(qsa));
@@ -853,17 +865,32 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
     // the per-head block scores and the per-cell scores are context x tokens f32 (1 GiB each at 64k cells and 4096
     // tokens), so a large batch scores a chunk of tokens at a time, about 64 MiB per tensor and at most 16 chunks;
-    // only the top-k indices of each chunk are kept
-    const int64_t row_bytes = std::max(n_kv, n_blocks*n_idx_h)*n_stream*(int64_t) sizeof(float);
+    // only the top-k indices of each chunk are kept. the chunk count is planned for the full context and the full
+    // ubatch, not for the cells in use or this ubatch's length: a node count that changed as the context fills, or for
+    // the shorter last ubatch, would re-plan the compute buffers (and drain every device) between ubatches
+    const int64_t n_cells   = std::max<int64_t>(n_kv*n_stream, n_ctx);
+    const int64_t row_bytes = std::max(n_cells, (n_cells/r + n_stream)*n_idx_h)*(int64_t) sizeof(float);
     const int64_t chunk_min = std::max<int64_t>(1, ((int64_t) 64 << 20) / row_bytes);
-    const int64_t chunk     = std::min(n_tps, std::max(chunk_min, (n_tps + 15)/16));
+    const int64_t n_tps_max = std::max<int64_t>(n_tps, cparams.n_ubatch/n_stream);
+    const int64_t plan      = std::max(chunk_min, (n_tps_max + 15)/16);
+    const int64_t n_chunks  = std::min(n_tps, (n_tps_max + plan - 1) / plan);
 
-    ggml_tensor * q4       = ggml_reshape_4d(ctx0, q, idx_dim, n_idx_h, n_tps, n_stream);
-    ggml_tensor * mask_all = blk_bias ? ggml_reshape_3d(ctx0, kq_mask, n_kv, n_tps, n_stream) : inp->bias;
+    ggml_tensor * q4 = ggml_reshape_4d(ctx0, q, idx_dim, n_idx_h, n_tps, n_stream);
 
-    ggml_tensor * top_k = nullptr;
-    for (int64_t t0 = 0; t0 < n_tps; t0 += chunk) {
-        const int64_t n_t = std::min(chunk, n_tps - t0);
+    // the chunks view this device-side copy of the token rows: every view of a host input would be an input of its own
+    // split, and the scheduler waits for the device to finish the previous split before it copies a user input
+    ggml_tensor * tok_rows = ggml_cont(ctx0, inp->tok_rows);
+
+    // each chunk writes its rows of the result in place; a chain of concats copied the growing result once per chunk
+    ggml_tensor * top_k = n_chunks > 1 ? ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, width, n_tps, n_stream) : nullptr;
+    for (int64_t c = 0; c < n_chunks; ++c) {
+        // an even split: every ubatch of at least n_chunks tokens builds the same nodes
+        const int64_t t0  = c*n_tps/n_chunks;
+        const int64_t n_t = (c + 1)*n_tps/n_chunks - t0;
+
+        // the chunk's rows of the bias and the mask are gathered on the device from the whole tensors: a view of a host
+        // input is copied to the device on its own, so views would add a copy per chunk and layer next to the mask's
+        ggml_tensor * rows = ggml_view_2d(ctx0, tok_rows, n_t, n_stream, tok_rows->nb[1], t0*tok_rows->nb[0]);
 
         ggml_tensor * q_c = ggml_view_4d(ctx0, q4, idx_dim, n_idx_h, n_t, n_stream, q4->nb[1], q4->nb[2], q4->nb[3], t0*q4->nb[2]);
         if (!ggml_is_contiguous(q_c)) {
@@ -889,8 +916,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
         // one value per block, so it is cheaper to bias here than after the cells are expanded
         if (blk_bias) {
-            score = ggml_add(ctx0, score, ggml_view_3d(ctx0, inp->bias, n_blocks, n_t, n_stream,
-                    inp->bias->nb[1], inp->bias->nb[2], t0*inp->bias->nb[1]));
+            score = ggml_add(ctx0, score, ggml_get_rows(ctx0, inp->bias, rows));
         }
 
         // every token of a block gets the block score; the budget is whole blocks, so top-k cuts on a block boundary
@@ -898,18 +924,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
                 ggml_cont(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3)), inp->cell_blk);
         expanded = ggml_cont(ctx0, ggml_permute(ctx0, expanded, 1, 0, 2, 3));
 
-        // with blk_bias this is the attention mask, which flash attention keeps in f16; the scores are f32
-        ggml_tensor * mask = ggml_view_3d(ctx0, mask_all, n_kv, n_t, n_stream, mask_all->nb[1], mask_all->nb[2], t0*mask_all->nb[1]);
-        if (mask->type != GGML_TYPE_F32) {
-            mask = ggml_cast(ctx0, mask, GGML_TYPE_F32);
-        } else if (!ggml_is_contiguous(mask)) {
-            mask = ggml_cont(ctx0, mask);
-        }
+        // with blk_bias this is the attention mask [n_kv, n_tps, 1, n_stream], in f16 for flash attention; get_rows
+        // gives f32 rows, which the scores are
+        ggml_tensor * mask = blk_bias
+            ? ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, kq_mask, ggml_view_3d(ctx0, rows, n_t, 1, n_stream,
+                    rows->nb[1], rows->nb[1], 0)), n_kv, n_t, n_stream)
+            : ggml_get_rows(ctx0, inp->bias, rows);
         expanded = ggml_add(ctx0, expanded, mask);
         cb(expanded, "indexer_score_tokens", il);
 
         ggml_tensor * top_k_c = ggml_cont(ctx0, ggml_top_k(ctx0, expanded, width));
-        top_k = top_k ? ggml_concat(ctx0, top_k, top_k_c, 1) : top_k_c;
+        top_k = top_k ? ggml_set_inplace(ctx0, top_k, top_k_c, top_k->nb[1], top_k->nb[2], top_k->nb[3], t0*top_k->nb[1]) : top_k_c;
     }
 
     // build_attn_qsa reads [n_top_k, n_batch, 1, n_stream], matching the KQ mask.
@@ -991,10 +1016,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    // TODO: enable sparse attention when we are ready
-    // ref: https://github.com/ggml-org/llama.cpp/pull/27970
-    //ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, top_k->ne[0], kq_scale, il);
-    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, 0, kq_scale, il);
+    // sparse attention: at most top_k->ne[0] cells of a row are finite, so a backend that gathers them reads only those
+    // instead of the whole context (ref: https://github.com/ggml-org/llama.cpp/pull/27970)
+    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, top_k->ne[0], kq_scale, il);
     cb(cur, "kqv_out", il);
 
     // the rotation is its own inverse, so undo it on the value side of the output
