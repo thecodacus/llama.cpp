@@ -2664,6 +2664,10 @@ llama_kv_cache_context::llama_kv_cache_context(llama_memory_status status) : sta
 llama_kv_cache_context::llama_kv_cache_context(
         llama_kv_cache * kv) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
     n_kv = kv->get_size();
+    if (kv->get_reserve_cells() > 0) {
+        // padded as get_n_kv pads, so the graphs this reserve stands for fit in it
+        n_kv = std::min<int32_t>(n_kv, GGML_PAD(kv->get_reserve_cells(), 256u));
+    }
 
     const uint32_t n_stream = kv->get_n_stream();
 

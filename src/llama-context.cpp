@@ -759,6 +759,12 @@ void llama_context::moe_cache_switch(bool off) {
     // free the compute buffers first: their memory goes to the packs, or the packs' memory to the new buffers
     sched.reset();
 
+    // lent buffers serve the cells the lending batch reaches, not the whole cache, so a larger ubatch fits in the lent
+    // memory; the decode-size buffers of the resident cache serve any position up to n_ctx
+    if (memory) {
+        memory->set_reserve_cells(off ? lend_cells : 0);
+    }
+
     bool ok = true;
     if (off) {
         model.moe_cache_release();
@@ -821,6 +827,9 @@ void llama_context::moe_cache_switch(bool off) {
         moe_cache_on             = false;
         cparams.moe_packs_off    = true;
         cparams.moe_cache_borrow = 0;
+        if (memory) {
+            memory->set_reserve_cells(0);
+        }
         sched.reset();
         sched_need_reserve = true;
         sched_reserve();
@@ -1889,10 +1898,18 @@ int llama_context::decode(const llama_batch & batch_inp) {
     llama_memory_context_ptr mctx;
 
     // a batch whose first ubatch borrows the expert cache memory lends it before the batch is split, so the split uses
-    // the ubatch size fitted to the lent memory
+    // the ubatch size fitted to the lent memory. the buffers are reserved for the cells the batch can reach, twice
+    // that for the batches that follow, and fitted again when a later batch reaches beyond them
     if (moe_cache_on && (n_decode_calls > 1 || !model.moe_cache_auto()) && cparams.moe_cache_borrow > 0 &&
-        !cparams.moe_packs_off && std::min(n_tokens_all, n_ubatch_max) >= cparams.moe_cache_borrow) {
-        moe_cache_switch(true);
+        std::min(n_tokens_all, n_ubatch_max) >= cparams.moe_cache_borrow) {
+        uint32_t n_cells = n_tokens_all;
+        for (llama_seq_id s = 0; memory && s < (llama_seq_id) cparams.n_seq_max; ++s) {
+            n_cells += std::max<llama_pos>(memory->seq_pos_max(s) + 1, 0);
+        }
+        if (!cparams.moe_packs_off || n_cells > lend_cells) {
+            lend_cells = std::min(cparams.n_ctx, std::max(2*n_cells, 8192u));
+            moe_cache_switch(true);
+        }
     }
 
     while (true) {

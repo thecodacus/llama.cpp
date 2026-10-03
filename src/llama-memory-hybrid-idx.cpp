@@ -128,6 +128,13 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
     return std::make_unique<llama_memory_hybrid_idx_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
 }
 
+void llama_memory_hybrid_idx::set_reserve_cells(uint32_t n_cells) {
+    llama_memory_hybrid::set_reserve_cells(n_cells);
+    if (mem_idx) {
+        mem_idx->set_reserve_cells(n_cells);
+    }
+}
+
 llama_memory_context_ptr llama_memory_hybrid_idx::init_full() {
     return std::make_unique<llama_memory_hybrid_idx_context>(this);
 }

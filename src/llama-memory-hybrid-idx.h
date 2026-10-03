@@ -52,6 +52,9 @@ public:
 
     llama_memory_context_ptr init_full() override;
 
+    // the indexer cache tracks the attention cache cell for cell
+    void set_reserve_cells(uint32_t n_cells) override;
+
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     void clear(bool data) override;

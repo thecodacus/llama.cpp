@@ -354,6 +354,9 @@ private:
     // the configured ubatch: while the cache is lent, n_ubatch is the largest size up to this that fits in its memory
     uint32_t n_ubatch_max = 0;
 
+    // the KV cells the lent buffers are reserved for: the batch that lent them reaches far fewer cells than n_ctx
+    uint32_t lend_cells = 0;
+
     // set while the lent memory is fitted: a pipelined reserve that does not fit fails instead of falling back, or
     // the reserve does not pipeline at all
     bool pipeline_required = false;
