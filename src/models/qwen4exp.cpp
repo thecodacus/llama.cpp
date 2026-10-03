@@ -881,8 +881,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     // split, and the scheduler waits for the device to finish the previous split before it copies a user input
     ggml_tensor * tok_rows = ggml_cont(ctx0, inp->tok_rows);
 
-    // each chunk writes its rows of the result in place; a chain of concats copied the growing result once per chunk
-    ggml_tensor * top_k = n_chunks > 1 ? ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, width, n_tps, n_stream) : nullptr;
+    // the chunks are joined pairwise, so each row is copied about log2(n_chunks) times; a chain of concats copied the
+    // growing result once per chunk, and a result tensor written in place is a graph leaf, which the allocator holds
+    // from the start of the graph (every layer's at once)
+    std::vector<std::pair<ggml_tensor *, int64_t>> parts; // a joined run of chunks and its chunk count
     for (int64_t c = 0; c < n_chunks; ++c) {
         // an even split: every ubatch of at least n_chunks tokens builds the same nodes
         const int64_t t0  = c*n_tps/n_chunks;
@@ -933,8 +935,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         expanded = ggml_add(ctx0, expanded, mask);
         cb(expanded, "indexer_score_tokens", il);
 
-        ggml_tensor * top_k_c = ggml_cont(ctx0, ggml_top_k(ctx0, expanded, width));
-        top_k = top_k ? ggml_set_inplace(ctx0, top_k, top_k_c, top_k->nb[1], top_k->nb[2], top_k->nb[3], t0*top_k->nb[1]) : top_k_c;
+        parts.emplace_back(ggml_cont(ctx0, ggml_top_k(ctx0, expanded, width)), 1);
+        while (parts.size() > 1 && parts[parts.size() - 2].second == parts.back().second) {
+            auto b = parts.back(); parts.pop_back();
+            parts.back() = { ggml_concat(ctx0, parts.back().first, b.first, 1), parts.back().second + b.second };
+        }
+    }
+    ggml_tensor * top_k = parts.back().first;
+    for (size_t i = parts.size() - 1; i-- > 0;) {
+        top_k = ggml_concat(ctx0, parts[i].first, top_k, 1);
     }
 
     // build_attn_qsa reads [n_top_k, n_batch, 1, n_stream], matching the KQ mask.
@@ -995,10 +1004,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     // reshape top_k indices: [n_top_k, n_batch, 1, n_stream] -> [n_top_k, n_batch, n_stream, 1]
     ggml_tensor * top_k_3d = ggml_view_4d(ctx0, top_k, top_k->ne[0], top_k->ne[1], top_k->ne[3], 1, top_k->nb[1], top_k->nb[2], top_k->ne[3]*top_k->nb[3], 0);
 
-    // prepare zero-filled tensor with rows of size 1: [1, n_top_k, n_batch, n_stream]
-    // this will be our source of zero values for unmasking top k mask elements
-    ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, top_k_3d->ne[0], top_k_3d->ne[1], top_k_3d->ne[2]);
-    zeros = ggml_fill(ctx0, zeros, 0.0f);
+    // the source of zero values for unmasking top k mask elements: one zero repeated to [1, n_top_k, n_batch, n_stream];
+    // a zero-filled tensor of that shape would be a graph leaf, which the allocator holds from the start of the graph
+    ggml_tensor * zeros = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1), 0.0f);
+    zeros = ggml_repeat_4d(ctx0, zeros, 1, top_k_3d->ne[0], top_k_3d->ne[1], top_k_3d->ne[2]);
 
     // modify KQ mask by unmasking elements that are in top_k indices
     // ggml_set_rows([1, n_kv, n_batch, n_stream], [1, n_top_k, n_batch, n_stream], [n_top_k, n_batch, n_stream, 1])
