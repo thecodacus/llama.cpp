@@ -20,8 +20,10 @@ struct fattn_listed_smem {
     float mrow[16];
     float lsum[16];
     float alpha[16];
-    float mval[FATTN_LISTED_CH]; // the mask value of the chunk's cells, base 2; -inf for a hidden or empty slot
+    float mval[FATTN_LISTED_CH]; // the mask value of the chunk's cells, base 2; -inf for an empty slot
     int   cell[FATTN_LISTED_CH];
+    int   next;                  // the list position the next chunk is collected from
+    int   count;                 // cells in this chunk
 };
 
 // D = A B + D, A 16x16 row major, B 16x8 column major, f16 inputs and f32 accumulators
@@ -139,6 +141,9 @@ static __global__ void flash_attn_ext_listed(
         S.mrow[tid] = -INFINITY;
         S.lsum[tid] = 0.0f;
     }
+    if (tid == 0) {
+        S.next = 0;
+    }
 
     float acc[8][4];
 #pragma unroll
@@ -146,21 +151,50 @@ static __global__ void flash_attn_ext_listed(
         acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.0f;
     }
 
-    for (int c0 = 0; c0 < n_list; c0 += FATTN_LISTED_CH) {
-        // the cells and their mask values (read only by this chunk's gather and scores, so no barrier before)
-        if (tid < FATTN_LISTED_CH) {
-            int   c = c0 + tid < n_list ? list[c0 + tid] : -1;
-            float m = -INFINITY;
-            if (c >= 0 && c < n_kv) {
-                m = __half2float(mrow[c]) * 1.4426950408889634f;
+    for (;;) {
+        // warp 0 collects the next FATTN_LISTED_CH cells of the list that the mask leaves visible: a query early in
+        // the context lists more cells than it can see, and a hidden one would cost a whole slot. the chunk's cells
+        // are read only by its gather and scores, so no barrier before
+        if (warp == 0) {
+            static_assert(FATTN_LISTED_CH == WARP_SIZE, "one cell per lane");
+            int next  = S.next;
+            int count = 0;
+            while (count < FATTN_LISTED_CH && next < n_list) {
+                int   c = next + lane < n_list ? list[next + lane] : -1;
+                float m = -INFINITY;
+                if (c >= 0 && c < n_kv) {
+                    m = __half2float(mrow[c]) * 1.4426950408889634f;
+                }
+                const bool     visible = m != -INFINITY;
+                const uint32_t ballot  = __ballot_sync(0xFFFFFFFF, visible);
+                const int      rank    = count + __popc(ballot & ((1u << lane) - 1));
+                if (visible && rank < FATTN_LISTED_CH) {
+                    S.cell[rank] = c;
+                    S.mval[rank] = m;
+                }
+                const int room = FATTN_LISTED_CH - count;
+                if (__popc(ballot) > room) {
+                    // the list resumes at the first visible cell left out
+                    next += __fns(ballot, 0, room + 1);
+                    count = FATTN_LISTED_CH;
+                } else {
+                    next  += WARP_SIZE;
+                    count += __popc(ballot);
+                }
             }
-            if (m == -INFINITY) {
-                c = -1;
+            if (lane >= count) {
+                S.cell[lane] = -1;
+                S.mval[lane] = -INFINITY;
             }
-            S.cell[tid] = c;
-            S.mval[tid] = m;
+            if (lane == 0) {
+                S.next  = next;
+                S.count = count;
+            }
         }
         __syncthreads(); // also: the previous chunk's P V is done with k, v and s
+        if (S.count == 0) {
+            break;
+        }
 
         fattn_listed_stage<type_KV>(S.k, Kb, nb11, S.cell, tid);
         fattn_listed_stage<type_KV>(S.v, Vb, nb21, S.cell, tid);
