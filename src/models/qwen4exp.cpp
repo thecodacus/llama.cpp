@@ -365,6 +365,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
     ggml_tensor * w = ggml_sigmoid(ctx0, ggml_scale(ctx0, inject, 1.0f / (float) hc));
     w = ggml_scale(ctx0, w, 2.0f);
     w = ggml_reshape_3d(ctx0, w, 1, hc, nt);
+    // in the graph before the repeat, so that the repeat, the multiply and the add are adjacent nodes the backends can
+    // fuse
+    ggml_build_forward_expand(gf, w);
 
     ggml_tensor * b = ggml_reshape_3d(ctx0, block_out, n_embd, 1, nt);
     b = ggml_repeat_4d(ctx0, b, n_embd, hc, nt, 1);

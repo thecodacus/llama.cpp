@@ -572,3 +572,46 @@ void ggml_cuda_op_repeat_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         } break;
     }
 }
+
+// a block row at a time: the row's offsets are worked out once, the threads walk its elements
+static __global__ void k_repeat_mul_add(
+        const float * __restrict__ a, const float * __restrict__ b, const float * __restrict__ w, float * __restrict__ dst,
+        const int ne0, const int ne1, const int ne2, const int64_t nrows,
+        const int64_t sa1, const int64_t sa2, const int64_t sa3,
+        const int nb0, const int nb1, const int nb2, const int nb3, const int64_t sb1, const int64_t sb2, const int64_t sb3,
+        const int nw0, const int nw1, const int nw2, const int nw3, const int64_t sw1, const int64_t sw2, const int64_t sw3) {
+    for (int64_t r = blockIdx.y; r < nrows; r += gridDim.y) {
+        const int i1 = r % ne1;
+        const int i2 = (r / ne1) % ne2;
+        const int i3 = r / (int64_t(ne1)*ne2);
+
+        const float * ar = a + i1*sa1 + i2*sa2 + i3*sa3;
+        const float * br = b + (i1 % nb1)*sb1 + (i2 % nb2)*sb2 + (i3 % nb3)*sb3;
+        const float * wr = w + (i1 % nw1)*sw1 + (i2 % nw2)*sw2 + (i3 % nw3)*sw3;
+        float       * dr = dst + r*ne0;
+
+        for (int i0 = blockIdx.x*blockDim.x + threadIdx.x; i0 < ne0; i0 += gridDim.x*blockDim.x) {
+            dr[i0] = ar[i0] + br[nb0 == 1 ? 0 : i0 % nb0]*wr[nw0 == 1 ? 0 : i0 % nw0];
+        }
+    }
+}
+
+void ggml_cuda_op_repeat_mul_add(ggml_backend_cuda_context & ctx, ggml_tensor * repeat, ggml_tensor * mul, ggml_tensor * add) {
+    const ggml_tensor * b = repeat->src[0];
+    const ggml_tensor * w = mul->src[0] == repeat ? mul->src[1] : mul->src[0];
+    const ggml_tensor * a = add->src[0] == mul    ? add->src[1] : add->src[0];
+
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 && add->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(add));
+
+    const int     bs    = 256;
+    const int64_t nrows = ggml_nrows(add);
+    const dim3    grid((add->ne[0] + bs - 1)/bs, std::min<int64_t>(nrows, 65535), 1);
+    k_repeat_mul_add<<<grid, bs, 0, ctx.stream()>>>(
+        (const float *) a->data, (const float *) b->data, (const float *) w->data, (float *) add->data,
+        add->ne[0], add->ne[1], add->ne[2], nrows,
+        a->nb[1]/sizeof(float), a->nb[2]/sizeof(float), a->nb[3]/sizeof(float),
+        b->ne[0], b->ne[1], b->ne[2], b->ne[3], b->nb[1]/sizeof(float), b->nb[2]/sizeof(float), b->nb[3]/sizeof(float),
+        w->ne[0], w->ne[1], w->ne[2], w->ne[3], w->nb[1]/sizeof(float), w->nb[2]/sizeof(float), w->nb[3]/sizeof(float));
+    CUDA_CHECK(cudaGetLastError());
+}

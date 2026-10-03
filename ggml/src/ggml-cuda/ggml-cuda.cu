@@ -3511,6 +3511,23 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         return true;
     }
 
+    if (ops.size() == 3 && ops.begin()[0] == GGML_OP_REPEAT && ops.begin()[1] == GGML_OP_MUL && ops.begin()[2] == GGML_OP_ADD) {
+        const ggml_tensor * rep = cgraph->nodes[node_idx];
+        const ggml_tensor * mul = cgraph->nodes[node_idx+1];
+        const ggml_tensor * add = cgraph->nodes[node_idx+2];
+        const ggml_tensor * b   = rep->src[0];
+        const ggml_tensor * w   = mul->src[0] == rep ? mul->src[1] : mul->src[0];
+        const ggml_tensor * a   = add->src[0] == mul ? add->src[1] : add->src[0];
+
+        for (const ggml_tensor * t : { b, w, a, rep, mul, add }) {
+            if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous_rows(t)) {
+                return false;
+            }
+        }
+        // the add's other operand is read in full, the repeated one and the multiplier by broadcasting
+        return ggml_is_contiguous(add) && ggml_are_same_shape(a, add) && ggml_can_repeat(b, add) && ggml_can_repeat(w, add);
+    }
+
     if (ops.size() == 3 && ops.begin()[0] == GGML_OP_SCALE && ops.begin()[1] == GGML_OP_UNARY && ops.begin()[2] == GGML_OP_SCALE
      && unary_ops.size() == 1 && unary_ops.begin()[0] == GGML_UNARY_OP_TANH) {
         const ggml_tensor *scale  = cgraph->nodes[node_idx];
@@ -4267,6 +4284,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
         ggml_cuda_op_ssm_conv(*cuda_ctx, node, /*bias_add_node=*/ nullptr, cgraph->nodes[i + 1]);
         return 1;
+    }
+
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_REPEAT, GGML_OP_MUL, GGML_OP_ADD }, {})) {
+        ggml_cuda_op_repeat_mul_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+        return 2;
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||

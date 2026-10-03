@@ -6596,6 +6596,41 @@ struct test_moe_weighted_reduction : public test_case {
     }
 };
 
+// add(a, mul(repeat(b), w)): the backends fuse the three into one pass
+struct test_repeat_mul_add : public test_case {
+    const std::array<int64_t, 4> ne;   // the output
+    const std::array<int64_t, 4> ne_b; // repeated to ne
+    const std::array<int64_t, 4> ne_w; // broadcast by the multiply
+
+    std::string vars() override {
+        return VARS_TO_STR3(ne, ne_b, ne_w);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "REPEAT_MUL_ADD";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_repeat_mul_add(std::array<int64_t, 4> ne, std::array<int64_t, 4> ne_b, std::array<int64_t, 4> ne_w)
+        : ne(ne), ne_b(ne_b), ne_w(ne_w) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * b = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_b.data());
+        ggml_tensor * w = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_w.data());
+        ggml_set_name(a, "a");
+        ggml_set_name(b, "b");
+        ggml_set_name(w, "w");
+
+        ggml_tensor * r   = ggml_repeat_4d(ctx, b, ne[0], ne[1], ne[2], ne[3]);
+        ggml_tensor * out = ggml_add(ctx, a, ggml_mul(ctx, r, w));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_mul_mat_vec_fusion : public test_case {
     const ggml_type type;
     const ggml_glu_op glu_op;
@@ -10505,6 +10540,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_weighted_reduction(2560, 10, 64, false, false, false, true));
     test_cases.emplace_back(new test_moe_weighted_reduction(63,   12, 33, true,  true,  true,  true));
     test_cases.emplace_back(new test_moe_weighted_reduction(2048, 8, 128, false, true,  false, true));
+
+    // a hyper-connection residual update: a block output repeated over 4 streams, scaled per stream and token
+    test_cases.emplace_back(new test_repeat_mul_add({2560, 4, 37, 1}, {2560, 1, 37, 1}, {1, 4, 37, 1}));
+    test_cases.emplace_back(new test_repeat_mul_add({64, 3, 5, 2}, {64, 3, 1, 2}, {64, 1, 5, 1}));
 
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
