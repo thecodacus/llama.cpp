@@ -2891,6 +2891,35 @@ llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
 }
 
+void llm_graph_context::build_kv_store(
+        llm_graph_input_attn_kv * inp,
+        ggml_tensor * k_cur,
+        ggml_tensor * v_cur,
+        int           il) const {
+    if (inp->self_k_rot) {
+        k_cur = llama_mul_mat_hadamard(ctx0, k_cur, inp->self_k_rot);
+    }
+
+    if (inp->self_v_rot) {
+        v_cur = llama_mul_mat_hadamard(ctx0, v_cur, inp->self_v_rot);
+    }
+
+    // expand k later to enable rope fusion which directly writes into k-v cache
+    ggml_build_forward_expand(gf, v_cur);
+    ggml_build_forward_expand(gf, k_cur);
+
+    const auto * mctx_cur = inp->mctx;
+
+    // store to KV cache
+    {
+        const auto & k_idxs = inp->get_k_idxs();
+        const auto & v_idxs = inp->get_v_idxs();
+
+        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+    }
+}
+
 ggml_tensor * llm_graph_context::build_attn(
         llm_graph_input_attn_kv * inp,
         ggml_tensor * wo,
@@ -2908,30 +2937,15 @@ ggml_tensor * llm_graph_context::build_attn(
 
     if (inp->self_k_rot) {
         q_cur = llama_mul_mat_hadamard(ctx0, q_cur, inp->self_k_rot);
-        k_cur = llama_mul_mat_hadamard(ctx0, k_cur, inp->self_k_rot);
-    }
-
-    if (inp->self_v_rot) {
-        v_cur = llama_mul_mat_hadamard(ctx0, v_cur, inp->self_v_rot);
     }
 
     // these nodes are added to the graph together so that they are not reordered
     // by doing so, the number of splits in the graph is reduced
-    // expand k later to enable rope fusion which directly writes into k-v cache
     ggml_build_forward_expand(gf, q_cur);
-    ggml_build_forward_expand(gf, v_cur);
-    ggml_build_forward_expand(gf, k_cur);
+
+    build_kv_store(inp, k_cur, v_cur, il);
 
     const auto * mctx_cur = inp->mctx;
-
-    // store to KV cache
-    {
-        const auto & k_idxs = inp->get_k_idxs();
-        const auto & v_idxs = inp->get_v_idxs();
-
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
-        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
-    }
 
     ggml_tensor * kq_mask = inp->get_kq_mask();
 

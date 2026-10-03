@@ -539,8 +539,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     res->add_input(std::move(inp));
 
-    ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_pos = build_inp_pos();
 
     auto * inp_attn = build_attn_inp_kv();
 
@@ -570,6 +569,29 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     const int64_t n_embd_head = hparams.n_embd_head_v();
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
+    ggml_tensor * Kcur = build_lora_mm(layer.wk, cur, layer.wk_s);
+    Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+    Kcur = build_norm(Kcur, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il);
+    cb(Kcur, "mtp_Kcur_normed", il);
+
+    ggml_tensor * Vcur = build_lora_mm(layer.wv, cur, layer.wv_s);
+    Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+    cb(Vcur, "mtp_Vcur", il);
+
+    Kcur = ggml_rope_multi(ctx0, Kcur, inp_pos, nullptr,
+            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+            ext_factor, attn_factor, beta_fast, beta_slow);
+    cb(Kcur, "mtp_Kcur", il);
+
+    // a ubatch with no outputs (the prompt) only fills the draft layer's cache, which later drafts attend over: the
+    // attention, the expert FFN and the head have nothing to give it
+    if (n_outputs == 0) {
+        build_kv_store(inp_attn, Kcur, Vcur, il);
+        return;
+    }
+
+    ggml_tensor * inp_out_ids = build_inp_out_ids();
+
     ggml_tensor * Qcur_full = build_lora_mm(layer.wq, cur, layer.wq_s);
     cb(Qcur_full, "mtp_Qcur_full", il);
 
@@ -586,23 +608,10 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n_tokens);
     cb(gate, "mtp_gate", il);
 
-    ggml_tensor * Kcur = build_lora_mm(layer.wk, cur, layer.wk_s);
-    Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
-    Kcur = build_norm(Kcur, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il);
-    cb(Kcur, "mtp_Kcur_normed", il);
-
-    ggml_tensor * Vcur = build_lora_mm(layer.wv, cur, layer.wv_s);
-    Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
-    cb(Vcur, "mtp_Vcur", il);
-
     Qcur = ggml_rope_multi(ctx0, Qcur, inp_pos, nullptr,
             n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
             ext_factor, attn_factor, beta_fast, beta_slow);
-    Kcur = ggml_rope_multi(ctx0, Kcur, inp_pos, nullptr,
-            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
-            ext_factor, attn_factor, beta_fast, beta_slow);
     cb(Qcur, "mtp_Qcur", il);
-    cb(Kcur, "mtp_Kcur", il);
 
     const float kq_scale = hparams.f_attention_scale == 0.0f
             ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;

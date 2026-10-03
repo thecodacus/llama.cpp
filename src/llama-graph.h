@@ -1195,6 +1195,14 @@ struct llm_graph_context {
 
     llm_graph_input_attn_kv * build_attn_inp_kv() const;
 
+    // stores the layer's K and V in the cache, rotated as build_attn rotates them, without the attention: for a ubatch
+    // with no outputs that only has to fill the cache
+    void build_kv_store(
+            llm_graph_input_attn_kv * inp,
+            ggml_tensor * k_cur, // [n_embd_head_k, n_head_k, n_tokens]
+            ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens]
+                    int   il) const;
+
     ggml_tensor * build_attn(
             llm_graph_input_attn_kv * inp,
             ggml_tensor * wo,
