@@ -751,6 +751,25 @@ void llama_context::sched_reserve() {
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
 }
 
+// the scratch memory a matrix multiplication takes beside the compute buffer: the activations are converted to the
+// weights' dot product format (q8_1 for quantized weights, 16 bits for f16 and bf16), and MUL_MAT_ID gathers one row
+// per selected expert
+static size_t llama_mul_mat_scratch(const ggml_tensor * node) {
+    if (node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_MUL_MAT_ID) {
+        return 0;
+    }
+    const ggml_tensor * w = node->src[0];
+    const ggml_tensor * x = node->src[1];
+
+    size_t row = 0;
+    if (ggml_is_quantized(w->type)) {
+        row = ggml_row_size(GGML_TYPE_Q8_1, x->ne[0]);
+    } else if (w->type == GGML_TYPE_F16 || w->type == GGML_TYPE_BF16) {
+        row = 2*x->ne[0];
+    }
+    return row*(node->op == GGML_OP_MUL_MAT_ID ? ggml_nelements(node->src[2]) : ggml_nrows(x));
+}
+
 void llama_context::moe_cache_switch(bool off) {
     const int64_t t_start_us = ggml_time_us();
 
@@ -791,6 +810,30 @@ void llama_context::moe_cache_switch(bool off) {
                 sched_need_reserve = true;
                 try {
                     sched_reserve();
+                    // the scratch is not in the compute buffers: a ubatch whose buffers fill the lent memory fails at
+                    // its first matrix multiplication
+                    std::map<ggml_backend_dev_t, size_t> need;
+                    ggml_cgraph * gf = gf_res_reserve->get_gf();
+                    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                        ggml_tensor * node = ggml_graph_node(gf, i);
+                        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), node);
+                        ggml_backend_dev_t dev = backend ? ggml_backend_get_device(backend) : nullptr;
+                        if (dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                            need[dev] = std::max(need[dev], llama_mul_mat_scratch(node));
+                        }
+                    }
+                    for (const auto & [dev, n_need] : need) {
+                        size_t free = 0;
+                        size_t total = 0;
+                        ggml_backend_dev_memory(dev, &free, &total);
+                        if (n_need > lend_scratch[dev] && n_need - lend_scratch[dev] > free) {
+                            throw std::runtime_error(format("%zu MiB of matrix multiplication scratch is not free on %s",
+                                (n_need - lend_scratch[dev])/(1024*1024), ggml_backend_dev_name(dev)));
+                        }
+                    }
+                    for (const auto & [dev, n_need] : need) {
+                        lend_scratch[dev] = std::max(lend_scratch[dev], n_need);
+                    }
                     ok = true;
                     break;
                 } catch (const std::exception & e) {
