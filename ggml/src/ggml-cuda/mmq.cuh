@@ -1545,6 +1545,11 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
     int J_best        = 0;
     int ntiles_J_best = INT_MAX;
 
+    // expert matmuls: one tile holds twice the mean expert's columns, up to the widest tile, as routing is uneven
+    // (the kernel walks further tiles of a busier expert)
+    const int64_t ncols = args.expert_bounds ?
+        std::min<int64_t>({args.ncols_max, 2*((args.ncols_dst + args.nchannels_y - 1) / args.nchannels_y), 128}) : args.ncols_max;
+
     for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
         const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
         if (config.type == GGML_TYPE_COUNT) {
@@ -1555,7 +1560,7 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
             continue;
         }
 
-        const int ntiles_x = (args.ncols_max + config.J - 1) / config.J;
+        const int ntiles_x = (ncols + config.J - 1) / config.J;
 
         if (ntiles_x < ntiles_J_best) {
             J_best = J;
