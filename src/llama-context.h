@@ -351,6 +351,14 @@ private:
     // this context builds and lends the MoE expert cache packs of the model
     bool moe_cache_on = false;
 
+    // the configured ubatch: while the cache is lent, n_ubatch is the largest size up to this that fits in its memory
+    uint32_t n_ubatch_max = 0;
+
+    // set while the lent memory is fitted: a pipelined reserve that does not fit fails instead of falling back, or
+    // the reserve does not pipeline at all
+    bool pipeline_required = false;
+    bool pipeline_blocked  = false;
+
     int64_t n_decode_calls = 0;
 
     ggml_backend_t backend_cpu = nullptr;

@@ -96,24 +96,31 @@ Qwen3.8-Flash-Next keeps its MTP head in a separate file: add `-md mtp-Qwen3.8-F
 ### Two GPUs
 
 Split layers with `-sm layer`; each GPU caches the experts of its own layers and gets its own
-fitted slot count. The MTP draft head (`-ngld 99`) lands on the last GPU, so give that GPU fewer
-layers. A large ubatch lets prompts borrow the cache memory (see [Flags and defaults](#flags-and-defaults)):
+fitted slot count. The MTP draft head (`-ngld 99`) lands on the last GPU. A large ubatch lets
+prompts borrow the cache memory, and while they do the two GPUs work as a pipeline: GPU0 starts the
+next ubatch while GPU1 finishes the current one (see [Flags and defaults](#flags-and-defaults)).
+Build with `-DGGML_SCHED_MAX_COPIES=2`: two GPUs need two pipeline copies, and each copy holds the
+batch's inputs again.
 
 ```bash
-GGML_SCHED_PREFETCH_EXPERTS=6 \
+GGML_SCHED_PREFETCH_EXPERTS=3 \
 ./build/bin/llama-server -m Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf \
-  -ngl 99 -ncmoe 99 -fa on -c 65536 -b 3072 -ub 3072 \
-  -sm layer -ts 34,14 --moe-cache-profile profile.csv \
+  -ngl 99 -ncmoe 99 -fa on -c 65536 -b 24576 -ub 3072 \
+  -sm layer -ts 30,18 --moe-cache-profile profile.csv \
   -md mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf -ngld 99 --spec-type draft-mtp --spec-draft-n-max 1 \
   --load-mode none --lazy-mode on
 ```
 
-On 2× RTX 3060 12 GB with the GSQ-RCO IQ3_XXS build, the fitted cache took 132 + 226 slots, decode
-ran **36 tok/s**, and a 17k-token prompt read at **437 tok/s** (442 at `-ub 4096`, which costs ~2 tok/s
-of decode in slots). `--load-mode none` reads the weights into pinned buffers, which is what lets
-the prefetch copies run at full PCIe speed on GeForce cards. Lending the cache memory took 0.5 s and
-uploading it again about 2 s per long prompt. At `-c 131072` the prompt's compute buffer no longer
-fits next to the second GPU's share; stay at 64k there for now.
+On 2× RTX 3060 12 GB (PCIe 4.0 x8 + x4) with the GSQ-RCO IQ3_XXS build, a 44k-token prompt read at
+**597 tok/s** the first time and 612 when repeated; decode runs ~34 tok/s. `-ub` is the largest
+ubatch tried: a prompt that borrows the cache runs the largest one up to it whose buffers fit the
+lent memory, pipelined if one fits, and the log says which. 4096 pipelines here too (563–610 tok/s,
+no gain); at `-c 131072` `-ub 8192` settles on 2048 pipelined (a 58k-token prompt at 535 tok/s).
+`-b 24576` hands a long prompt to the pipeline in large pieces, so it fills and drains less often.
+`-ts 30,18` balances the two stages (the x4 card copies its experts at half the rate); 34,14 was
+579 tok/s. `--load-mode none` reads the weights into pinned buffers, which is what lets the prefetch
+copies run at full PCIe speed on GeForce cards. Lending the cache memory took 0.5–1.3 s and
+uploading it again about 2 s per long prompt.
 
 ### Several models behind one server
 
@@ -141,12 +148,22 @@ Every flag below has a default that suits the common case; set one only to overr
 | `--moe-cache-profile FILE` | none (cache off) | Routing profile from `llama-moe-trace`. Giving one turns the cache on. |
 | `--moe-cache-slots N\|auto` | `auto` | Experts cached per layer. `auto` fits each GPU's slots to its free memory on the first request, after the KV cache, compute buffers and any draft model are allocated. `N` fixes the count; `0` disables the cache. |
 | `--moe-cache-margin MiB` | `512` | GPU memory `auto` leaves free per device, for the CUDA memory pool to grow into during long prompts. |
-| `--moe-cache-borrow N\|auto` | `auto` | Batches of at least `N` tokens free the cache, run every expert on the GPU in the freed memory, and the cache is uploaded again before the next smaller batch. `auto` is 512 when op offload is on and the ubatch is 1024 or more, otherwise off. While the cache is resident, the compute buffers are sized for batches below `N`, which leaves more memory for slots. `0` keeps the cache resident for every batch: large batches compute the cached experts from the cache and, with prefetch on, upload only the others. The compute buffers then share the GPU with the cache, so it gets fewer slots (52 + 48 instead of 132 + 226 in the two-GPU recipe, 335 vs 437 tok/s prefill, 28 vs 36 tok/s decode). |
+| `--moe-cache-borrow N\|auto` | `auto` | Batches of at least `N` tokens free the cache, run every expert on the GPU in the freed memory, and the cache is uploaded again before the next smaller batch. `auto` is 512 when op offload is on and the ubatch is 1024 or more, otherwise off. `-ub` is then the largest ubatch: the borrowing batch runs the largest of `-ub`, 8192, 6144, 4096, 3072, 2048, 1024, 512 whose buffers fit the lent memory, pipelined across GPUs (`-sm layer`) if any size fits that way, since two GPUs computing at once beat a larger ubatch that runs on one GPU at a time. While the cache is resident, the compute buffers are sized for batches below `N`, which leaves more memory for slots. `0` keeps the cache resident for every batch: large batches compute the cached experts from the cache and, with prefetch on, upload only the others. The compute buffers then share the GPU with the cache, so it gets fewer slots (52 + 48 instead of 132 + 226 in the two-GPU recipe, 335 vs 437 tok/s prefill, 28 vs 36 tok/s decode). |
 | `GGML_CUDA_REGISTER_HOST` | off (`=1` enables) | Pins the expert weights kept in RAM. Mapped weights are pinned in place where the GPU supports it; otherwise (e.g. GeForce cards) they are copied into pinned buffers at load, up to three quarters of the RAM. Lazily read tensors (`--lazy-mode`) are never pinned. Pinned memory cannot be paged out: on a model bigger than the RAM it can push lazily read tensors out of the page cache and slow everything down. |
 | `GGML_SCHED_PREFETCH_EXPERTS` | off (`=N` enables) | Uploads each layer's offloaded expert weights on a second CUDA stream while earlier layers compute. `N` is the staging slots per GPU (at most 8): a layer takes one set of slots, one per weight (gate, up, down), so `=6` gives two sets and the next layer's copy overlaps the current layer's compute; `=1` means one set. Each slot is the size of the largest weight it stages, so two sets cost about six expert tensors of VRAM per GPU. Needs op offload; pairs well with borrowing. |
 
 With an expert cache profile, the MTP draft context keeps a ubatch no larger than the borrow size
 (512 when borrowing is off): its compute buffer would only take memory from the cache.
+
+Two more things happen on their own for large batches:
+
+- **Lazily read rows are prefetched.** Rows a batch gathers from a weight kept in host memory (the
+  PLE / n-gram tables `--lazy-mode` leaves on disk) are read by 32 background threads before the
+  graph's own gather runs. A new 17k-token prompt on Qwen3.8-Flash-Next went from 355 to 464–501
+  tok/s, close to the 512 of a prompt whose rows were already cached.
+- **Prompt splits are captured as CUDA graphs** from their first run. Their shapes change every
+  ubatch, so they never passed the usual warm-up, and launching their thousands of kernels one by
+  one filled the device queue and held the host, which could then not feed the other GPU.
 
 ## Better routing profiles
 

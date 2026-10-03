@@ -2337,7 +2337,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     if (!weight_before_ffn) {
-        experts = ggml_mul(ctx0, experts, weights);
+        // in place: nothing else reads the unweighted outputs, and a copy is n_embd x n_expert_used x n_tokens
+        // (800 MiB at 2560 x 10 x 8192)
+        experts = ggml_mul_inplace(ctx0, experts, weights);
         cb(experts, "ffn_moe_weighted", il);
     }
 
@@ -2636,6 +2638,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     ggml_tensor * cur;
 
     const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
+
     if (use_flash_attn) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
 
