@@ -32,7 +32,9 @@
 #include <cstring>
 #include <cmath>
 #include <functional>
+#include <future>
 #include <map>
+#include <thread>
 #include <numeric>
 #include <regex>
 #include <sstream>
@@ -1188,6 +1190,8 @@ struct llama_model::impl {
     std::vector<moe_pack>  moe_packs;
     int32_t                moe_slots = 0; // > 0 fixed, < 0 fitted to the free memory
     bool                   moe_built = false;
+
+    std::vector<std::future<void>> row_readers; // prefetch_rows, one job per call
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
@@ -1200,7 +1204,47 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
     pimpl->has_tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
 }
 
+void llama_model::prefetch_rows(const ggml_tensor * table, const ggml_tensor * ids) const {
+    // forget the jobs that have finished; a running one keeps going alongside the new one
+    auto & jobs = pimpl->row_readers;
+    jobs.erase(std::remove_if(jobs.begin(), jobs.end(), [](const std::future<void> & f) {
+        return f.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+    }), jobs.end());
+
+    std::vector<int32_t> rows((const int32_t *) ids->data, (const int32_t *) ids->data + ggml_nelements(ids));
+    std::sort(rows.begin(), rows.end());
+    rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
+
+    // touching a row faults its pages in; many readers keep the disk queue deep
+    const char * data     = (const char *) table->data;
+    const size_t row_size = table->nb[1];
+    const int64_t n_rows  = table->ne[1];
+    jobs.push_back(std::async(std::launch::async, [data, row_size, n_rows, rows = std::move(rows)]() {
+        const int n_readers = 32;
+        std::vector<std::thread> readers;
+        for (int r = 0; r < n_readers; ++r) {
+            readers.emplace_back([&, r]() {
+                volatile char sink = 0;
+                for (size_t k = r; k < rows.size(); k += n_readers) {
+                    if (rows[k] < 0 || rows[k] >= n_rows) {
+                        continue;
+                    }
+                    const volatile char * row = data + (size_t) rows[k] * row_size;
+                    sink = sink ^ row[0] ^ row[row_size - 1];
+                }
+                (void) sink;
+            });
+        }
+        for (auto & t : readers) {
+            t.join();
+        }
+    }));
+}
+
 llama_model::~llama_model() {
+    for (auto & job : pimpl->row_readers) {
+        job.wait();
+    }
     for (auto * lora : loras) {
         delete lora;
     }

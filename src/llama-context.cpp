@@ -1465,6 +1465,27 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    // the rows a large batch gathers from host weights start loading on a pool of readers now, before the graph's
+    // own gather: a table read lazily from disk otherwise costs one page fault after another on the compute threads.
+    // a decode step gathers a few rows, which the gather reads by itself
+    if (ubatch.n_tokens >= 256) {
+        ggml_cgraph * gf = res->get_gf();
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            const ggml_tensor * node = ggml_graph_node(gf, i);
+            if (node->op != GGML_OP_GET_ROWS) {
+                continue;
+            }
+            const ggml_tensor * table = node->src[0];
+            const ggml_tensor * ids   = node->src[1];
+            if (table->buffer && ggml_backend_buffer_is_host(table->buffer) &&
+                ggml_backend_buffer_get_usage(table->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                (ids->flags & GGML_TENSOR_FLAG_INPUT) && ids->type == GGML_TYPE_I32 &&
+                ids->buffer && ggml_backend_buffer_is_host(ids->buffer)) {
+                model.prefetch_rows(table, ids);
+            }
+        }
+    }
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);

@@ -785,6 +785,11 @@ struct llama_model {
 
     ggml_cgraph * build_graph(const llm_graph_params & params) const;
 
+    // read the rows of host weight `table` named by the I32 tensor `ids` in the background, many at a time: a table
+    // read lazily from disk (PLE / n-gram embeddings) then serves the graph's gather from memory instead of one page
+    // fault after another on the compute threads. only a hint, the gather reads the rows either way
+    void prefetch_rows(const ggml_tensor * table, const ggml_tensor * ids) const;
+
     virtual void load_stats  (llama_model_loader & ml) = 0;
     virtual void load_hparams(llama_model_loader & ml) = 0;
     virtual void load_vocab  (llama_model_loader & ml) = 0;
