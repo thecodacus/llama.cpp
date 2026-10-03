@@ -1824,6 +1824,30 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
 
+    // one 2D weight against contiguous activations of more dimensions is a single 2D product: the kernels below are
+    // picked by ne11, so a [ne10, 4, n_tokens] input would run a vector kernel once per token instead of one GEMM.
+    // the rows are packed (a contiguous tensor's nb[1] is arbitrary when ne[1] is 1)
+    if (ne02 == 1 && ne03 == 1 && ne12*ne13 > 1 && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)) {
+        ggml_tensor src1_2d = *src1;
+        src1_2d.ne[1] = ne11*ne12*ne13;
+        src1_2d.ne[2] = 1;
+        src1_2d.ne[3] = 1;
+        src1_2d.nb[1] = ggml_row_size(src1->type, ne10);
+        src1_2d.nb[2] = src1_2d.nb[1]*src1_2d.ne[1];
+        src1_2d.nb[3] = src1_2d.nb[2];
+
+        ggml_tensor dst_2d = *dst;
+        dst_2d.ne[1] = ne1*ne2*ne3;
+        dst_2d.ne[2] = 1;
+        dst_2d.ne[3] = 1;
+        dst_2d.nb[1] = ggml_row_size(dst->type, ne0);
+        dst_2d.nb[2] = dst_2d.nb[1]*dst_2d.ne[1];
+        dst_2d.nb[3] = dst_2d.nb[2];
+
+        ggml_cuda_mul_mat(ctx, src0, &src1_2d, &dst_2d);
+        return;
+    }
+
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
     // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
     // Therefore, in such cases use cuBLAS.
