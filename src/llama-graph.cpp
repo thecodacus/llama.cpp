@@ -2076,6 +2076,17 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(ids_cold, "ffn_moe_ids_cold", il);
     }
 
+    // the cold chain never reads the pack's experts, so staging its weights on the GPU for a large batch can skip them;
+    // any other path reads every expert, so the list is cleared. the scheduler keeps it until the layer is built again
+    if (moe_cache) {
+        const int n_hot = use_moe_packs ? (int) moe_cache->ffn_gate_exps_hot->ne[2] : 0;
+        for (const ggml_tensor * w : { gate_exps, up_exps, down_exps }) {
+            if (w) {
+                ggml_backend_sched_set_resident_experts(sched, w, moe_cache->moe_hot_ids, n_hot);
+            }
+        }
+    }
+
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
         // TODO: Use scalar div instead when/if implemented
         ggml_tensor * f_sel = ggml_cast(ctx0, selected_experts, GGML_TYPE_F32);

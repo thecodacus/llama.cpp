@@ -345,6 +345,7 @@ struct llama_layer {
     struct ggml_tensor * ffn_up_exps_hot   = nullptr;
     struct ggml_tensor * moe_map_hot       = nullptr; // i32[n_expert]: pack slot or -1
     struct ggml_tensor * moe_map_cold      = nullptr; // i32[n_expert]: global id or -1
+    const int32_t      * moe_hot_ids       = nullptr; // host copy: the experts in the pack, ffn_gate_exps_hot->ne[2] of them
     struct ggml_tensor * ffn_gate_inp_b    = nullptr;
     struct ggml_tensor * ffn_gate_exps_b   = nullptr;
     struct ggml_tensor * ffn_down_exps_b   = nullptr;

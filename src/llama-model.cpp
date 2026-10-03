@@ -2065,6 +2065,7 @@ void llama_model::moe_cache_release() const {
             auto & l = const_cast<llama_layer &>(layers[il]);
             l.ffn_gate_exps_hot = l.ffn_up_exps_hot = l.ffn_down_exps_hot = nullptr;
             l.moe_map_hot = l.moe_map_cold = nullptr;
+            l.moe_hot_ids = nullptr;
         }
     }
     pimpl->moe_packs.clear();
@@ -2094,6 +2095,7 @@ bool llama_model::moe_pack_alloc(size_t gi, int n_slots) const {
         l.ffn_down_exps_hot = ggml_new_tensor_3d(ctx, d->type, d->ne[0], d->ne[1], S);
         l.moe_map_hot       = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_expert);
         l.moe_map_cold      = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_expert);
+        l.moe_hot_ids       = group.ranked[k].data(); // the upload fills slot s with ranked[s]
         ggml_format_name(l.ffn_gate_exps_hot, "blk.%d.ffn_gate_exps_hot", il);
         ggml_format_name(l.ffn_up_exps_hot,   "blk.%d.ffn_up_exps_hot",   il);
         ggml_format_name(l.ffn_down_exps_hot, "blk.%d.ffn_down_exps_hot", il);
@@ -2107,6 +2109,7 @@ bool llama_model::moe_pack_alloc(size_t gi, int n_slots) const {
             auto & l = const_cast<llama_layer &>(layers[il]);
             l.ffn_gate_exps_hot = l.ffn_up_exps_hot = l.ffn_down_exps_hot = nullptr;
             l.moe_map_hot = l.moe_map_cold = nullptr;
+            l.moe_hot_ids = nullptr;
         }
         ggml_free(ctx);
         return false;
