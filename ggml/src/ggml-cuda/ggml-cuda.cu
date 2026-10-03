@@ -2468,6 +2468,8 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    // a copy from pageable memory is staged on the current device: it has to be this backend's
+    ggml_cuda_set_device(cuda_ctx->device);
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
 
@@ -2477,6 +2479,7 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    ggml_cuda_set_device(cuda_ctx->device);
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
 
@@ -4520,6 +4523,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 static void ggml_backend_cuda_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
+    ggml_cuda_set_device(cuda_ctx->device);
     CUDA_CHECK(cudaEventRecord((cudaEvent_t)event->context, cuda_ctx->stream()));
 }
 
@@ -4876,8 +4880,14 @@ void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * tot
     *total /= share_count;
 }
 
+// pinning of host weights is off by default, GGML_CUDA_REGISTER_HOST=1 turns it on
+static bool ggml_cuda_register_host_enabled() {
+    const char * env = getenv("GGML_CUDA_REGISTER_HOST");
+    return env != nullptr && atoi(env) != 0;
+}
+
 bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
-    if (getenv("GGML_CUDA_REGISTER_HOST") == nullptr) {
+    if (!ggml_cuda_register_host_enabled()) {
         return false;
     }
 
@@ -4887,7 +4897,7 @@ bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
         // clear the error
         (void)cudaGetLastError();
 
-        GGML_LOG_DEBUG("%s: failed to register %.2f MiB of pinned memory: %s\n", __func__,
+        GGML_LOG_INFO("%s: failed to register %.2f MiB of pinned memory: %s\n", __func__,
                            size / 1024.0 / 1024.0, cudaGetErrorString(err));
         return false;
     }
@@ -4899,8 +4909,28 @@ bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
 #endif // CUDART_VERSION >= 11010 || defined(GGML_USE_MUSA)
 }
 
+// whether pinning is on but mapped (read-only) memory cannot be pinned on every device, so the weights kept in
+// host memory have to be copied into pinned buffers instead of mapped to be pinned
+static bool ggml_backend_cuda_host_pin_needs_copy() {
+    if (!ggml_cuda_register_host_enabled()) {
+        return false;
+    }
+#if CUDART_VERSION >= 11010 && !defined(GGML_USE_MUSA) && !defined(GGML_USE_HIP)
+    for (int device = 0; device < ggml_cuda_info().device_count; ++device) {
+        int supported = 0;
+        if (cudaDeviceGetAttribute(&supported, cudaDevAttrHostRegisterReadOnlySupported, device) != cudaSuccess || !supported) {
+            (void)cudaGetLastError();
+            return true;
+        }
+    }
+    return false;
+#else
+    return true;
+#endif
+}
+
 void ggml_backend_cuda_unregister_host_buffer(void * buffer) {
-    if (getenv("GGML_CUDA_REGISTER_HOST") == nullptr) {
+    if (!ggml_cuda_register_host_enabled()) {
         return;
     }
 
@@ -5743,6 +5773,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_unregister_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_unregister_host_buffer;
+    }
+    if (strcmp(name, "ggml_backend_host_pin_needs_copy") == 0) {
+        return (void *)ggml_backend_cuda_host_pin_needs_copy;
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;

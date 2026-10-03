@@ -14,6 +14,10 @@
 #include <future>
 #include <regex>
 
+#ifndef _WIN32
+#include <unistd.h>
+#endif
+
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
@@ -1321,14 +1325,28 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         }
 
-        // avoid using a host buffer when using mmap
+        // avoid using a host buffer when using mmap, unless the device cannot pin mapped memory: then the weights
+        // kept in host memory are copied into its pinned buffers, as long as they fit in three quarters of the RAM
         auto * buft_dev = ggml_backend_buft_get_device(buft);
         if (use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {
-            auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-            if (!cpu_dev) {
-                throw std::runtime_error("no CPU backend found");
+            if (pin_copy < 0) {
+                auto * needs_copy_fn = (bool (*)(void)) ggml_backend_reg_get_proc_address(
+                        ggml_backend_dev_backend_reg(buft_dev), "ggml_backend_host_pin_needs_copy");
+                pin_copy = needs_copy_fn && needs_copy_fn() ? 1 : 0;
+#ifndef _WIN32
+                pin_copy_budget = (size_t) sysconf(_SC_PHYS_PAGES) * (size_t) sysconf(_SC_PAGE_SIZE) / 4 * 3;
+#endif
             }
-            buft = ggml_backend_dev_buffer_type(cpu_dev);
+            const size_t nbytes = ggml_nbytes(t_meta);
+            if (pin_copy && pin_copy_bytes + nbytes <= pin_copy_budget) {
+                pin_copy_bytes += nbytes;
+            } else {
+                auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+                if (!cpu_dev) {
+                    throw std::runtime_error("no CPU backend found");
+                }
+                buft = ggml_backend_dev_buffer_type(cpu_dev);
+            }
         }
 
         if (buft != buft_list->front().second) {
@@ -1465,6 +1483,10 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
             __func__, first_tensor_moved_name.c_str(), first_tensor_moved_type_name.c_str(), n_tensors_moved - 1,
             ggml_backend_buft_name(first_moved_from_buft), ggml_backend_buft_name(first_moved_to_buft));
     }
+    if (pin_copy_bytes > 0) {
+        LLAMA_LOG_INFO("%s: the GPU cannot pin mapped memory, %.2f MiB of weights kept in host memory are copied into pinned buffers (unset GGML_CUDA_REGISTER_HOST to keep them mapped)\n",
+            __func__, pin_copy_bytes/1024.0/1024.0);
+    }
 }
 
 void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
@@ -1472,6 +1494,7 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
     if (use_mmap || lazy.any()) {
         mappings.reserve(files.size());
         mmaps_used.reserve(files.size());
+        mmaps_pin.reserve(files.size());
         for (uint32_t idx = 0; idx < files.size(); idx++) {
             const auto & file = files[idx];
 
@@ -1491,6 +1514,7 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
             std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa,
                     lazy.for_file(idx));
             mmaps_used.emplace_back(mapping->size(), 0);
+            mmaps_pin.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());
                 mlock_mmap->init(mapping->addr());
@@ -1726,6 +1750,13 @@ bool llama_model_loader::load_all_data(
                 auto & mmap_used = mmaps_used[weight->idx];
                 mmap_used.first  = std::min(mmap_used.first,  weight->offs);
                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
+
+                // pinning a lazy tensor would fault all of it in, like locking it
+                if (!lazy.has(cur)) {
+                    auto & mmap_pin = mmaps_pin[weight->idx];
+                    mmap_pin.first  = std::min(mmap_pin.first,  weight->offs);
+                    mmap_pin.second = std::max(mmap_pin.second, weight->offs + n_size);
+                }
             } else {
                 ggml_backend_tensor_set(cur, data, 0, n_size);
             }
@@ -1853,8 +1884,9 @@ bool llama_model_loader::load_all_data(
                 if (mmap_used.second != 0) {
                     mapping->unmap_fragment(mmap_used.second, mapping->size());
                 }
-                if (mmap_used.second > mmap_used.first) {
-                    size_t n_registered = mapping->register_host(mmap_used.first, mmap_used.second, reg_fn, unreg_fn);
+                const auto & mmap_pin = mmaps_pin.at(idx);
+                if (mmap_pin.second > mmap_pin.first) {
+                    size_t n_registered = mapping->register_host(mmap_pin.first, mmap_pin.second, reg_fn, unreg_fn);
                     if (n_registered > 0) {
                         LLAMA_LOG_INFO("%s: pinned %.2f MiB of mapped model memory for faster H2D transfers\n",
                                 __func__, n_registered / 1024.0 / 1024.0);
