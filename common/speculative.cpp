@@ -2532,6 +2532,11 @@ common_speculative_init_result::common_speculative_init_result(
     // the draft context holds as many tokens per sequence as the target context
     cparams.n_ctx = llama_n_ctx(ctx_tgt);
 
+    // the large ubatch is for the target, which borrows its expert cache memory for it; the draft has no such memory
+    if (!params.moe_cache_profile.empty() && params.moe_cache_borrow != 0) {
+        cparams.n_ubatch = std::min(cparams.n_ubatch, (uint32_t) (params.moe_cache_borrow > 0 ? params.moe_cache_borrow : 512));
+    }
+
     // note: for small models maybe we can set this to the maximum possible draft from all speculative types
     //       the extra memory for small models is likely negligible?
     cparams.n_rs_seq  = 0;

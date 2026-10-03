@@ -55,6 +55,9 @@ struct llama_context {
     //   - etc.
     void sched_reserve();
 
+    // MoE expert cache borrowing: free the packs for a large batch (off = true) or upload them again
+    void moe_cache_switch(bool off);
+
     void synchronize();
 
     const llama_model   & get_model()   const;
@@ -344,6 +347,11 @@ private:
     ggml_backend_sched_ptr sched;
 
     bool sched_need_reserve = true;
+
+    // this context builds and lends the MoE expert cache packs of the model
+    bool moe_cache_on = false;
+
+    int64_t n_decode_calls = 0;
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;

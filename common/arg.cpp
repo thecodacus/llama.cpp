@@ -2811,12 +2811,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_PROFILE"));
     add_opt(common_arg(
-        {"--moe-cache-slots"}, "N",
-        "number of routed experts per layer to keep resident in GPU memory (default: 0 = disabled)",
-        [](common_params & params, int value) {
-            params.moe_cache_slots = value;
+        {"--moe-cache-slots"}, "N|auto",
+        "number of routed experts per layer to keep resident in GPU memory, 0 disables the cache (default: auto = fill the GPU memory left free, see --moe-cache-margin)",
+        [](common_params & params, const std::string & value) {
+            params.moe_cache_slots = value == "auto" ? -1 : std::stoi(value);
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_SLOTS"));
+    add_opt(common_arg(
+        {"--moe-cache-margin"}, "MiB",
+        string_format("GPU memory left free per device when the cache slots are fitted (default: %d)", params.moe_cache_margin),
+        [](common_params & params, int value) {
+            params.moe_cache_margin = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_MARGIN"));
+    add_opt(common_arg(
+        {"--moe-cache-borrow"}, "N|auto",
+        "batches of at least N tokens free the expert cache GPU memory and use it to offload all experts to the GPU; the cache is uploaded again before the next smaller batch, 0 disables (needs op offload, default: auto = 512 when the ubatch is 1024 or more)",
+        [](common_params & params, const std::string & value) {
+            params.moe_cache_borrow = value == "auto" ? -1 : std::stoi(value);
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_BORROW"));
     add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"

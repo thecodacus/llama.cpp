@@ -746,6 +746,20 @@ struct llama_model {
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
+    // MoE expert cache: the layers it covers are known at load, the packs (GPU copies of their hottest experts)
+    // are built at load for a fixed slot count, or on first use when the slots are fitted to the free memory
+    bool    moe_cache_has_layers()   const;
+    bool    moe_cache_resident()     const;
+    bool    moe_cache_auto()         const;
+    int32_t moe_cache_borrow_param() const;
+
+    // free all packs
+    void moe_cache_release() const;
+
+    // probe = one slot per layer and no upload, to size the compute buffers against; otherwise the fixed slot
+    // count, or as many slots as fit in the free memory minus the margin; returns false if no pack was built
+    bool moe_cache_build(bool probe) const;
+
     // total number of parameters in the model
     uint64_t n_elements() const;
 
@@ -784,6 +798,12 @@ protected:
 
     struct impl;
     std::unique_ptr<impl> pimpl;
+
+    // allocate the pack of group gi with n_slots per layer, false if it does not fit
+    bool moe_pack_alloc(size_t gi, int n_slots) const;
+
+    // copy the hot experts of pack i into its buffer and write its id maps, returns the bytes copied
+    size_t moe_pack_upload(size_t i) const;
 };
 
 llama_model * llama_model_create(llm_arch arch, const llama_model_params & params);

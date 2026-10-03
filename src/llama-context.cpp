@@ -119,6 +119,8 @@ llama_context::llama_context(
     cparams.embeddings_nextn_masked = false;
     cparams.offload_kqv             = params.offload_kqv;
     cparams.sched_async_cpu         = params.sched_async_cpu;
+    cparams.moe_cache_borrow        = 0;
+    cparams.moe_packs_off           = !model.moe_cache_resident();
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
 
@@ -272,6 +274,24 @@ llama_context::llama_context(
 
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
+
+    // the expert cache packs are managed by the main context; a draft context on the same model leaves them alone
+    moe_cache_on = model.moe_cache_has_layers() && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP;
+    if (moe_cache_on) {
+        int32_t borrow = model.moe_cache_borrow_param();
+        if (borrow < 0) {
+            // auto: worth it only when large prompt batches can run on the GPU
+            borrow = cparams.op_offload && cparams.n_ubatch >= 1024 ? 512 : 0;
+        }
+        if (borrow > 0 && !cparams.op_offload) {
+            LLAMA_LOG_WARN("%s: --moe-cache-borrow needs op offload, disabling it\n", __func__);
+            borrow = 0;
+        }
+        cparams.moe_cache_borrow = (uint32_t) borrow;
+        if (borrow > 0) {
+            LLAMA_LOG_INFO("%s: batches of %d+ tokens borrow the expert cache memory\n", __func__, borrow);
+        }
+    }
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -594,7 +614,12 @@ void llama_context::sched_reserve() {
     const int64_t t_start_us = ggml_time_us();
 
     const uint32_t n_seqs = cparams.n_seq_max;
-    const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+    uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+
+    // with the expert cache resident only batches below the borrow size run, larger ones free the packs first
+    if (cparams.moe_cache_borrow > 0 && !cparams.moe_packs_off) {
+        n_tokens = std::max(n_seqs, std::min(n_tokens, cparams.moe_cache_borrow - 1));
+    }
 
     const size_t max_nodes = this->graph_max_nodes(n_tokens);
 
@@ -712,6 +737,51 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
+}
+
+void llama_context::moe_cache_switch(bool off) {
+    const int64_t t_start_us = ggml_time_us();
+
+    synchronize();
+
+    // free the compute buffers first: their memory goes to the packs, or the packs' memory to the new buffers
+    sched.reset();
+
+    bool ok = true;
+    if (off) {
+        model.moe_cache_release();
+        cparams.moe_packs_off = true;
+        sched_need_reserve = true;
+        sched_reserve();
+    } else if (model.moe_cache_auto()) {
+        // size the compute buffers against one-slot packs, then fill what is left with slots
+        ok = model.moe_cache_build(true);
+        if (ok) {
+            cparams.moe_packs_off = false;
+            sched_need_reserve = true;
+            sched_reserve();
+            ok = model.moe_cache_build(false);
+        }
+    } else {
+        ok = model.moe_cache_build(false);
+        cparams.moe_packs_off = !ok;
+        sched_need_reserve = true;
+        sched_reserve();
+    }
+
+    if (!ok) {
+        LLAMA_LOG_WARN("%s: could not build the expert cache, continuing without it\n", __func__);
+        model.moe_cache_release();
+        moe_cache_on             = false;
+        cparams.moe_packs_off    = true;
+        cparams.moe_cache_borrow = 0;
+        sched.reset();
+        sched_need_reserve = true;
+        sched_reserve();
+    }
+
+    LLAMA_LOG_INFO("%s: expert cache %s in %.0f ms\n", __func__,
+            cparams.moe_packs_off ? "memory lent to the batch" : "uploaded again", (ggml_time_us() - t_start_us) / 1000.0);
 }
 
 void llama_context::synchronize() {
@@ -1649,6 +1719,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
 
+    n_decode_calls++;
+
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -1823,6 +1895,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
             // needs to happen before the graph is built
             n_outputs = n_outputs_new;
+        }
+
+        // MoE expert cache: build it on first use (fitted slots), lend its memory to large batches, upload it again after.
+        // fitted slots wait for the second decode: the first is the warm-up, which runs before a draft model is loaded
+        if (moe_cache_on && (n_decode_calls > 1 || !model.moe_cache_auto())) {
+            const bool off = cparams.moe_cache_borrow > 0 && ubatch.n_tokens >= cparams.moe_cache_borrow;
+            if (off != cparams.moe_packs_off) {
+                moe_cache_switch(off);
+            }
         }
 
         ggml_status status;

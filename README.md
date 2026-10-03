@@ -1,16 +1,18 @@
 # llama.cpp — `perf` fork
 
 Faster **mixture-of-experts (MoE) models on consumer GPUs** when the experts don't fit in VRAM.
-This is [llama.cpp](https://github.com/ggml-org/llama.cpp) plus a handful of opt-in changes for the
-`--n-cpu-moe` case (experts in system RAM, the rest on the GPU). Everything is **off by default**
-and produces the **same tokens** as upstream.
+This is [llama.cpp](https://github.com/ggml-org/llama.cpp) plus a handful of changes for the
+`--n-cpu-moe` case (experts in system RAM, the rest on the GPU). The expert cache turns on when you
+give it a routing profile; everything it needs after that sizes itself (see
+[Flags and defaults](#flags-and-defaults)). Models without a profile run as upstream.
 
 | Feature | What it does | How to turn it on |
 | --- | --- | --- |
-| **MoE expert cache** | Keeps each layer's most-used experts resident in VRAM; the rest stay in RAM. With several GPUs, each GPU caches the experts of its own layers. | `--moe-cache-profile FILE --moe-cache-slots N` |
+| **MoE expert cache** | Keeps each layer's most-used experts resident in VRAM; the rest stay in RAM. With several GPUs, each GPU caches the experts of its own layers, and the slot count is fitted to each GPU's free memory. | `--moe-cache-profile FILE` |
+| **Prefill borrowing** | A large prompt batch frees the cache's VRAM, runs every expert on the GPU with a big ubatch, and the cache is uploaded again before generation. | on by default with the cache and `-ub 1024` or more |
 | **Routing profiles** | `llama-moe-trace` records which experts a model picks, with your real sampling settings, so the cache knows what to keep. | `llama-moe-trace` (see below) |
 | **Async CPU splits** | CPU and GPU halves of each MoE layer run at the same time. | on by default with the cache (`--no-sched-async-cpu` to disable) |
-| **Prefill speedups** | Pins offloaded expert memory and prefetches it on a second CUDA stream. | `GGML_CUDA_REGISTER_HOST=1 GGML_SCHED_PREFETCH_EXPERTS=1` |
+| **Prefill speedups** | Pins the expert weights kept in RAM and prefetches them on a second CUDA stream. | `GGML_CUDA_REGISTER_HOST=1` `GGML_SCHED_PREFETCH_EXPERTS=1` |
 | **Qwen3.8-Flash-Next MTP** | `--spec-type draft-mtp` works for `qwen4exp` with its separate draft head. | `-md mtp-*.gguf --spec-type draft-mtp` |
 
 Measured decode speed on one **RTX 3060 12 GB** (`-ngl 99 -ncmoe 99 -fa 1`):
@@ -25,7 +27,8 @@ Measured decode speed on one **RTX 3060 12 GB** (`-ngl 99 -ncmoe 99 -fa 1`):
 | Qwen3.8-Flash-Next UD-IQ3_XXS (512 experts/layer), with MTP | 16.6 | **24.4 (+47%)** @ 56 slots |
 
 On **two RTX 3060s**, Qwen3.8-Flash-Next with the cache split across both cards runs **~40 tok/s**
-(see [Two GPUs](#two-gpus)).
+(see [Two GPUs](#two-gpus)). With prefill borrowing and prefetch, the GSQ-RCO IQ3_XXS build of the
+same model reads a 17k-token prompt at **423 tok/s**, up from 61 with its experts on the CPU.
 
 Cache-capable architectures: `qwen35moe`, `qwen4exp` (Qwen3.8-Flash-Next), `deepseek2`, `laguna`.
 Other models run unchanged.
@@ -59,22 +62,19 @@ MOE_TRACE_OUT=profile.csv ./build/bin/llama-moe-trace -m model.gguf \
   -p "Write a Python function that parses a CSV file and explain how it works."
 ```
 
-**4. Serve with the cache.** Start around 64 slots:
+**4. Serve with the cache:**
 
 ```bash
 ./build/bin/llama-server -m model.gguf -ngl 99 -ncmoe 99 -fa on -c 16384 \
-  --moe-cache-profile profile.csv --moe-cache-slots 64
+  --moe-cache-profile profile.csv
 ```
 
-The load log should show:
+The slots are fitted to the free GPU memory on the first request after the load (the warm-up and a
+draft model are loaded by then), and the log shows what each GPU got:
 
 ```
-init_moe_expert_cache: expert cache: <layers> layers x 64 slots, <size> MiB uploaded to CUDA0
+moe_cache_build: expert cache: <layers> layers x <slots> slots, <size> MiB uploaded to CUDA0
 ```
-
-**5. Find your slot count.** Raise `--moe-cache-slots` until the load prints
-`pack allocation failed`, step back down, then leave about 1 GB of VRAM free (`nvidia-smi`) for
-long prompts. More slots means more experts in VRAM and faster decode.
 
 That's it. Everything below is for squeezing out more.
 
@@ -95,20 +95,23 @@ Qwen3.8-Flash-Next keeps its MTP head in a separate file: add `-md mtp-Qwen3.8-F
 
 ### Two GPUs
 
-Split layers with `-sm layer`; each GPU caches the experts of its own layers, so `-ts` decides how
-the cache is shared. The MTP draft head (`-ngld 99`) lands on the last GPU, so give that GPU fewer
-layers:
+Split layers with `-sm layer`; each GPU caches the experts of its own layers and gets its own
+fitted slot count. The MTP draft head (`-ngld 99`) lands on the last GPU, so give that GPU fewer
+layers. A large ubatch lets prompts borrow the cache memory (see [Flags and defaults](#flags-and-defaults)):
 
 ```bash
+GGML_SCHED_PREFETCH_EXPERTS=1 \
 ./build/bin/llama-server -m Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf \
-  -ngl 99 -ncmoe 99 -fa on -c 65536 -ctk q8_0 -ctv q8_0 \
-  -sm layer -ts 28,20 --moe-cache-profile profile.csv --moe-cache-slots 136 \
+  -ngl 99 -ncmoe 99 -fa on -c 65536 -ctk q8_0 -ctv q8_0 -b 4096 -ub 4096 \
+  -sm layer -ts 28,20 --moe-cache-profile profile.csv \
   -md mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf -ngld 99 --spec-type draft-mtp --spec-draft-n-max 2 \
-  --load-mode mmap --lazy-mode on --no-op-offload
+  --load-mode mmap --lazy-mode on
 ```
 
-On 2× RTX 3060 12 GB this used 11.2 + 11.4 GB and ran **39.9 tok/s** (temp 0, warm server), vs
-35.0 for the best layout without the cache. Tune `-ts` until both cards end up about equally full.
+On 2× RTX 3060 12 GB with the GSQ-RCO IQ3_XXS build, the fitted cache took 183 + 139 slots
+(vs 136 + 136 fixed) and decode ran **37 tok/s**; prompts of 512+ tokens borrowed the cache and a
+17k-token prompt read at **423 tok/s**. Lending the cache memory took 0.5 s and uploading it again
+about 2 s per long prompt.
 
 ### Several models behind one server
 
@@ -119,11 +122,29 @@ Every flag works as a key in a `--models-preset` INI section:
 model = /models/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf
 n-cpu-moe = 99
 moe-cache-profile = /models/traces/profile.csv
-moe-cache-slots = 136
+ubatch-size = 4096
+batch-size = 4096
 ```
 
-The cache flags also read `LLAMA_ARG_MOE_CACHE_PROFILE` / `LLAMA_ARG_MOE_CACHE_SLOTS` (and the
-legacy `GGML_MOE_CACHE_PROFILE` / `GGML_MOE_CACHE_SLOTS`, which `llama-bench` accepts too).
+The cache flags also read `LLAMA_ARG_MOE_CACHE_PROFILE`, `LLAMA_ARG_MOE_CACHE_SLOTS`,
+`LLAMA_ARG_MOE_CACHE_MARGIN` and `LLAMA_ARG_MOE_CACHE_BORROW` (and the legacy
+`GGML_MOE_CACHE_PROFILE` / `GGML_MOE_CACHE_SLOTS`, which `llama-bench` accepts too).
+
+## Flags and defaults
+
+Every flag below has a default that suits the common case; set one only to override it.
+
+| Flag | Default | What it does |
+| --- | --- | --- |
+| `--moe-cache-profile FILE` | none (cache off) | Routing profile from `llama-moe-trace`. Giving one turns the cache on. |
+| `--moe-cache-slots N\|auto` | `auto` | Experts cached per layer. `auto` fits each GPU's slots to its free memory on the first request, after the KV cache, compute buffers and any draft model are allocated. `N` fixes the count; `0` disables the cache. |
+| `--moe-cache-margin MiB` | `512` | GPU memory `auto` leaves free per device, for the CUDA memory pool to grow into during long prompts. |
+| `--moe-cache-borrow N\|auto` | `auto` | Batches of at least `N` tokens free the cache, run every expert on the GPU in the freed memory, and the cache is uploaded again before the next smaller batch. `auto` is 512 when op offload is on and the ubatch is 1024 or more, otherwise off. `0` disables it. While the cache is resident, the compute buffers are sized for batches below `N`, which leaves more memory for slots. |
+| `GGML_CUDA_REGISTER_HOST` | off (`=1` enables) | Pins the expert weights kept in RAM. Mapped weights are pinned in place where the GPU supports it; otherwise (e.g. GeForce cards) they are copied into pinned buffers at load, up to three quarters of the RAM. Lazily read tensors (`--lazy-mode`) are never pinned. Pinned memory cannot be paged out: on a model bigger than the RAM it can push lazily read tensors out of the page cache and slow everything down. |
+| `GGML_SCHED_PREFETCH_EXPERTS` | off (`=1` enables) | Uploads each layer's experts on a second CUDA stream while the previous layer computes. Needs op offload; pairs well with borrowing. |
+
+With borrowing on, the MTP draft context keeps a ubatch no larger than the borrow size, since it
+has no cache memory to borrow.
 
 ## Better routing profiles
 
@@ -161,15 +182,16 @@ profile from the work you want fastest.
 
 ## Tuning
 
-- **`--moe-cache-slots` is the main knob** — experts cached per layer. Throughput rises with slot
-  count until the pack no longer fits in VRAM. The pack is all-or-nothing per GPU: an oversized
-  request logs `pack allocation failed on <device> - expert cache disabled for its N layers` and
-  those layers run at baseline speed (it does not partially fill). The pack costs roughly
-  slots × (cached layers on that GPU) × (one expert's gate+up+down bytes). Check the GPU's memory
-  after load: a pack that fell back leaves it far below full.
-- **Leave ~900 MB of VRAM free beyond the pack.** A slot count that loads can still crash on the
-  first large prompt: runtime CUDA pool growth allocates beyond what the load-time check sees.
-  Size slots against the biggest prompt you will serve, not against "it loaded".
+- **Slots are fitted for you.** `auto` gives each GPU as many slots as its free memory holds minus
+  `--moe-cache-margin`, and fits them again after every borrowed prompt (a grown memory pool means
+  a few fewer slots instead of a crash). A fixed `--moe-cache-slots N` is all-or-nothing per GPU:
+  an oversized request logs `pack allocation failed on <device> - expert cache disabled for its N
+  layers`. The pack costs roughly slots × (cached layers on that GPU) × (one expert's gate+up+down
+  bytes).
+- **Raise the margin if long prompts crash.** Runtime CUDA pool growth allocates beyond what the
+  fit sees; 512 MiB covered a 17k-token prompt on a 3060.
+- **A large ubatch is cheap with borrowing.** The big compute buffers only exist while a long
+  prompt runs, in the cache's memory, so `-ub 4096` costs decode nothing.
 - **On one GPU, fill VRAM to just under the ceiling and don't sweat the split.** Near the maximum,
   a marginal MB is worth about the same as cache slots or as fully-resident layers (lower
   `--n-cpu-moe`). Pure `-ncmoe 99` + max slots is the simple default; a hybrid (e.g. `-ncmoe 30` +
@@ -202,20 +224,22 @@ profile from the work you want fastest.
 | Symptom | Cause |
 | --- | --- |
 | `cannot open profile '...'` | Path not visible to the process (e.g. not mounted into the container). |
-| `pack allocation failed on <device>` | Slot count too big for that GPU — reduce slots, or move layers off it with `-ts`. |
+| `pack allocation failed on <device>` | Fixed slot count too big for that GPU — use `auto`, reduce slots, or move layers off it with `-ts`. |
+| `could not build the expert cache, continuing without it` | No GPU had room for even one slot after the context was allocated. |
 | `no CPU-resident MoE layers` | Experts are already on GPU (no `--n-cpu-moe`) — nothing to cache. |
 | No init line, no warning | Architecture not wired for the cache — model runs unchanged. |
 | Model loads, then context creation OOMs | Pack fits but KV/compute don't — drop a few slots or shrink/compress KV. |
-| Crash on the first long prompt | Not enough free VRAM for the prompt's workspace — drop slots until ~1 GB stays free. |
+| Crash on the first long prompt | Not enough free VRAM for the prompt's workspace — raise `--moe-cache-margin` (or drop a fixed slot count). |
 
 ## Prefill speedups for offloaded experts
 
 Two environment variables speed up prompt processing when experts live in RAM, independent of the
-cache. Both are off by default and token-identical.
+cache. Both are token-identical and off by default. See
+[Flags and defaults](#flags-and-defaults) for how pinning picks between pinning in place and copying.
 
 | Env var | What it does |
 | --- | --- |
-| `GGML_CUDA_REGISTER_HOST=1` | Page-locks (pins) the mmap'd CPU expert weights so host→device copies go straight over DMA instead of through the driver's hidden bounce buffer (~6–7 → ~20 GB/s). |
+| `GGML_CUDA_REGISTER_HOST=1` | Pins the CPU expert weights so host→device copies go straight over DMA instead of through the driver's hidden bounce buffer (~6–7 → ~20 GB/s). |
 | `GGML_SCHED_PREFETCH_EXPERTS=1` | Prefetches each layer's experts on a second CUDA stream, so the weight uploads overlap compute instead of stalling the GPU. |
 
 On an RTX 3060 12 GB with Qwen3.6-35B-A3B (`--n-cpu-moe 26`), prefill at 2048 went from

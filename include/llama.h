@@ -342,7 +342,9 @@ extern "C" {
 
         // MoE expert cache: keep the hottest routed experts per layer resident in GPU memory
         const char * moe_cache_profile; // routing profile CSV from llama-moe-trace (NULL = disabled)
-        int32_t      moe_cache_slots;   // experts cached per layer (0 = disabled)
+        int32_t      moe_cache_slots;   // experts cached per layer (0 = disabled, < 0 = fit to the free memory on first use)
+        int32_t      moe_cache_margin;  // MiB left free per device when the slots are fitted
+        int32_t      moe_cache_borrow;  // batches of at least this many tokens free the cache memory and use it (0 = disabled, < 0 = auto)
         // target for a draft head that declares nextn_shared_target_tensors; must outlive this model
         const struct llama_model * model_shared;
 

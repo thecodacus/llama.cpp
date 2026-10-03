@@ -1697,7 +1697,9 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     if (!params.moe_cache_profile.empty()) {
         mparams.moe_cache_profile = params.moe_cache_profile.c_str();
     }
-    mparams.moe_cache_slots = params.moe_cache_slots;
+    mparams.moe_cache_slots  = params.moe_cache_slots;
+    mparams.moe_cache_margin = params.moe_cache_margin;
+    mparams.moe_cache_borrow = params.moe_cache_borrow;
 
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;

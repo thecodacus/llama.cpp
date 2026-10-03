@@ -55,6 +55,10 @@ struct llama_cparams {
     bool kv_unified;
     bool pipeline_parallel;
 
+    // MoE expert cache: batches of at least moe_cache_borrow tokens run with the packs freed (0 = never)
+    uint32_t moe_cache_borrow;
+    bool     moe_packs_off;
+
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 
     enum llama_context_type ctx_type;

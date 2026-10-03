@@ -2064,7 +2064,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // no pre-FFN weighting) — the dual chains below reproduce exactly that
     ggml_tensor * ids_hot  = nullptr;
     ggml_tensor * ids_cold = nullptr;
-    const bool use_moe_packs = moe_cache && moe_cache->moe_map_hot && !gate_up_exps &&
+    const bool use_moe_packs = moe_cache && moe_cache->moe_map_hot && !cparams.moe_packs_off && !gate_up_exps &&
         !up_exps_s && !gate_exps_s && !down_exps_s &&
         type_op == LLM_FFN_SILU && gate_exps && !up_exps_b && !gate_exps_b && !weight_before_ffn &&
         (il < 0 || hparams.swiglu_clamp_exp[il] <= 1e-6f);
@@ -2156,6 +2156,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // split stays free of cross-backend inputs.
         ggml_tensor * cold = build_pack_chain(gate_exps, up_exps, down_exps, ids_cold);
         cb(cold, "ffn_moe_down_cold", il);
+
+        // with borrowing only the pack-free batches offload the experts, here the cold chain stays on the CPU
+        if (cparams.moe_cache_borrow > 0) {
+            ggml_tensor * act = cold->src[1];
+            ggml_tensor * cold_nodes[4] = { act->src[0], act->src[1], act, cold };
+            for (ggml_tensor * t : cold_nodes) {
+                ggml_backend_sched_set_tensor_backend(sched, t, backend_cpu);
+            }
+        }
 
         ggml_tensor * hot = build_pack_chain(moe_cache->ffn_gate_exps_hot, moe_cache->ffn_up_exps_hot, moe_cache->ffn_down_exps_hot, ids_hot);
         cb(hot, "ffn_moe_down_hot", il);
