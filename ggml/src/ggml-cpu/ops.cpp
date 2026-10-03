@@ -8667,6 +8667,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const ggml_tensor * v     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
+    const ggml_tensor * cells = dst->src[5]; // optional list of the cells each query row attends
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -8700,6 +8701,12 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     GGML_ASSERT(nb0 <= nb1);
     GGML_ASSERT(nb1 <= nb2);
     GGML_ASSERT(nb2 <= nb3);
+
+    // with a cell list, a cell outside the query row's list is skipped like a hidden one
+    thread_local std::vector<uint8_t> listed;
+    if (cells) {
+        listed.assign(nek1, 0);
+    }
 
     // broadcast factors
     const int64_t rk2 = neq2/nek2;
@@ -8763,6 +8770,15 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
         const ggml_fp16_t * mp = mask ? (ggml_fp16_t *)((char *) mask->data + iq1*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) : NULL;
 
+        const int32_t * row_cells = cells ? (const int32_t *) ((const char *) cells->data + iq1*cells->nb[1] + (iq3%cells->ne[3])*cells->nb[3]) : NULL;
+        if (row_cells) {
+            for (int64_t j = 0; j < cells->ne[0]; ++j) {
+                if (row_cells[j] >= 0 && row_cells[j] < nek1) {
+                    listed[row_cells[j]] = 1;
+                }
+            }
+        }
+
         // k indices
         const int ik3 = iq3 / rk3;
         const int ik2 = iq2 / rk2;
@@ -8779,6 +8795,9 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
         for (int64_t ic = ic_start; ic < ic_end; ++ic) {
+            if (row_cells && !listed[ic]) {
+                continue;
+            }
             const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
             if (mv == -INFINITY) {
                 continue;
@@ -8843,6 +8862,14 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             }
 
             S = S*ms + vs; // scale and increment sum with partial sum
+        }
+
+        if (row_cells) {
+            for (int64_t j = 0; j < cells->ne[0]; ++j) {
+                if (row_cells[j] >= 0 && row_cells[j] < nek1) {
+                    listed[row_cells[j]] = 0;
+                }
+            }
         }
 
         if (v->type == GGML_TYPE_F16) {
@@ -9298,7 +9325,8 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const int nth = params->nth;
 
     // When use_ref is set, force the vec-only reference implementation (no tiling, no KV-chunking)
-    const bool use_ref = params->use_ref;
+    // a cell list (src[5]) is only read by the reference implementation
+    const bool use_ref = params->use_ref || dst->src[5] != nullptr;
 
     const bool kv_is_f32_or_f16 = (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
     const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;

@@ -1362,6 +1362,7 @@ void launch_fattn(
         ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV, need_f16_K, need_f16_V);
 
     ggml_cuda_pool_alloc<int>    KV_max(pool);
+    const int *                  sparse_cells = nullptr; // a cell list given with the op (src[5])
     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
     ggml_cuda_pool_alloc<float2> dst_tmp_meta(pool);
 
@@ -1450,8 +1451,14 @@ void launch_fattn(
         GGML_ASSERT(n_kv_max > 0);
         const size_t mask_rows = size_t(mask->ne[1]) * mask->ne[3];
 
-        KV_max.alloc(size_t(n_kv_max) * mask_rows);
-        ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, n_kv_max, main_stream);
+        if (KQV->src[5] != nullptr) {
+            // the caller's cell list, laid out as the compaction below would write it
+            GGML_ASSERT(KQV->src[5]->ne[0] == n_kv_max && KQV->src[5]->ne[1] == mask->ne[1] && KQV->src[5]->ne[3] == mask->ne[3]);
+            sparse_cells = (const int *) KQV->src[5]->data;
+        } else {
+            KV_max.alloc(size_t(n_kv_max) * mask_rows);
+            ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, n_kv_max, main_stream);
+        }
     }
 
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
@@ -1581,7 +1588,7 @@ void launch_fattn(
         V_data,
         mask ? ((const char *) mask->data) : nullptr,
         sinks ? ((const char *) sinks->data) : nullptr,
-        KV_max.ptr,
+        sparse_cells ? sparse_cells : KV_max.ptr,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],

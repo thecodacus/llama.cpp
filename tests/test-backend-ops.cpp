@@ -7438,7 +7438,14 @@ struct test_flash_attn_ext : public test_case {
 
         ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hsk), max_bias, logit_softcap);
         ggml_flash_attn_ext_add_sinks(out, s);
-        ggml_flash_attn_ext_set_n_kv_max(out, n_kv_max);
+        if (n_kv_max < 0) {
+            // an explicit cell list of -n_kv_max cells per query row
+            ggml_tensor * c = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, -n_kv_max, nb, 1, nr23[1]);
+            ggml_set_name(c, "c");
+            ggml_flash_attn_ext_set_indices(out, c);
+        } else {
+            ggml_flash_attn_ext_set_n_kv_max(out, n_kv_max);
+        }
         ggml_flash_attn_ext_set_prec (out, prec);
         ggml_set_name(out, "out");
 
@@ -7450,6 +7457,22 @@ struct test_flash_attn_ext : public test_case {
             if (strcmp(t->name, "s") == 0) {
                 // make the sink values more noticeable in order to trigger a test failure when the implementation is wrong
                 init_tensor_uniform(t, -10.0f, 10.0f);
+            } else if (strcmp(t->name, "c") == 0) {
+                // distinct cells per row in random order, the last row % 5 of them unused (-1)
+                std::vector<int32_t> cells(ggml_nelements(t));
+                std::vector<int32_t> order(kv);
+                for (int64_t i = 0; i < kv; ++i) {
+                    order[i] = i;
+                }
+                std::mt19937 gen(0xCE11);
+                const int64_t n = t->ne[0];
+                for (int64_t row = 0; row < ggml_nrows(t); ++row) {
+                    std::shuffle(order.begin(), order.end(), gen);
+                    for (int64_t i = 0; i < n; ++i) {
+                        cells[row*n + i] = i < n - row % 5 ? order[i] : -1;
+                    }
+                }
+                ggml_backend_tensor_set(t, cells.data(), 0, cells.size()*sizeof(int32_t));
             } else if (strcmp(t->name, "m") == 0) {
                 if (n_kv_max > 0) {
                     init_tensor_kq_mask_sparse(t, n_kv_max);
@@ -10340,6 +10363,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // sparse mask + quantized cache
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 8, 1}, 4096,  1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 512));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 512));
+    // a sparse-attention indexer's selection: q8_0 cache, a width that is not a multiple of the tile
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, { 8, 1}, 8192, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 2051));
+    // the same with the indexer's cell list passed to the op (negative n_kv_max), over a causal mask
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, { 8, 1}, 8192, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, -2051));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, { 8, 1}, 4096,  1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_F16,  {0, 1, 2, 3}, true, false,  -512));
+    // 12 query heads per KV head, as in qwen3.8-flash
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 4096, 16, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, -512));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 4096,  1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, -512));
 
     // more V-is-sub-view-of-K cases: other head shapes, and full views with equal head sizes
     test_cases.emplace_back(new test_flash_attn_ext(320, 256, 1, {32, 1}, 512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
@@ -10800,6 +10831,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+    // qwen3.8-flash prompt attention: 2 KV heads of 256 shared by 12 query heads each, q8_0 cache; dense and over the
+    // indexer's 2051 cells per query
+    for (int64_t kv : {16384, 65536}) {
+        for (int64_t n_kv_max : {0, -2051}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1024, true, false, 0, 0, GGML_PREC_F32,
+                GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, n_kv_max));
+        }
+    }
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
 

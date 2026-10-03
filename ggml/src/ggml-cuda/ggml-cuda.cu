@@ -5849,6 +5849,10 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
     }
+    // flash attention reads the cell list of ggml_flash_attn_ext_set_indices (sparse kernel shapes only, see supports_op)
+    if (strcmp(name, "ggml_backend_flash_attn_ext_indices") == 0) {
+        return (void *)ggml_flash_attn_ext_set_indices;
+    }
     return nullptr;
 }
 
