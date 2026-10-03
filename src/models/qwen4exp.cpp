@@ -314,10 +314,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     const int64_t nt     = x->ne[2];
 
     // grouped RMSNorm: reduce over one stream, then scale all streams with the [hc_dim] gamma
-    // the converter folded each gamma to (1 + w)
+    // the converter folded each gamma to (1 + w). the gamma multiplies the [n_embd, hc, T] norm output directly,
+    // so the backends can fuse the two
     ggml_tensor * xn = ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps);
+    xn = ggml_mul(ctx0, xn, ggml_reshape_2d(ctx0, w_norm, n_embd, hc));
     xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
-    xn = ggml_mul(ctx0, xn, w_norm);
     cb(xn, "hc_norm", il);
 
     ggml_tensor * lo = build_lora_mm(w_down, xn);
@@ -544,9 +545,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     auto * inp_attn = build_attn_inp_kv();
 
     ggml_tensor * h_norm = ggml_rms_norm(ctx0, h_state, hparams.f_norm_rms_eps);
-    h_norm = ggml_reshape_2d(ctx0, h_norm, hc_dim, n_tokens);
-    h_norm = ggml_mul(ctx0, h_norm, layer.nextn.hnorm);
-    h_norm = ggml_reshape_3d(ctx0, h_norm, n_embd, hc, n_tokens);
+    h_norm = ggml_mul(ctx0, h_norm, ggml_reshape_2d(ctx0, layer.nextn.hnorm, n_embd, hc));
     cb(h_norm, "mtp_hnorm", il);
 
     ggml_tensor * e_norm = build_norm(tok_embd, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
