@@ -909,6 +909,8 @@ struct ggml_backend_sched {
     int cur_copy;
     int next_copy;
     ggml_backend_event_t events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
+    // recorded on every backend after the last split of a graph: the end of the previous graph that used a copy
+    ggml_backend_event_t graph_end[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
     struct ggml_tensor ** graph_inputs;
     int n_graph_inputs;
     int graph_inputs_capacity;
@@ -2023,7 +2025,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
-                if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                // a pipeline copy of a user input is only read by its own graph (the allocator keeps it), so the copy
+                // waits for the end of the previous graph that used this copy, not for the splits of this one: a
+                // user input of a late split would otherwise hold the host until this graph has nearly finished, and
+                // the next graph would start only then
+                if (sched->graph_end[split_backend_id][sched->cur_copy] != NULL) {
+                    ggml_backend_event_synchronize(sched->graph_end[split_backend_id][sched->cur_copy]);
+                } else if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                 } else {
                     ggml_backend_synchronize(split_backend);
@@ -2213,7 +2221,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
                     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
                         ggml_backend_synchronize(input_backend);
-                        if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                        // as for user inputs: only the previous graph that used this copy can still read it
+                        if (sched->graph_end[split_backend_id][sched->cur_copy] != NULL) {
+                            ggml_backend_event_synchronize(sched->graph_end[split_backend_id][sched->cur_copy]);
+                        } else if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                         } else {
                             ggml_backend_synchronize(split_backend);
@@ -2282,6 +2293,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         prev_backend_id = split_backend_id;
+    }
+
+    for (int b = 0; b < sched->n_backends; b++) {
+        if (sched->graph_end[b][sched->cur_copy] != NULL) {
+            ggml_backend_event_record(sched->graph_end[b][sched->cur_copy], sched->backends[b]);
+        }
     }
 
     if (sched->cpu_async) {
@@ -2353,7 +2370,8 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
         if (sched->n_copies > 1) {
             for (int c = 0; c < sched->n_copies; c++) {
-                sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
+                sched->events[b][c]    = ggml_backend_event_new(backends[b]->device);
+                sched->graph_end[b][c] = ggml_backend_event_new(backends[b]->device);
             }
         }
     }
@@ -2385,6 +2403,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
+            ggml_backend_event_free(sched->graph_end[b][c]);
         }
     }
     for (int b = 0; b < sched->n_backends; b++) {
