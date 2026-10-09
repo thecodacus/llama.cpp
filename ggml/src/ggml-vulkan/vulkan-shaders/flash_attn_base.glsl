@@ -88,17 +88,7 @@ layout (binding = 6) readonly buffer MO {uint32_t data_mask_opt[];};
 #define BINDING_IDX_K 0
 #define BINDING_IDX_V 1
 
-// FaTypeK / FaTypeV spec constant values. These mirror enum ggml_type so the
-// host can pass the type directly. Keep in sync with ggml.h.
-#define FA_TYPE_F32   0u
-#define FA_TYPE_F16   1u
-#define FA_TYPE_Q4_0  2u
-#define FA_TYPE_Q4_1  3u
-#define FA_TYPE_Q5_0  6u
-#define FA_TYPE_Q5_1  7u
-#define FA_TYPE_Q8_0  8u
-#define FA_TYPE_BF16 30u
-#define FA_TYPE_Q1_0 41u
+#include "fa_types.glsl"
 
 #if defined(BFLOAT16)
 #define O_TYPE float

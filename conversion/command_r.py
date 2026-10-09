@@ -12,6 +12,8 @@ from .base import ModelBase, TextModel, gguf, logger
 
 
 @ModelBase.register("CohereForCausalLM")
+# [TAG_HF_EXAMPLE_GATED] CohereLabs/c4ai-command-r-v01 is gated
+# [TAG_HF_EXAMPLE_MISSING]
 class CommandR2Model(TextModel):
     model_arch = gguf.MODEL_ARCH.COMMAND_R
 
@@ -30,6 +32,8 @@ class CommandR2Model(TextModel):
 
 
 @ModelBase.register("Cohere2ForCausalLM")
+# [TAG_HF_EXAMPLE_GATED] CohereLabs/c4ai-command-r7b-12-2024 is gated
+@ModelBase.example("hf-tiny-v2/tiny-random-Cohere2ForCausalLM")
 class Cohere2Model(TextModel):
     model_arch = gguf.MODEL_ARCH.COHERE2
 
@@ -59,6 +63,7 @@ class Cohere2Model(TextModel):
 
 
 @ModelBase.register("Cohere2MoeForCausalLM")
+@ModelBase.example("CohereLabs/North-Mini-Code-1.0")
 class Cohere2MoeModel(TextModel):
     model_arch = gguf.MODEL_ARCH.COHERE2MOE
     _n_main_layers: int | None = None
@@ -126,9 +131,9 @@ class Cohere2MoeModel(TextModel):
             is_mtp = (m := re.match(r"model\.layers\.(\d+)\.", name)) is not None and int(m.group(1)) >= cls._n_main_layers
             if is_mtp and cls.no_mtp:
                 return None
-            if cls.mtp_only and not is_mtp and name not in (
+            if cls.mtp_only and not is_mtp and (cls.mtp_shared_embd or name not in (
                 "model.embed_tokens.weight", "model.norm.weight", "lm_head.weight",
-            ):
+            )):
                 return None
 
         return name, gen
