@@ -1,0 +1,749 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Vision Decision Harness</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: 'Segoe UI', monospace;
+            background: #0d1117;
+            color: #c9d1d9;
+            padding: 20px;
+            font-size: 13px;
+        }
+        .container { max-width: 1100px; margin: 0 auto; }
+        h1 { color: #58a6ff; margin-bottom: 5px; font-size: 20px; }
+        .subtitle { color: #8b949e; margin-bottom: 20px; font-size: 12px; }
+        .panel {
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            padding: 15px;
+            margin-bottom: 15px;
+        }
+        .panel h2 { color: #58a6ff; font-size: 14px; margin-bottom: 12px; }
+        .row { margin-bottom: 12px; }
+        label {
+            display: block;
+            font-size: 11px;
+            color: #8b949e;
+            margin-bottom: 4px;
+            text-transform: uppercase;
+            font-weight: 600;
+        }
+        input[type="text"], input[type="number"], textarea, select {
+            width: 100%;
+            padding: 6px 8px;
+            background: #0d1117;
+            border: 1px solid #30363d;
+            border-radius: 4px;
+            color: #c9d1d9;
+            font-size: 12px;
+            font-family: inherit;
+        }
+        input:focus, textarea:focus, select:focus { outline: 1px solid #58a6ff; }
+        textarea { min-height: 50px; resize: vertical; font-family: 'Monaco', monospace; font-size: 11px; }
+        .tag-list { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+        .tag {
+            background: #23282f;
+            border: 1px solid #533478;
+            border-radius: 4px;
+            padding: 3px 10px;
+            font-size: 11px;
+            color: #f0f6fc;
+            display: flex;
+            align-items: center;
+        }
+        .tag .remove {
+            margin-left: 5px;
+            cursor: pointer;
+            color: #ff7b72;
+            font-size: 11px;
+            font-weight: bold;
+        }
+        .tag-input-row { display: flex; gap: 4px; }
+        .tag-input-row input { flex: 1; }
+        .btn {
+            padding: 5px 14px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 600;
+            transition: background 0.2s;
+        }
+        .btn-primary { background: #58a6ff; color: #0d1117; }
+        .btn-primary:hover { background: #74c0fc; }
+        .btn-secondary { background: #30363d; color: #c9d1d9; }
+        .btn-secondary:hover { background: #3d444f; }
+        .btn-warning { background: #d29922; color: #1c1f23; }
+        .btn-warning:hover { background: #f0c143; }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        .suggestions { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; max-height: 70px; overflow-y: auto; }
+        .suggestion {
+            background: #0d1117;
+            border: 1px solid #58a6ff;
+            border-radius: 4px;
+            padding: 2px 8px;
+            font-size: 11px;
+            color: #58a6ff;
+            cursor: pointer;
+        }
+        .suggestion:hover { background: #161b22; }
+        .progress-bar { width: 100%; height: 12px; background: #23282f; border-radius: 6px; overflow: hidden; margin-top: 8px; }
+        .progress-fill { height: 100%; background: #58a6ff; width: 0%; transition: width 0.3s; }
+        .results-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+        .results-table th, .results-table td { text-align: left; padding: 4px 6px; border-bottom: 1px solid #23282f; }
+        .results-table th { color: #58a6ff; font-weight: 600; font-size: 10px; text-transform: uppercase; }
+        .status-ok { color: #3fb357; }
+        .status-err { color: #ff7b72; }
+        .log { background: #010409; border: 1px solid #23282f; border-radius: 4px; padding: 8px; font-family: 'Monaco', monospace; font-size: 10px; color: #3fb357; max-height: 200px; overflow-y: auto; white-space: pre-wrap; }
+        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; }
+        .flex-row { display: flex; gap: 6px; align-items: center; }
+        .badge { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 10px; font-weight: 600; }
+        .badge-ok { background: #1a3a1a; color: #3fb357; }
+        .badge-err { background: #3a1a1a; color: #ff7b72; }
+        .badge-pending { background: #1a2a3a; color: #58a6ff; }
+        .match-highlight { background: #1a3a1a; color: #58a6ff; font-weight: bold; }
+        @media (max-width: 768px) { .grid { grid-template-columns: 1fr; } }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1>Vision Decision Harness</h1>
+    <div class="subtitle">Harness on 0.0.0.0:5786 | Proxies to llama-server at 0.0.0.0:8081</div>
+
+    <div class="grid">
+        <!-- Left: Configuration -->
+        <div>
+            <div class="panel">
+                <h2>Source</h2>
+                <div class="row">
+                    <label>Folder Upload / Path</label>
+                    <div class="flex-row">
+                        <input type="text" id="folderInput" placeholder="/path/to/images/">
+                        <button class="btn btn-secondary" onclick="document.getElementById('folderPicker').click()">Browse</button>
+                    </div>
+                    <input type="file" id="folderPicker" webkitdirectory directory multiple style="display:none;">
+                    <small style="color: #6e7681; margin-top: 4px; display: block;">Drag-drop or browse a folder of images (.jpg/.png/etc) and text files (.txt/.md)</small>
+                </div>
+                <div class="row">
+                    <label>Single Image Upload</label>
+                    <input type="file" id="imageInput" accept="image/*">
+                </div>
+            </div>
+
+            <div class="panel">
+                <h2>Prompt & Tags</h2>
+                <div class="row">
+                    <label>Image Analysis Prompt</label>
+                    <input type="text" id="promptInput" placeholder="Enter your prompt (e.g. 'Analyze this image and decide...')" oninput="onPromptInput()">
+                    <div class="suggestions" id="promptSuggestions"></div>
+                </div>
+                <div class="row">
+                    <label>Image Selection Question</label>
+                    <input type="text" id="selectionQuestion" placeholder="e.g. Which image contains a rubber duck?">
+                </div>
+                <div class="row">
+                    <label>System Instructions</label>
+                    <input type="text" id="instructionsInput" value="Choose the appropriate action based on the input.">
+                </div>
+                <div class="row">
+                    <label>Schema Field Name</label>
+                    <input type="text" id="fieldName" value="action">
+                </div>
+                <div class="row">
+                    <label>Decision Tags</label>
+                    <div class="tag-input-row">
+                        <input type="text" id="tagInput" placeholder="Type a tag and press +" onkeypress="if(event.key==='Enter') addTag()">
+                        <button class="btn btn-primary" onclick="addTag()" title="Add tag from text">+</button>
+                        <button class="btn btn-secondary" onclick="suggestTags()">Suggest</button>
+                    </div>
+                    <div class="tag-list" id="tagList"></div>
+                    <div class="suggestions" id="tagSuggestions"></div>
+                </div>
+                <div class="row">
+                    <label>Seed</label>
+                    <input type="number" id="seedInput" value="42" min="-1">
+                </div>
+            </div>
+
+            <div class="panel">
+                <h2>Actions</h2>
+                <div class="row">
+                    <button class="btn btn-primary" style="width:100%;" onclick="runSingle()">Run Single Decision</button>
+                </div>
+                <div class="row">
+                    <button class="btn btn-secondary" style="width:100%;" onclick="runBatch()">Run Batch</button>
+                </div>
+                <div class="row">
+                    <button class="btn btn-warning" style="width:100%;" onclick="runImageSelection()">Image Selection</button>
+                </div>
+                <div class="row">
+                    <button class="btn btn-secondary" style="width:100%;" onclick="exportSnippet()">Export API Snippet</button>
+                </div>
+                <div class="row">
+                    <label><input type="checkbox" id="showImages" onchange="toggleImages()"> Show images in results</label>
+                </div>
+            </div>
+        </div>
+
+        <!-- Right: Results -->
+        <div>
+            <div class="panel">
+                <h2>Results</h2>
+                <div class="progress-bar"><div class="progress-fill" id="progressBar"></div></div>
+                <div style="margin-top: 4px; font-size: 11px; color: #8b949e;" id="progressText"></div>
+                <table class="results-table" id="resultsTable" style="margin-top: 10px;">
+                    <thead>
+                        <tr>
+                            <th>File</th><th>Image</th><th>Decision</th><th>Prob</th><th>Tokens</th><th>Time (ms)</th><th>Status</th>
+                        </tr>
+                    </thead>
+                    <tbody id="resultsBody"></tbody>
+                </table>
+            </div>
+
+            <div class="panel">
+                <h2>Log</h2>
+                <div class="log" id="log"></div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+let currentImageBase64 = null;
+let currentFileName = null;
+let currentFolder = null;
+
+function log(msg) {
+    const el = document.getElementById('log');
+    const ts = new Date().toISOString().substring(11, 23);
+    el.textContent += '[' + ts + '] ' + msg + '\n';
+    el.scrollTop = el.scrollHeight;
+}
+
+function logClear() {
+    document.getElementById('log').textContent = '';
+}
+
+// --- Image / Folder selection ---
+
+document.getElementById('imageInput').addEventListener('change', function(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = function(ev) {
+        currentImageBase64 = ev.target.result.split(',')[1];
+        currentFileName = file.name;
+        log('Loaded image: ' + file.name);
+    };
+    reader.readAsDataURL(file);
+});
+
+document.getElementById('folderPicker').addEventListener('change', function(e) {
+    const files = Array.from(e.target.files);
+    if (!files.length) return;
+    log('Uploading ' + files.length + ' files...');
+    const formData = new FormData();
+    files.forEach(function(f) {
+        formData.append('files', f, f.webkitrelativePath || f.name);
+    });
+    fetch('/api/upload', {
+        method: 'POST',
+        body: formData
+    }).then(r => r.json()).then(data => {
+        if (data.dir) {
+            currentFolder = data.dir;
+            document.getElementById('folderInput').value = data.dir;
+            log('Folder uploaded: ' + files.length + ' files into ' + data.dir);
+        } else {
+            log('Upload error: ' + (data.error || 'unknown'));
+        }
+    }).catch(err => log('Upload error: ' + err.message));
+    e.target.value = '';
+});
+
+function loadFolder() {
+    const path = document.getElementById('folderInput').value.trim();
+    if (!path) {
+        log('Error: Please enter a folder path or click Browse to upload.');
+        return;
+    }
+    currentFolder = path;
+    log('Folder set: ' + path);
+}
+
+// --- Prompt suggestions (from /completion) ---
+
+function onPromptInput() {
+    const prompt = document.getElementById('promptInput').value.trim();
+    const el = document.getElementById('promptSuggestions');
+    el.innerHTML = '';
+    if (!prompt || prompt.length < 3) return;
+    fetch('/api/completion', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({prompt: prompt, n_predict: 16, temperature: 0.3})
+    }).then(r => r.json()).then(data => {
+        if (data.content) {
+            const suggestion = data.content.trim();
+            if (suggestion) {
+                el.innerHTML = '<span class="suggestion" onclick="applyPromptSuggestion(\'' + suggestion.replace(/'/g, "\\'") + '\')">' + suggestion.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</span>';
+            }
+        }
+    }).catch(() => {});
+}
+
+function applyPromptSuggestion(text) {
+    document.getElementById('promptInput').value += text;
+    document.getElementById('promptSuggestions').innerHTML = '';
+}
+
+// --- Tags ---
+
+function getTags() {
+    const tags = [];
+    document.querySelectorAll('#tagList .tag').forEach(function(tag) {
+        tags.push(tag.getAttribute('data-value'));
+    });
+    return tags;
+}
+
+function addTag() {
+    const input = document.getElementById('tagInput');
+    const val = input.value.trim();
+    if (!val) return;
+    const tags = getTags();
+    if (tags.includes(val)) { input.value = ''; return; }
+    const list = document.getElementById('tagList');
+    const tag = document.createElement('div');
+    tag.className = 'tag';
+    tag.setAttribute('data-value', val);
+    tag.innerHTML = val + ' <span class="remove" onclick="this.parentElement.remove()">x</span>';
+    list.appendChild(tag);
+    log('Added tag: ' + val);
+    input.value = '';
+}
+
+function suggestTags() {
+    const prompt = document.getElementById('promptInput').value.trim();
+    if (!prompt) {
+        log('Enter a prompt first to get tag suggestions.');
+        return;
+    }
+    log('Requesting tag suggestions from model...');
+    fetch('/api/completion', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+            prompt: 'Based on the prompt "' + prompt + '", suggest 4-6 short tag labels (one per line, max 2 words each):',
+            n_predict: 64,
+            temperature: 0.3
+        })
+    }).then(r => r.json()).then(data => {
+        if (data.content) {
+            const lines = data.content.trim().split('\n').filter(function(l) { return l.trim(); });
+            const sugg = document.getElementById('tagSuggestions');
+            sugg.innerHTML = '';
+            lines.forEach(function(line) {
+                const label = line.trim();
+                if (label) {
+                    const el = document.createElement('span');
+                    el.className = 'suggestion';
+                    el.textContent = label;
+                    el.onclick = function() { addTagToUI(label); };
+                    sugg.appendChild(el);
+                }
+            });
+        }
+    }).catch(function() { log('Failed to get tag suggestions.'); });
+}
+
+function addTagToUI(val) {
+    const tags = getTags();
+    if (tags.includes(val)) return;
+    const list = document.getElementById('tagList');
+    const tag = document.createElement('div');
+    tag.className = 'tag';
+    tag.setAttribute('data-value', val);
+    tag.innerHTML = val + ' <span class="remove" onclick="this.parentElement.remove()">x</span>';
+    list.appendChild(tag);
+}
+
+// --- Schema ---
+
+function getSchema() {
+    const fieldName = document.getElementById('fieldName').value || 'action';
+    const tags = getTags();
+    return {"properties": {[fieldName]: {"type": "string", "enum": tags}}};
+}
+
+// --- API calls ---
+
+function getContexts() {
+    const prompt = document.getElementById('promptInput').value.trim();
+    return [prompt || "What action should I take?"];
+}
+
+function getSeed() {
+    const v = document.getElementById('seedInput').value;
+    return v === '' ? -1 : parseInt(v);
+}
+
+function runSingle() {
+    const tags = getTags();
+    if (!tags.length) {
+        log('Error: Add at least one decision tag before running.');
+        return;
+    }
+    const body = {
+        contexts: getContexts(),
+        schema: getSchema(),
+        instructions: document.getElementById('instructionsInput').value,
+        seed: getSeed()
+    };
+    if (currentImageBase64) {
+        body.images = [currentImageBase64];
+    }
+
+    log('Running single decision...');
+    const t0 = Date.now();
+    fetch('/api/decision', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(body)
+    }).then(r => r.json()).then(data => {
+        const elapsed = Date.now() - t0;
+        displayResult({
+            file: currentFileName || 'single',
+            elapsed_ms: elapsed,
+            result: data
+        });
+        log('Decision complete in ' + (elapsed / 1000).toFixed(2) + 's');
+        log(JSON.stringify(data, null, 2));
+    }).catch(err => log('Error: ' + err.message));
+}
+
+function displayResult(entry) {
+    const resultsBody = document.getElementById('resultsBody');
+    const row = document.createElement('tr');
+    const result = entry.result;
+    let decision = '-';
+    let prob = '-';
+    let tokens = '-';
+    let statusClass = 'status-ok';
+    let statusText = 'OK';
+
+    // Determine image data for this entry
+    let imgSrc = '';
+    if (entry.image_data) {
+        imgSrc = entry.image_data;
+    } else if (entry.is_image && currentImageBase64 && entry.file === currentFileName) {
+        imgSrc = currentImageBase64;
+    }
+
+    const showImgs = document.getElementById('showImages').checked;
+    const imgCell = showImgs && imgSrc
+        ? '<td><img src="data:image/jpeg;base64,' + imgSrc + '" style="max-width:60px;max-height:60px;object-fit:contain;"></td>'
+        : '<td></td>';
+
+    row.setAttribute('data-image', imgSrc);
+
+    if (result && result.results && result.results[0]) {
+        const field = Object.keys(result.results[0].fields)[0];
+        const fld = result.results[0].fields[field];
+        decision = fld.value;
+        prob = (fld.probability * 100).toFixed(1) + '%';
+        tokens = result.results[0].usage ? result.results[0].usage.context_tokens : '-';
+    } else if (entry.error) {
+        statusClass = 'status-err';
+        statusText = 'Fail';
+        decision = entry.error.substring(0, 50);
+    }
+
+    const ms = entry.elapsed_ms || '-';
+
+    row.innerHTML =
+        '<td>' + entry.file + '</td>' +
+        imgCell +
+        '<td>' + decision + '</td>' +
+        '<td>' + prob + '</td>' +
+        '<td>' + tokens + '</td>' +
+        '<td>' + ms + '</td>' +
+        '<td class="' + statusClass + '">' + statusText + '</td>';
+    resultsBody.appendChild(row);
+    log(entry.file + ': ' + decision + ' (' + prob + ') [' + ms + 'ms]');
+}
+
+function toggleImages() {
+    const showImgs = document.getElementById('showImages').checked;
+    document.querySelectorAll('#resultsBody tr').forEach(function(row) {
+        const imgData = row.getAttribute('data-image') || '';
+        const imgCell = row.cells[1];
+        if (showImgs && imgData) {
+            imgCell.innerHTML = '<img src="data:image/png;base64,' + imgData + '" style="max-width:60px;max-height:60px;object-fit:contain;">';
+        } else {
+            imgCell.innerHTML = '';
+        }
+    });
+}
+
+function runBatch() {
+    const tags = getTags();
+    if (!tags.length) {
+        log('Error: Add at least one decision tag before running.');
+        return;
+    }
+    const folder = currentFolder || document.getElementById('folderInput').value.trim();
+    if (!folder) {
+        log('Error: Specify a folder path or click Browse to upload.');
+        return;
+    }
+
+    const body = {
+        source: folder,
+        contexts: getContexts(),
+        schema: getSchema(),
+        instructions: document.getElementById('instructionsInput').value,
+        seed: getSeed()
+    };
+
+    log('Starting batch: ' + folder);
+    logClear();
+    log('Starting batch: ' + folder);
+    document.getElementById('progressBar').style.width = '0%';
+    document.getElementById('progressText').textContent = 'Starting...';
+    document.getElementById('resultsBody').innerHTML = '';
+
+    const t0 = Date.now();
+    fetch('/api/batch-stream', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(body)
+    }).then(response => {
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let totalFiles = 0;
+
+        function read() {
+            return reader.read().then(function(computed) {
+                if (computed.done) return;
+                buffer += decoder.decode(computed.value, { stream: true });
+                const lines = buffer.split('\n\n');
+                buffer = lines.pop();
+
+                lines.forEach(function(line) {
+                    if (line.startsWith('data:')) {
+                        const payload = line.substring(5).trim();
+                        try {
+                            const data = JSON.parse(payload);
+                            if (data.event === 'start') {
+                                totalFiles = data.total_files;
+                                document.getElementById('progressText').textContent = 'Processing ' + totalFiles + ' files...';
+                            } else if (data.event === 'done') {
+                                document.getElementById('progressBar').style.width = '100%';
+                                document.getElementById('progressText').textContent = 'Done: ' + data.total_files + ' files, ' + data.total_ms + 'ms total';
+                                const elapsed = (Date.now() - t0) / 1000;
+                                log('Batch complete: ' + data.total_files + ' files, ' + elapsed.toFixed(2) + 's total');
+                            } else if (data.file) {
+                                displayResult(data);
+                                const pct = (data.index + 1) / totalFiles * 100;
+                                document.getElementById('progressBar').style.width = pct + '%';
+                                document.getElementById('progressText').textContent = 'Processing: ' + data.file + ' (' + (data.index + 1) + '/' + totalFiles + ')';
+                            }
+                        } catch (e) {
+                            // ignore parse errors
+                        }
+                    }
+                });
+                read();
+            });
+        }
+        read();
+    }).catch(err => log('Batch error: ' + err.message));
+}
+
+function runImageSelection() {
+    const folder = currentFolder || document.getElementById('folderInput').value.trim();
+    if (!folder) {
+        log('Error: Specify a folder path or click Browse to upload.');
+        return;
+    }
+
+    const question = document.getElementById('selectionQuestion').value.trim();
+    const instructions = document.getElementById('instructionsInput').value;
+    const seed = getSeed();
+
+    const body = {
+        source: folder,
+        question: question || "Which image contains a yellow rubber duck?",
+        instructions: instructions,
+        seed: seed,
+    };
+
+    log('Starting image selection: ' + folder);
+    logClear();
+    log('Starting image selection on: ' + folder);
+    log('Question: ' + body.question);
+    document.getElementById('progressBar').style.width = '0%';
+    document.getElementById('progressText').textContent = 'Scanning images...';
+    document.getElementById('resultsBody').innerHTML = '';
+
+    fetch('/api/image-selection/stream', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(body)
+    }).then(response => {
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let totalImages = 0;
+        let processed = 0;
+
+        function read() {
+            return reader.read().then(function(computed) {
+                if (computed.done) return;
+                buffer += decoder.decode(computed.value, { stream: true });
+                const lines = buffer.split('\n\n');
+                buffer = lines.pop();
+
+                lines.forEach(function(line) {
+                    if (line.startsWith('data:')) {
+                        const payload = line.substring(5).trim();
+                        try {
+                            const data = JSON.parse(payload);
+            if (data.event === 'start') {
+                                totalImages = data.total_images;
+                                document.getElementById('progressText').textContent =
+                                    'Scanning ' + totalImages + ' images...';
+                                log('Found ' + totalImages + ' images');
+                                log('Files: ' + data.image_files.join(', '));
+                            } else if (data.event === 'progress') {
+                                processed++;
+                                const pct = (processed / totalImages) * 100;
+                                document.getElementById('progressBar').style.width = pct + '%';
+                                document.getElementById('progressText').textContent =
+                                    'Loading: ' + processed + '/' + totalImages + ' (' + data.file + ')';
+                            } else if (data.event === 'result' && data.data) {
+                                const entry = data.data;
+                                processed++;
+                                const pct = (processed / totalImages) * 100;
+                                document.getElementById('progressBar').style.width = Math.min(pct, 100) + '%';
+                                document.getElementById('progressText').textContent =
+                                    'Evaluating: ' + processed + '/' + totalImages + ' (' + entry.file + ')';
+                                log('Evaluated: ' + entry.file + ' -> ' + entry.value + ' (' + (entry.probability * 100).toFixed(1) + '%)');
+                            } else if (data.event === 'decision' && data.data) {
+                                const entry = data.data;
+                                document.getElementById('progressBar').style.width = '100%';
+                                if (entry.selected_file) {
+                                    document.getElementById('progressText').textContent =
+                                        'Selected: ' + entry.selected_file + ' (' + (entry.probability * 100).toFixed(1) + '%)';
+                                } else {
+                                    document.getElementById('progressText').textContent =
+                                        'No match found';
+                                }
+                                displayImageSelectionDecision(entry);
+                                if (entry.selected_file) {
+                                    log('RESULT: ' + entry.selected_file + ' at ' + (entry.probability * 100).toFixed(1) + '%');
+                                    log('Total yes matches: ' + entry.total_matches);
+                                } else {
+                                    log('RESULT: No match found');
+                                }
+                                if (entry.timings) {
+                                    log('Timings: ' + JSON.stringify(entry.timings));
+                                }
+                            } else if (data.event === 'done') {
+                                log('Image selection complete in ' + data.total_ms + 'ms');
+                            } else if (data.error) {
+                                log('Error: ' + data.error);
+                                document.getElementById('progressText').textContent = 'Error: ' + data.error;
+                            }
+                        } catch (e) {
+                            // ignore parse errors
+                        }
+                    }
+                });
+                read();
+            });
+        }
+        read();
+    }).catch(err => {
+        log('Image selection error: ' + err.message);
+        document.getElementById('progressText').textContent = 'Error: ' + err.message;
+    });
+}
+
+function displayImageSelectionDecision(entry) {
+    // Single decision result — only ONE image is selected
+    const resultsBody = document.getElementById('resultsBody');
+    const row = document.createElement('tr');
+    const showImgs = document.getElementById('showImages').checked;
+
+    if (entry.selected_file) {
+        const prob = (entry.probability * 100).toFixed(1) + '%';
+        const statusClass = 'status-ok';
+        const statusText = 'SELECTED';
+
+        let imgCell = '<td></td>';
+        if (showImgs) {
+            imgCell = entry.image_data
+                ? '<td><img src="data:image/png;base64,' + entry.image_data + '" style="max-width:60px;max-height:60px;object-fit:contain;"></td>'
+                : '<td class="' + statusClass + '" style="font-weight:bold;">&#10003;</td>';
+        }
+
+        row.setAttribute('data-image', entry.image_data || '');
+
+        row.innerHTML =
+            '<td>' + entry.selected_file + '</td>' +
+            imgCell +
+            '<td>' + prob + '</td>' +
+            '<td>-</td>' +
+            '<td>-</td>' +
+            '<td class="' + statusClass + '">' + statusText + '</td>';
+        resultsBody.appendChild(row);
+        log('Selected image: ' + entry.selected_file + ' at ' + prob + ' confidence');
+    } else {
+        row.innerHTML =
+            '<td colspan="6">No match found for the question: "' + entry.question + '"</td>';
+        resultsBody.appendChild(row);
+        log('No match found');
+    }
+}
+
+function displayImageSelectionPerImage(items) {
+    // This function is kept for compatibility but no longer used
+    // The yes/no results are streamed as 'result' events, not per_image
+}
+
+function exportSnippet() {
+    const body = {
+        contexts: getContexts(),
+        schema: getSchema(),
+        instructions: document.getElementById('instructionsInput').value,
+        seed: getSeed(),
+    };
+    fetch('/api/export-snippet', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(body)
+    }).then(r => r.json()).then(data => {
+        const w = window.open('', '_blank');
+        w.document.write('<pre>' + data.snippet.replace(/</g, '&lt;') + '</pre>');
+        w.document.title = 'API Snippet';
+    }).catch(err => log('Export error: ' + err.message));
+}
+
+// Health check on load
+window.onload = function() {
+    fetch('/api/health').then(r => r.json()).then(data => {
+        log('Server status: ' + (data.status === 'ok' ? 'connected' : 'disconnected'));
+    }).catch(() => log('Server: disconnected'));
+};
+</script>
+</body>
+</html>

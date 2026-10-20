@@ -1,0 +1,190 @@
+{
+  "description": "Answer key for decision scoring test suite",
+  "total_tests": 23,
+  "tests": [
+    {
+      "id": "t01_basic_color",
+      "context": "What is the dominant color in this image?",
+      "expected": "brown",
+      "difficulty": "easy",
+      "category": "color",
+      "schema_enum": ["red", "green", "blue", "brown", "orange"]
+    },
+    {
+      "id": "t02_animal_type",
+      "context": "What type of animal is in this image?",
+      "expected": "dog",
+      "difficulty": "medium",
+      "category": "animal",
+      "schema_enum": ["dog", "cat", "bird", "horse", "fish"]
+    },
+    {
+      "id": "t03_ui_element",
+      "context": "What type of UI element should you click to submit this form?",
+      "expected": "button",
+      "difficulty": "easy",
+      "category": "ui",
+      "schema_enum": ["button", "link", "checkbox", "text_field", "dropdown"]
+    },
+    {
+      "id": "t04_action_select",
+      "context": "Based on this content, what is the best action to take?",
+      "expected": "CLICK_OK",
+      "difficulty": "easy",
+      "category": "action",
+      "schema_enum": ["CLICK_OK", "CLICK_CANCEL", "NO_ACTION"]
+    },
+    {
+      "id": "t05_sentiment",
+      "context": "What is the sentiment expressed in this content?",
+      "expected": "positive",
+      "difficulty": "medium",
+      "category": "sentiment",
+      "schema_enum": ["positive", "negative", "neutral"]
+    },
+    {
+      "id": "t06_navigation",
+      "context": "Where should you navigate to complete this task?",
+      "expected": "settings",
+      "difficulty": "hard",
+      "category": "navigation",
+      "schema_enum": ["home", "settings", "profile", "logout", "help"]
+    },
+    {
+      "id": "t07_content_type",
+      "context": "What type of content is shown in this image?",
+      "expected": "image",
+      "difficulty": "easy",
+      "category": "content",
+      "schema_enum": ["text", "image", "video", "audio", "interactive"]
+    },
+    {
+      "id": "t08_priority",
+      "context": "What priority level should this task be assigned?",
+      "expected": "medium",
+      "difficulty": "hard",
+      "category": "priority",
+      "schema_enum": ["low", "medium", "high", "urgent"]
+    },
+    {
+      "id": "t09_safety",
+      "context": "Is it safe to proceed with this action?",
+      "expected": "yes",
+      "difficulty": "medium",
+      "category": "safety",
+      "schema_enum": ["yes", "no", "caution"]
+    },
+    {
+      "id": "t10_layout",
+      "context": "Where should new items be added in this layout?",
+      "expected": "bottom_right",
+      "difficulty": "hard",
+      "category": "layout",
+      "schema_enum": ["top_left", "top_right", "bottom_left", "bottom_right", "center"]
+    },
+    {
+      "id": "t11_text_format",
+      "context": "What format is this text in?",
+      "expected": "plain",
+      "difficulty": "medium",
+      "category": "format",
+      "schema_enum": ["plain", "markdown", "html", "json", "xml"]
+    },
+    {
+      "id": "t12_object_count",
+      "context": "How many main objects are visible in this image?",
+      "expected": "one",
+      "difficulty": "medium",
+      "category": "counting",
+      "schema_enum": ["one", "two", "three", "four", "many"]
+    },
+    {
+      "id": "t13_file_op",
+      "context": "What file operation should be performed?",
+      "expected": "save",
+      "difficulty": "easy",
+      "category": "fileop",
+      "schema_enum": ["save", "delete", "rename", "copy", "move"]
+    },
+    {
+      "id": "t14_error_type",
+      "context": "What type of error is indicated by this message?",
+      "expected": "not_found",
+      "difficulty": "hard",
+      "category": "error",
+      "schema_enum": ["syntax", "runtime", "network", "permission", "not_found"]
+    },
+    {
+      "id": "t15_time_urgency",
+      "context": "How urgent is this action?",
+      "expected": "soon",
+      "difficulty": "hard",
+      "category": "time",
+      "schema_enum": ["immediate", "soon", "later", "anytime"]
+    },
+    {
+      "id": "t16_language",
+      "context": "What language is this text written in?",
+      "expected": "english",
+      "difficulty": "hard",
+      "category": "language",
+      "schema_enum": ["english", "spanish", "french", "german", "chinese"]
+    },
+    {
+      "id": "t17_component",
+      "context": "What type of UI component is shown here?",
+      "expected": "card",
+      "difficulty": "medium",
+      "category": "ui",
+      "schema_enum": ["modal", "sidebar", "header", "footer", "card"]
+    },
+    {
+      "id": "t18_data_source",
+      "context": "Where should this data be fetched from?",
+      "expected": "api",
+      "difficulty": "hard",
+      "category": "data",
+      "schema_enum": ["database", "api", "file", "cache", "user_input"]
+    },
+    {
+      "id": "t19_interaction",
+      "context": "What type of user interaction does this represent?",
+      "expected": "click",
+      "difficulty": "medium",
+      "category": "interaction",
+      "schema_enum": ["click", "hover", "drag", "scroll", "type"]
+    },
+    {
+      "id": "t20_state",
+      "context": "What is the correct state for this toggle?",
+      "expected": "on",
+      "difficulty": "hard",
+      "category": "state",
+      "schema_enum": ["on", "off", "indeterminate", "disabled"]
+    },
+    {
+      "id": "t21_direction",
+      "context": "Which direction should this carousel move?",
+      "expected": "right",
+      "difficulty": "hard",
+      "category": "direction",
+      "schema_enum": ["left", "right", "up", "down", "none"]
+    },
+    {
+      "id": "t22_file_type",
+      "context": "What type of file is this?",
+      "expected": "image",
+      "difficulty": "easy",
+      "category": "filetype",
+      "schema_enum": ["image", "document", "spreadsheet", "presentation", "archive"]
+    },
+    {
+      "id": "t23_security",
+      "context": "What security level is required for this resource?",
+      "expected": "internal",
+      "difficulty": "hard",
+      "category": "security",
+      "schema_enum": ["public", "internal", "confidential", "restricted"]
+    }
+  ]
+}

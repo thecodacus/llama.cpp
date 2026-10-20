@@ -4,7 +4,7 @@
 
 <div align="center">
 
-<b>LLM inference in C/C++</b>
+<b>LLM inference in C/C++, with batched constrained decisions over text and images</b>
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp?filter=v*&color=brightgreen)](https://github.com/ggml-org/llama.cpp/releases?q=tag:v0)
@@ -17,7 +17,74 @@
 
 </div>
 
-## Quick start
+## Constrained decisions
+
+Instead of generating a JSON object one token at a time, this branch scores a whole schema in a single batched
+forward pass. Every field has a fixed set of allowed values, so the values are scored as token paths that fork from
+the same KV cache. All fields are answered in one `llama_decode`, cannot see each other, and the object is
+assembled by code, so the output always matches the schema. Each field comes back with a probability.
+
+Contexts can carry images. A prompt part is either a run of text tokens or a media chunk, and chunks encode through
+the same mtmd path the completion endpoint uses. A decision over a screenshot, a document scan, or a whole folder of
+images stays a single pass rather than becoming a run of generate calls.
+
+```bash
+./build/bin/llama-server -m model-Q4_K_M.gguf --mmproj mmproj-model.gguf \
+    --decision-seqs 8 --host 0.0.0.0 --port 8081
+```
+
+```bash
+curl http://localhost:8081/decision -H "Content-Type: application/json" -d '{
+  "instructions": "Answer each question about this screenshot.",
+  "schema": {
+    "properties": {
+      "page":  {"type": "string", "enum": ["login", "checkout", "settings", "other"]},
+      "error": {"type": "boolean"}
+    }
+  },
+  "contexts": ["What kind of page is this?"],
+  "images": ["iVBORw0KGgoAAAANSUhEUg..."]
+}'
+```
+
+```json
+{
+  "object": "decision",
+  "results": [
+    {
+      "decision": {"page": "settings", "error": true},
+      "fields": {
+        "page":  {"value": "settings", "probability": 0.868, "scored_nodes": 1, "tree": true},
+        "error": {"value": true,      "probability": 0.966, "scored_nodes": 1, "tree": true}
+      },
+      "usage": {"context_tokens": 516, "scored_rows": 9}
+    }
+  ]
+}
+```
+
+`images` is positional: entry *i* belongs to context *i*. An entry is one base64 string, or an array when a single
+context should see several images. Media markers already present in the context text are left where the caller put
+them, so images can be interleaved with the caller's own labels.
+
+Full reference: [parallel-decision](tools/parallel-decision/README.md).
+
+### Vision decision harness
+
+`tools/parallel-decision/examples/vision-decision-harness/` is a runnable example UI for the endpoint. It does
+folder upload, batch runs over images and text with SSE progress, image selection across a folder, a text
+classification suite, and snippet export. It is an example, not a dependency, and nothing in the server links
+against it. See its [README](tools/parallel-decision/examples/vision-decision-harness/README.md).
+
+### Set `LLAMA_DECISION_DEBUG`
+
+Traces tokenization, chunk encoding, and decode on the decision path.
+
+## Standard llama.cpp
+
+Everything below this point is the upstream project as usual.
+
+### Quick start
 
 A few options to get `llama.cpp` installed on your machine:
 
@@ -49,7 +116,7 @@ llama serve -hf ggml-org/Qwen3.5-0.8B-GGUF
     </tr>
 <table>
 
-## Description
+### Description
 
 The main goal of `llama.cpp` is to enable LLM (and VLM) inference with minimal setup and state-of-the-art performance on
 a wide range of hardware - locally and in the cloud.
@@ -65,7 +132,7 @@ a wide range of hardware - locally and in the cloud.
 
 The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-org/ggml) library.
 
-## Supported backends
+### Supported backends
 
 | Backend | Target devices |
 | --- | --- |
@@ -87,7 +154,7 @@ The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-or
 | [WebGPU](docs/build.md#webgpu) | All |
 | [ZenDNN](docs/build.md#zendnn) | AMD CPU |
 
-## Documentation
+### Documentation
 
 #### Tools
 
@@ -109,7 +176,7 @@ The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-or
 - [Models](docs/models.md)
 - [Release process](docs/release.md)
 
-## Contributing
+### Contributing
 
 - Contributors can open PRs
 - Collaborators will be invited based on contributions
@@ -117,7 +184,7 @@ The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-or
 - Any help with managing issues, PRs and projects is very appreciated!
 - Read the [CONTRIBUTING.md](CONTRIBUTING.md) for more information
 
-## Acknowledgements
+### Acknowledgements
 
 - [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - Single-header HTTP server, used by `llama-server` - MIT license
 - [nothings/stb](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain

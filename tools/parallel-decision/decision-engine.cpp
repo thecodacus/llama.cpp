@@ -2,6 +2,7 @@
 
 #include "chat.h"
 #include "common.h"
+#include "mtmd-helper.h"
 
 #include <algorithm>
 #include <chrono>
@@ -9,6 +10,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
+
+// Toggle debug output with LLAMA_DECISION_DEBUG env var
+namespace { bool debug_enabled() { static bool v = std::getenv("LLAMA_DECISION_DEBUG") != nullptr; return v; } }
+#define DECISION_DEBUG(fmt, ...) do { if (debug_enabled()) { fprintf(stderr, "[decision-debug] " fmt "\n", ##__VA_ARGS__); } } while(0)
 
 namespace llama_decision {
 
@@ -173,10 +178,11 @@ struct decision_field {
 
 // ---------------------------------------------------------------- engine
 
-engine::engine(llama_context * ctx, llama_seq_id seq_base, int n_seqs)
+engine::engine(llama_context * ctx, llama_seq_id seq_base, int n_seqs, mtmd_context * mctx)
     : ctx(ctx), vocab(llama_model_get_vocab(llama_get_model(ctx))), mem(llama_get_memory(ctx)),
       seq_snap(seq_base), seq_pool(seq_base + 1), n_pool(n_seqs - 1),
-      pad_branches(llama_model_is_recurrent(llama_get_model(ctx)) || llama_model_is_hybrid(llama_get_model(ctx))) {
+      pad_branches(llama_model_is_recurrent(llama_get_model(ctx)) || llama_model_is_hybrid(llama_get_model(ctx))),
+      mctx(mctx) {
     if (n_seqs < 3) {
         throw std::invalid_argument("a decision engine needs at least 3 sequences");
     }
@@ -192,11 +198,94 @@ tokens_t engine::tokenize(const std::string & text, bool add_special) const {
     return toks;
 }
 
+// Tokenize text that may contain media markers. When mctx is available and the text
+// contains a media marker, uses mtmd_tokenize to split the text into text chunks and
+// image chunks. Text tokens with LLAMA_TOKEN_NULL at image positions are returned,
+// and the image chunks are collected for separate encoding in decode_parts.
+engine::multimodal_tokens engine::tokenize_mm(const std::string & text, bool add_special,
+                                                const mtmd::bitmaps * bitmaps) const {
+    multimodal_tokens result;
+
+    if (!mctx) {
+        // no multimodal context, fall back to regular tokenization
+        result.toks = tokenize(text, add_special);
+        return result;
+    }
+
+    const char * marker = mctx ? mtmd_get_marker(mctx) : nullptr;
+    if (marker == nullptr || text.find(marker) == std::string::npos) {
+        // no media marker in text, use regular tokenization
+        result.toks = tokenize(text, add_special);
+        return result;
+    }
+
+    // Use mtmd_tokenize to properly split text and image chunks, passing bitmaps
+    mtmd::input_chunks chunks(mtmd_input_chunks_init());  // MUST be initialized!
+    mtmd_input_text input_text;
+    input_text.text = text.c_str();
+    input_text.text_len = text.size();
+    input_text.add_special = add_special;
+    input_text.parse_special = true;
+
+    auto bmp_ptr = [bitmaps]() {
+        std::vector<const mtmd_bitmap *> res;
+        if (bitmaps) {
+            res.reserve(bitmaps->entries.size());
+            for (const auto & b : bitmaps->entries) {
+                res.push_back(b.ptr.get());
+            }
+        }
+        return res;
+    }();
+    int32_t rc = mtmd_tokenize(mctx, chunks.ptr.get(), &input_text, bmp_ptr.data(), (int32_t) bmp_ptr.size());
+    DECISION_DEBUG("tokenize_mm: mtmd_tokenize rc=%d chunks.size=%zu", (int)rc, chunks.size());
+    if (rc != 0) {
+        // fall back to regular tokenization on error
+        result.toks = tokenize(text, add_special);
+        return result;
+    }
+
+    // Extract tokens from chunks, interleaving text tokens and LLAMA_TOKEN_NULL for images
+    for (size_t i = 0; i < chunks.size(); ++i) {
+        const mtmd_input_chunk * chunk = chunks[i];
+        enum mtmd_input_chunk_type type = mtmd_input_chunk_get_type(chunk);
+        if (type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
+            size_t n_tokens = 0;
+            const llama_token * toks = mtmd_input_chunk_get_tokens_text(chunk, &n_tokens);
+            for (size_t j = 0; j < n_tokens; ++j) {
+                result.toks.push_back(toks[j]);
+            }
+        } else if (type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+            // image chunk: insert LLAMA_TOKEN_NULL placeholder and record the chunk copy
+            size_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk);
+            result.toks.insert(result.toks.end(), n_tokens, LLAMA_TOKEN_NULL);
+            // copy the chunk so it stays valid after chunks object is destroyed
+            result.chunks.push_back(mtmd_input_chunk_copy(chunk));
+        } else if (type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
+            // audio chunk: insert LLAMA_TOKEN_NULL placeholder and record the chunk copy
+            size_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk);
+            result.toks.insert(result.toks.end(), n_tokens, LLAMA_TOKEN_NULL);
+            result.chunks.push_back(mtmd_input_chunk_copy(chunk));
+        }
+    }
+
+    // deduplicate BOS if needed (consistent with tokenize())
+    const llama_token bos = llama_vocab_bos(vocab);
+    if (result.toks.size() >= 2 && result.toks[0] == bos && result.toks[1] == bos) {
+        result.toks.erase(result.toks.begin());
+    }
+
+    return result;
+}
+
 // Decode several prompts, each on its own sequence, packed into as few batches as n_batch allows.
+// Image chunks are encoded via the mtmd batch API (mtmd_batch_init/add_chunk/encode/get_output_embd)
+// followed by mtmd_helper_decode_image_chunk, the same path the server's completion endpoint uses.
+// Text tokens use a plain llama_batch for batched llama_decode.
 void engine::decode_parts(const std::vector<prompt_part> & parts) {
     const int n_batch = (int) llama_n_batch(ctx);
     llama_batch batch = llama_batch_init(n_batch, 0, 1);
-    auto flush = [&]() {
+    auto flush_text = [&]() {
         const int rc = batch.n_tokens > 0 ? llama_decode(ctx, batch) : 0;
         common_batch_clear(batch);
         if (rc != 0) {
@@ -205,15 +294,93 @@ void engine::decode_parts(const std::vector<prompt_part> & parts) {
                                              : "llama_decode failed on the decision prompt (" + std::to_string(rc) + ")");
         }
     };
+    // Collect image chunks that need encoding
+    std::vector<const mtmd_input_chunk *> img_chunks;
     for (const auto & p : parts) {
-        for (size_t i = 0; i < p.toks->size(); ++i) {
-            if (batch.n_tokens == n_batch) {
-                flush();
-            }
-            common_batch_add(batch, (*p.toks)[i], p.pos0 + (llama_pos) i, { p.seq }, false);
+        if (p.kind == prompt_part::CHUNK) {
+            img_chunks.push_back(p.chunk);
         }
     }
-    flush();
+
+    // Encode image chunks via the mtmd batch API, the same path the server's completion
+    // endpoint uses. Some models (e.g. SmolVLM2) do not support batching in the CLIP context,
+    // so mtmd_batch_add_chunk rejects the second chunk with "batch too large" (rc=2). In that
+    // case each chunk is encoded on its own with mtmd_encode_chunk instead.
+    // Text-only decisions never reach this and skip the whole block.
+    mtmd::batch_ptr mbatch;
+    bool use_batch = false;
+    if (!img_chunks.empty() && mctx) {
+        mbatch.reset(mtmd_batch_init(mctx));
+        use_batch = true;
+        for (auto * chunk : img_chunks) {
+            DECISION_DEBUG("decode_parts: adding image chunk with n_tokens=%d", (int) mtmd_input_chunk_get_n_tokens(chunk));
+            int32_t add_rc = mtmd_batch_add_chunk(mbatch.get(), chunk);
+            DECISION_DEBUG("decode_parts: mtmd_batch_add_chunk rc=%d", (int) add_rc);
+            if (add_rc == 2) {
+                // batch too large: this model does not support batched clip encoding
+                use_batch = false;
+                mbatch.reset();
+                break;
+            }
+            if (add_rc != 0) {
+                throw std::runtime_error("mtmd_batch_add_chunk failed (" + std::to_string(add_rc) + ")");
+            }
+        }
+        if (use_batch) {
+            int32_t enc_rc = mtmd_batch_encode(mbatch.get());
+            DECISION_DEBUG("decode_parts: mtmd_batch_encode rc=%d", (int) enc_rc);
+            if (enc_rc != 0) {
+                llama_batch_free(batch);
+                throw std::runtime_error("mtmd_batch_encode failed on the decision prompt (" + std::to_string(enc_rc) + ")");
+            }
+        }
+    }
+
+    // Now iterate parts: decode text via llama_batch, decode image via mtmd_helper_decode_image_chunk
+    for (const auto & p : parts) {
+        if (p.kind == prompt_part::CHUNK) {
+            // Flush pending text tokens first so image decoding starts at the right position
+            flush_text();
+            DECISION_DEBUG("decode_parts: decoding CHUNK pos0=%d seq=%d", (int) p.pos0, (int) p.seq);
+            float * embd = nullptr;
+            if (use_batch && mbatch) {
+                embd = mtmd_batch_get_output_embd(mbatch.get(), p.chunk);
+                DECISION_DEBUG("decode_parts: embd ptr from batch=%p", (void*)embd);
+            } else {
+                // Non-batch fallback: encode this chunk individually
+                DECISION_DEBUG("decode_parts: encoding chunk individually via mtmd_encode_chunk");
+                int32_t enc_rc = mtmd_encode_chunk(mctx, p.chunk);
+                DECISION_DEBUG("decode_parts: mtmd_encode_chunk rc=%d", (int) enc_rc);
+                if (enc_rc != 0) {
+                    llama_batch_free(batch);
+                    throw std::runtime_error("mtmd_encode_chunk failed on the decision prompt (" + std::to_string(enc_rc) + ")");
+                }
+                embd = mtmd_get_output_embd(mctx);
+                DECISION_DEBUG("decode_parts: embd ptr from mtmd=%p", (void*)embd);
+            }
+            if (!embd) {
+                llama_batch_free(batch);
+                throw std::runtime_error("failed to get image embedding for chunk");
+            }
+            DECISION_DEBUG("decode_parts: mtmd_helper_decode_image_chunk n_batch=%d", n_batch);
+            llama_pos new_n_past = p.pos0;
+            int32_t rc = mtmd_helper_decode_image_chunk(mctx, ctx, p.chunk, embd, p.pos0, p.seq, n_batch, &new_n_past, nullptr, nullptr);
+            DECISION_DEBUG("decode_parts: mtmd_helper_decode_image_chunk rc=%d new_n_past=%d", (int) rc, (int) new_n_past);
+            if (rc != 0) {
+                llama_batch_free(batch);
+                throw std::runtime_error("mtmd_helper_decode_image_chunk failed on the decision prompt (" + std::to_string(rc) + ")");
+            }
+        } else {
+            DECISION_DEBUG("decode_parts: TOKS pos0=%d seq=%d n_toks=%zu", (int) p.pos0, (int) p.seq, p.toks->size());
+            for (size_t i = 0; i < p.toks->size(); ++i) {
+                if (batch.n_tokens == n_batch) {
+                    flush_text();
+                }
+                common_batch_add(batch, (*p.toks)[i], p.pos0 + (llama_pos) i, { p.seq }, false);
+            }
+        }
+    }
+    flush_text();
     llama_batch_free(batch);
 }
 
@@ -229,7 +396,9 @@ bool engine::prepare_prefix(const tokens_t & shared, bool allow_cache) {
     }
     cached.clear();
     if (!shared.empty()) {
-        decode_parts({ { &shared, 0, seq_snap } });
+        DECISION_DEBUG("prepare_prefix: calling decode_parts with shared.size=%zu", shared.size());
+        decode_parts({ { prompt_part::TOKS, &shared, nullptr, 0, seq_snap } });
+        DECISION_DEBUG("prepare_prefix: decode_parts returned");
         cached = shared;
     }
     return false;
@@ -326,12 +495,15 @@ batch_result engine::decide_batch(const std::string & shared_text, const std::ve
         throw std::invalid_argument("a decision needs at least one context");
     }
     const tokens_t shared = tokenize(shared_text, true);
-    std::vector<tokens_t> prefixes;
-    for (const auto & text : contexts) {
-        prefixes.push_back(tokenize(text, shared.empty()));
-        if (prefixes.back().empty()) {
+    std::vector<multimodal_tokens> prefixes;
+    for (size_t i = 0; i < contexts.size(); ++i) {
+        const mtmd::bitmaps * ctx_bitmaps = (i < opt.context_bitmaps.size()) ? &opt.context_bitmaps[i] : nullptr;
+        auto mtoks = tokenize_mm(contexts[i], shared.empty(), ctx_bitmaps);
+        DECISION_DEBUG("decide_batch: tokenize_mm returned toks=%zu chunks=%zu", mtoks.toks.size(), mtoks.chunks.size());
+        if (mtoks.toks.empty()) {
             throw std::invalid_argument("the decision context must not be empty");
         }
+        prefixes.push_back(std::move(mtoks));
     }
 
     std::vector<decision_field> fields;
@@ -406,6 +578,16 @@ batch_result engine::decide_batch(const std::string & shared_text, const std::ve
         const size_t n_group = std::min(per_group, contexts.size() - g0);
 
         const auto tp = std::chrono::steady_clock::now();
+        // We need to keep segment token vectors alive while parts reference them
+        // Reserve enough capacity to prevent reallocation (which would invalidate pointers)
+        // With N image chunks interleaved with text, there can be up to N+1 text segments.
+        // Use a generous reserve based on the max chunks in any prefix.
+        std::vector<tokens_t> seg_storage;
+        size_t max_chunks = 0;
+        for (const auto & mtoks : prefixes) {
+            max_chunks = std::max(max_chunks, mtoks.chunks.size());
+        }
+        seg_storage.reserve((max_chunks + 1) * n_group);  // at most (chunks+1) text segments per context
         std::vector<prompt_part> parts;
         for (size_t i = 0; i < n_group; ++i) {
             const llama_seq_id trunk = seq_pool + (llama_seq_id) i;
@@ -413,9 +595,44 @@ batch_result engine::decide_batch(const std::string & shared_text, const std::ve
             if (!shared.empty()) {
                 llama_memory_seq_cp(mem, seq_snap, trunk, -1, -1);
             }
-            parts.push_back({ &prefixes[g0 + i], (llama_pos) shared.size(), trunk });
+            // Build prompt_parts from multimodal_tokens: text tokens become TOKS parts,
+            // image chunks become CHUNK parts with proper position tracking
+            const auto & mtoks = prefixes[g0 + i];
+            llama_pos pos = (llama_pos) shared.size();
+            size_t chunk_idx = 0;
+            size_t seg_start = 0;
+            for (size_t t_idx = 0; t_idx < mtoks.toks.size(); ++t_idx) {
+                if (mtoks.toks[t_idx] == LLAMA_TOKEN_NULL) {
+                    // Flush preceding text tokens as a TOKS part
+                    if (t_idx > seg_start) {
+                        seg_storage.push_back(tokens_t(mtoks.toks.begin() + seg_start, mtoks.toks.begin() + t_idx));
+                        parts.push_back({ prompt_part::TOKS, &seg_storage.back(), nullptr, pos, trunk });
+                        pos += (llama_pos) seg_storage.back().size();
+                        seg_start = t_idx + 1;
+                    }
+                    // Add image chunk if available
+                    if (chunk_idx < mtoks.chunks.size()) {
+                        const size_t n_img_tokens = mtmd_input_chunk_get_n_tokens(mtoks.chunks[chunk_idx]);
+                        parts.push_back({ prompt_part::CHUNK, nullptr, mtoks.chunks[chunk_idx], pos, trunk });
+                        pos += (llama_pos) n_img_tokens;
+                        chunk_idx++;
+                        seg_start = t_idx + 1;
+                    } else {
+                        // No image chunk is left for this NULL token, so skip it
+                        // (it's a placeholder that has no corresponding chunk)
+                        seg_start = t_idx + 1;
+                    }
+                }
+            }
+            // Flush remaining text tokens
+            if (seg_start < mtoks.toks.size()) {
+                seg_storage.push_back(tokens_t(mtoks.toks.begin() + seg_start, mtoks.toks.end()));
+                parts.push_back({ prompt_part::TOKS, &seg_storage.back(), nullptr, pos, trunk });
+            }
         }
+        DECISION_DEBUG("decide_batch: calling decode_parts with %zu parts", parts.size());
         decode_parts(parts);
+        DECISION_DEBUG("decide_batch: decode_parts returned");
         llama_synchronize(ctx); // llama_decode is asynchronous: wait for the prefill so its time isn't billed to scoring
         out.prefill_ms += ms_since(tp);
 
@@ -429,7 +646,7 @@ batch_result engine::decide_batch(const std::string & shared_text, const std::ve
             std::vector<std::pair<size_t, size_t>> owner; // (context in group, field)
             for (size_t i = 0; i < n_group; ++i) {
                 const llama_seq_id trunk = seq_pool + (llama_seq_id) i;
-                const llama_pos    pos0  = (llama_pos) (shared.size() + prefixes[g0 + i].size());
+                const llama_pos    pos0  = (llama_pos) (shared.size() + prefixes[g0 + i].toks.size());
                 for (size_t f = 0; f < state[i].size(); ++f) {
                     auto & fd = state[i][f];
                     if (fd.use_tree) {
@@ -487,7 +704,7 @@ batch_result engine::decide_batch(const std::string & shared_text, const std::ve
         for (size_t i = 0; i < n_group; ++i) {
             llama_memory_seq_rm(mem, seq_pool + (llama_seq_id) i, -1, -1);
             result & r = out.items[g0 + i];
-            r.context_tokens = prefixes[g0 + i].size();
+            r.context_tokens = prefixes[g0 + i].toks.size();
             r.rows           = total;
             for (auto & fd : state[i]) {
                 if (fd.use_tree && fd.probs.empty()) {
