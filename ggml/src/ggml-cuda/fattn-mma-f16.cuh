@@ -512,7 +512,7 @@ static __constant__ float TURBO_CENTROIDS_4BIT_FATTN[16] = {
 // low nibble = elem 2c, high nibble = elem 2c+1. Hence one byte qs[col_offset+c] yields
 // the half2 for tile column c. sizeof(block_turbo4_0)-driven pointer math; never assume
 // 66/68 or a qs offset constant.
-template<int stride_tile, int nbatch_fa, int nthreads, bool oob_check>
+template<int stride_tile, bool swz, int nbatch_fa, int nthreads, bool oob_check>
 static __device__ __forceinline__ void flash_attn_ext_turbo4_load_tile(
         const char * const __restrict__ KV_raw, half2 * const __restrict__ tile_KV,
         const int D2, const int stride_bytes, const int col_offset, const int i_sup) {
@@ -538,7 +538,12 @@ static __device__ __forceinline__ void flash_attn_ext_turbo4_load_tile(
             const uint8_t byte = blk->qs[in_blk];
             const half lo = __float2half(TURBO_CENTROIDS_4BIT_FATTN[byte & 0xF] * norm);
             const half hi = __float2half(TURBO_CENTROIDS_4BIT_FATTN[byte >>  4] * norm);
-            tile_KV[row*stride_tile + c] = __halves2half2(lo, hi);
+            if constexpr (swz) {
+                const int byte_off = ggml_cuda_fattn_smem_swizzle::bytes_rc<stride_tile>(row, c);
+                *reinterpret_cast<half2 *>(reinterpret_cast<char *>(tile_KV) + byte_off) = __halves2half2(lo, hi);
+            } else {
+                tile_KV[row*stride_tile + c] = __halves2half2(lo, hi);
+            }
         }
     }
 }
@@ -550,7 +555,7 @@ static __constant__ float TURBO_CENTROIDS_3BIT_FATTN[8] = {
     -0.190207f, -0.118786f, -0.066822f, -0.021663f,
      0.021663f,  0.066822f,  0.118786f,  0.190207f
 };
-template<int stride_tile, int nbatch_fa, int nthreads, bool oob_check>
+template<int stride_tile, bool swz, int nbatch_fa, int nthreads, bool oob_check>
 static __device__ __forceinline__ void flash_attn_ext_turbo3_load_tile(
         const char * const __restrict__ KV_raw, half2 * const __restrict__ tile_KV,
         const int D2, const int stride_bytes, const int col_offset, const int i_sup) {
@@ -577,7 +582,12 @@ static __device__ __forceinline__ void flash_attn_ext_turbo3_load_tile(
             const uint8_t idx1 = ((qs_byte >> (shift+2)) & 0x3) | (((sgn_byte >> (j0 % 8 + 1)) & 0x1) << 2);
             const half lo = __float2half(TURBO_CENTROIDS_3BIT_FATTN[idx0] * norm);
             const half hi = __float2half(TURBO_CENTROIDS_3BIT_FATTN[idx1] * norm);
-            tile_KV[row*stride_tile + c] = __halves2half2(lo, hi);
+            if constexpr (swz) {
+                const int byte_off = ggml_cuda_fattn_smem_swizzle::bytes_rc<stride_tile>(row, c);
+                *reinterpret_cast<half2 *>(reinterpret_cast<char *>(tile_KV) + byte_off) = __halves2half2(lo, hi);
+            } else {
+                tile_KV[row*stride_tile + c] = __halves2half2(lo, hi);
+            }
         }
     }
 }
@@ -586,7 +596,7 @@ static __device__ __forceinline__ void flash_attn_ext_turbo3_load_tile(
 static __constant__ float TURBO_CENTROIDS_2BIT_FATTN[4] = {
     -0.133462f, -0.039994f, 0.039994f, 0.133462f
 };
-template<int stride_tile, int nbatch_fa, int nthreads, bool oob_check>
+template<int stride_tile, bool swz, int nbatch_fa, int nthreads, bool oob_check>
 static __device__ __forceinline__ void flash_attn_ext_turbo2_load_tile(
         const char * const __restrict__ KV_raw, half2 * const __restrict__ tile_KV,
         const int D2, const int stride_bytes, const int col_offset, const int i_sup) {
@@ -612,7 +622,12 @@ static __device__ __forceinline__ void flash_attn_ext_turbo2_load_tile(
             const uint8_t idx1 = (qs_byte >> (shift+2)) & 0x3;
             const half lo = __float2half(TURBO_CENTROIDS_2BIT_FATTN[idx0] * norm);
             const half hi = __float2half(TURBO_CENTROIDS_2BIT_FATTN[idx1] * norm);
-            tile_KV[row*stride_tile + c] = __halves2half2(lo, hi);
+            if constexpr (swz) {
+                const int byte_off = ggml_cuda_fattn_smem_swizzle::bytes_rc<stride_tile>(row, c);
+                *reinterpret_cast<half2 *>(reinterpret_cast<char *>(tile_KV) + byte_off) = __halves2half2(lo, hi);
+            } else {
+                tile_KV[row*stride_tile + c] = __halves2half2(lo, hi);
+            }
         }
     }
 }
@@ -798,13 +813,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             constexpr int nthreads_turbo = nwarps * ggml_cuda_get_physical_warp_size();
             const char * K_raw = (const char *) K_h2 + int64_t(k_VKQ_0) * stride_K;
             if constexpr (type_K == GGML_TYPE_TURBO4_0) {
-                flash_attn_ext_turbo4_load_tile<stride_tile_K, nbatch_fa, nthreads_turbo, oob_check>
+                flash_attn_ext_turbo4_load_tile<stride_tile_K, swz_K, nbatch_fa, nthreads_turbo, oob_check>
                     (K_raw, tile_K, k0_diff, stride_K, k0_start, k_VKQ_sup);
             } else if constexpr (type_K == GGML_TYPE_TURBO3_0) {
-                flash_attn_ext_turbo3_load_tile<stride_tile_K, nbatch_fa, nthreads_turbo, oob_check>
+                flash_attn_ext_turbo3_load_tile<stride_tile_K, swz_K, nbatch_fa, nthreads_turbo, oob_check>
                     (K_raw, tile_K, k0_diff, stride_K, k0_start, k_VKQ_sup);
             } else {
-                flash_attn_ext_turbo2_load_tile<stride_tile_K, nbatch_fa, nthreads_turbo, oob_check>
+                flash_attn_ext_turbo2_load_tile<stride_tile_K, swz_K, nbatch_fa, nthreads_turbo, oob_check>
                     (K_raw, tile_K, k0_diff, stride_K, k0_start, k_VKQ_sup);
             }
             __syncthreads();
@@ -1171,13 +1186,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             constexpr int nthreads_turbo = nwarps * ggml_cuda_get_physical_warp_size();
             const char * V_raw = (const char *) V_h2 + int64_t(k_VKQ_0) * stride_V;
             if constexpr (type_V == GGML_TYPE_TURBO4_0) {
-                flash_attn_ext_turbo4_load_tile<stride_tile_V, nbatch_fa, nthreads_turbo, oob_check>
+                flash_attn_ext_turbo4_load_tile<stride_tile_V, swz_V, nbatch_fa, nthreads_turbo, oob_check>
                     (V_raw, tile_V, i0_diff/2, stride_V, i0_start/2, k_VKQ_sup);
             } else if constexpr (type_V == GGML_TYPE_TURBO3_0) {
-                flash_attn_ext_turbo3_load_tile<stride_tile_V, nbatch_fa, nthreads_turbo, oob_check>
+                flash_attn_ext_turbo3_load_tile<stride_tile_V, swz_V, nbatch_fa, nthreads_turbo, oob_check>
                     (V_raw, tile_V, i0_diff/2, stride_V, i0_start/2, k_VKQ_sup);
             } else {
-                flash_attn_ext_turbo2_load_tile<stride_tile_V, nbatch_fa, nthreads_turbo, oob_check>
+                flash_attn_ext_turbo2_load_tile<stride_tile_V, swz_V, nbatch_fa, nthreads_turbo, oob_check>
                     (V_raw, tile_V, i0_diff/2, stride_V, i0_start/2, k_VKQ_sup);
             }
             __syncthreads();

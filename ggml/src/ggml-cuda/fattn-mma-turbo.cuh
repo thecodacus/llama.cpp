@@ -91,7 +91,7 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
     // the kernel receives raw quantized KV + the true byte pitch. stream_k = true.
     launch_fattn<DV, ncols1, ncols2>
         (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa,
-         /*need_f16_K=*/false, /*need_f16_V=*/false, /*stream_k=*/true, warp_size_host);
+         /*need_f16_K=*/false, /*need_f16_V=*/false, /*stream_k=*/true, /*use_sparse=*/false, warp_size_host);
 }
 
 
