@@ -11,7 +11,9 @@
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
 
+#include <atomic>
 #include <map>
+#include <thread>
 #include <vector>
 
 struct llama_model;
@@ -350,6 +352,16 @@ private:
 
     // this context builds and lends the MoE expert cache packs of the model
     bool moe_cache_on = false;
+
+    // dynamic re-election of the packs (fork, GGML_MOE_CACHE_DYN): uploads run on moe_dyn_worker while decoding goes on
+    std::thread moe_dyn_worker;
+    std::atomic<bool> moe_dyn_done{false};
+    std::vector<int> moe_dyn_layers;               // layers with uploads in flight
+    std::vector<std::vector<float>> moe_dyn_score; // per layer: decayed router demand
+    uint32_t moe_dyn_since = 0;
+    int64_t moe_dyn_n_reelect = 0, moe_dyn_n_upload = 0, moe_dyn_n_skip = 0;
+    void moe_dyn_after(uint32_t n_tokens); // end of a decode
+    void moe_dyn_finish();                 // wait for the uploads and route to them
 
     // the configured ubatch: while the cache is lent, n_ubatch is the largest size up to this that fits in its memory
     uint32_t n_ubatch_max = 0;

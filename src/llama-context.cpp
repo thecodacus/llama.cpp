@@ -506,6 +506,11 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+    moe_dyn_finish();
+    if (moe_dyn_n_reelect > 0) {
+        LLAMA_LOG_INFO("%s: expert cache re-elections: %" PRId64 ", uploads: %" PRId64 ", skipped (uploads in flight): %" PRId64 "\n",
+            __func__, moe_dyn_n_reelect, moe_dyn_n_upload, moe_dyn_n_skip);
+    }
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
@@ -774,6 +779,7 @@ void llama_context::moe_cache_switch(bool off) {
     const int64_t t_start_us = ggml_time_us();
 
     synchronize();
+    moe_dyn_finish(); // the packs are freed or rebuilt: no upload may be in flight
 
     // free the compute buffers first: their memory goes to the packs, or the packs' memory to the new buffers
     sched.reset();
@@ -2249,7 +2255,92 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
 
+    moe_dyn_after(n_tokens_all);
+
     return 0;
+}
+
+void llama_context::moe_dyn_finish() {
+    if (!moe_dyn_worker.joinable()) {
+        return;
+    }
+    moe_dyn_worker.join();
+    auto * m = const_cast<llama_model *>(&model);
+    for (int il : moe_dyn_layers) {
+        llama_model_moe_cache_end_hot(m, il);
+    }
+    moe_dyn_layers.clear();
+}
+
+void llama_context::moe_dyn_after(uint32_t n_tokens) {
+    static const int   win   = getenv("GGML_MOE_CACHE_DYN")   ? atoi(getenv("GGML_MOE_CACHE_DYN"))   : 0;
+    static const float decay = getenv("GGML_MOE_CACHE_DECAY") ? atof(getenv("GGML_MOE_CACHE_DECAY")) : 0.9f;
+    if (win <= 0 || !moe_cache_on || cparams.moe_packs_off || !model.moe_cache_resident()) {
+        return;
+    }
+    // the maps change between graphs only: wait for this decode's graph before touching them
+    if (moe_dyn_worker.joinable() && moe_dyn_done) {
+        synchronize();
+        moe_dyn_finish();
+    }
+    moe_dyn_since += n_tokens;
+    if (moe_dyn_since < (uint32_t) win) {
+        return;
+    }
+    moe_dyn_since = 0;
+    if (moe_dyn_worker.joinable()) {
+        moe_dyn_n_skip++;
+        return;
+    }
+    synchronize();
+
+    auto * m = const_cast<llama_model *>(&model);
+    const int n_layer = (int) model.layers.size();
+    moe_dyn_score.resize(n_layer);
+    std::vector<float> demand;
+    std::vector<int32_t> order;
+    for (int il = 0; il < n_layer; il++) {
+        const int S = llama_model_moe_cache_slots(m, il);
+        if (S <= 0) {
+            continue;
+        }
+        const int n_expert = (int) model.layers[il].ffn_gate_exps->ne[2];
+        demand.resize(n_expert);
+        if (llama_model_moe_cache_take_demand(m, il, demand.data(), n_expert) != n_expert) {
+            continue;
+        }
+        auto & sc = moe_dyn_score[il];
+        sc.resize(n_expert, 0.0f);
+        for (int e = 0; e < n_expert; e++) {
+            sc[e] = sc[e]*decay + demand[e];
+        }
+        order.resize(n_expert);
+        for (int e = 0; e < n_expert; e++) {
+            order[e] = e;
+        }
+        const int k = std::min(S, n_expert);
+        std::partial_sort(order.begin(), order.begin() + k, order.end(), [&sc](int a, int b) { return sc[a] > sc[b]; });
+        const int32_t up = llama_model_moe_cache_begin_hot(m, il, order.data(), k);
+        if (up > 0) {
+            moe_dyn_n_upload += up;
+            moe_dyn_layers.push_back(il);
+        }
+    }
+    moe_dyn_n_reelect++;
+    if (moe_dyn_n_reelect <= 3 || moe_dyn_n_reelect % 200 == 0) {
+        LLAMA_LOG_INFO("%s: expert cache re-election %" PRId64 ": %zu layers re-packed, %" PRId64 " uploads so far, %" PRId64 " skipped\n",
+            __func__, moe_dyn_n_reelect, moe_dyn_layers.size(), moe_dyn_n_upload, moe_dyn_n_skip);
+    }
+    if (moe_dyn_layers.empty()) {
+        return;
+    }
+    moe_dyn_done = false;
+    moe_dyn_worker = std::thread([this, m, layers = moe_dyn_layers]() {
+        for (int il : layers) {
+            llama_model_moe_cache_upload(m, il);
+        }
+        moe_dyn_done = true;
+    });
 }
 
 //
