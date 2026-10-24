@@ -2110,6 +2110,9 @@ void llama_model::moe_cache_release() const {
             l.ffn_gate_exps_hot = l.ffn_up_exps_hot = l.ffn_down_exps_hot = nullptr;
             l.moe_map_hot = l.moe_map_cold = nullptr;
             l.moe_hot_ids = nullptr;
+            l.moe_bias_hot = nullptr;
+            l.moe_demand = nullptr;
+            l.moe_pending.clear();
         }
     }
     pimpl->moe_packs.clear();
@@ -2119,7 +2122,7 @@ bool llama_model::moe_pack_alloc(size_t gi, int n_slots) const {
     const auto & group = pimpl->moe_groups[gi];
 
     ggml_init_params ctx_params = {
-        /*.mem_size   =*/ (5*group.layers.size() + 1)*ggml_tensor_overhead(),
+        /*.mem_size   =*/ (7*group.layers.size() + 1)*ggml_tensor_overhead(),
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
@@ -2139,6 +2142,10 @@ bool llama_model::moe_pack_alloc(size_t gi, int n_slots) const {
         l.ffn_down_exps_hot = ggml_new_tensor_3d(ctx, d->type, d->ne[0], d->ne[1], S);
         l.moe_map_hot       = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_expert);
         l.moe_map_cold      = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_expert);
+        l.moe_bias_hot      = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_expert);
+        ggml_format_name(l.moe_bias_hot, "blk.%d.moe_bias_hot", il);
+        l.moe_demand        = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_expert);
+        ggml_format_name(l.moe_demand, "blk.%d.moe_demand", il);
         l.moe_hot_ids       = group.ranked[k].data(); // the upload fills slot s with ranked[s]
         ggml_format_name(l.ffn_gate_exps_hot, "blk.%d.ffn_gate_exps_hot", il);
         ggml_format_name(l.ffn_up_exps_hot,   "blk.%d.ffn_up_exps_hot",   il);
@@ -2154,6 +2161,9 @@ bool llama_model::moe_pack_alloc(size_t gi, int n_slots) const {
             l.ffn_gate_exps_hot = l.ffn_up_exps_hot = l.ffn_down_exps_hot = nullptr;
             l.moe_map_hot = l.moe_map_cold = nullptr;
             l.moe_hot_ids = nullptr;
+            l.moe_bias_hot = nullptr;
+            l.moe_demand = nullptr;
+            l.moe_pending.clear();
         }
         ggml_free(ctx);
         return false;
@@ -2212,6 +2222,19 @@ size_t llama_model::moe_pack_upload(size_t i) const {
         }
         ggml_backend_tensor_set(l.moe_map_hot,  map_hot.data(),  0, n_expert*sizeof(int32_t));
         ggml_backend_tensor_set(l.moe_map_cold, map_cold.data(), 0, n_expert*sizeof(int32_t));
+        {
+            std::vector<float> bias(n_expert);
+            for (int64_t e = 0; e < n_expert; e++) {
+                bias[e] = map_hot[e] >= 0 ? 0.0f : -1e30f;
+            }
+            ggml_backend_tensor_set(l.moe_bias_hot, bias.data(), 0, n_expert*sizeof(float));
+            auto & lm = const_cast<llama_layer &>(l);
+            lm.moe_slot_expert.assign(group.ranked[k].begin(), group.ranked[k].begin() + S);
+            lm.moe_hot_ids = lm.moe_slot_expert.data();
+            lm.moe_pending.clear();
+            std::vector<float> zeros(n_expert, 0.0f);
+            ggml_backend_tensor_set(l.moe_demand, zeros.data(), 0, n_expert*sizeof(float));
+        }
     }
 
     return total_bytes;
@@ -3112,6 +3135,193 @@ int32_t llama_model_n_embd_out(const llama_model * model) {
 
 int32_t llama_model_n_layer(const llama_model * model) {
     return model->hparams.n_layer();
+}
+
+int32_t llama_model_moe_cache_slots(const llama_model * model, int32_t il) {
+    if (il < 0 || il >= (int32_t) model->layers.size()) {
+        return 0;
+    }
+    const auto & l = model->layers[il];
+    return l.moe_map_hot && l.ffn_gate_exps_hot && l.moe_bias_hot ? (int32_t) l.ffn_gate_exps_hot->ne[2] : 0;
+}
+
+int32_t llama_model_moe_cache_set_hot(llama_model * model, int32_t il, const int32_t * experts, int32_t n_experts) {
+    if (llama_model_moe_cache_slots(model, il) <= 0) {
+        return -1;
+    }
+    auto & l = model->layers[il];
+    const int64_t n_expert = l.ffn_gate_exps->ne[2];
+    const int64_t S = l.ffn_gate_exps_hot->ne[2];
+
+    std::vector<char> want(n_expert, 0);
+    int64_t n_want = 0;
+    for (int32_t i = 0; i < n_experts && n_want < S; i++) {
+        const int32_t e = experts[i];
+        if (e >= 0 && e < n_expert && !want[e]) {
+            want[e] = 1;
+            n_want++;
+        }
+    }
+    // keep resident experts that are still wanted; the others' slots take the new experts
+    std::vector<char> resident(n_expert, 0);
+    std::vector<int64_t> free_slots;
+    for (int64_t s = 0; s < S; s++) {
+        const int32_t e = l.moe_slot_expert[s];
+        if (want[e]) {
+            resident[e] = 1;
+        } else {
+            free_slots.push_back(s);
+        }
+    }
+    const ggml_tensor * srcs[3] = { l.ffn_gate_exps, l.ffn_up_exps, l.ffn_down_exps };
+    ggml_tensor * dsts[3] = { l.ffn_gate_exps_hot, l.ffn_up_exps_hot, l.ffn_down_exps_hot };
+    std::vector<uint8_t> slab;
+    int32_t uploads = 0;
+    size_t fi = 0;
+    for (int64_t e = 0; e < n_expert && fi < free_slots.size(); e++) {
+        if (!want[e] || resident[e]) {
+            continue;
+        }
+        const int64_t s = free_slots[fi++];
+        for (int t = 0; t < 3; t++) {
+            const size_t nb = srcs[t]->nb[2];
+            if (ggml_backend_buffer_is_host(srcs[t]->buffer)) {
+                ggml_backend_tensor_set(dsts[t], (const char *) srcs[t]->data + e*nb, s*nb, nb);
+            } else {
+                slab.resize(nb);
+                ggml_backend_tensor_get(srcs[t], slab.data(), e*nb, nb);
+                ggml_backend_tensor_set(dsts[t], slab.data(), s*nb, nb);
+            }
+        }
+        l.moe_slot_expert[s] = (int32_t) e;
+        uploads++;
+    }
+    std::vector<int32_t> map_hot(n_expert, -1), map_cold(n_expert);
+    std::vector<float> bias(n_expert, -1e30f);
+    for (int64_t e = 0; e < n_expert; e++) {
+        map_cold[e] = (int32_t) e;
+    }
+    for (int64_t s = 0; s < S; s++) {
+        const int32_t e = l.moe_slot_expert[s];
+        map_hot[e] = (int32_t) s;
+        map_cold[e] = -1;
+        bias[e] = 0.0f;
+    }
+    ggml_backend_tensor_set(l.moe_map_hot,  map_hot.data(),  0, n_expert*sizeof(int32_t));
+    ggml_backend_tensor_set(l.moe_map_cold, map_cold.data(), 0, n_expert*sizeof(int32_t));
+    ggml_backend_tensor_set(l.moe_bias_hot, bias.data(),     0, n_expert*sizeof(float));
+    return uploads;
+}
+
+int32_t llama_model_moe_cache_take_demand(llama_model * model, int32_t il, float * out, int32_t n) {
+    if (llama_model_moe_cache_slots(model, il) <= 0) {
+        return -1;
+    }
+    auto & l = model->layers[il];
+    const int64_t n_expert = l.ffn_gate_exps->ne[2];
+    if (n < n_expert) {
+        return -1;
+    }
+    ggml_backend_tensor_get(l.moe_demand, out, 0, n_expert*sizeof(float));
+    std::vector<float> zeros(n_expert, 0.0f);
+    ggml_backend_tensor_set(l.moe_demand, zeros.data(), 0, n_expert*sizeof(float));
+    return (int32_t) n_expert;
+}
+
+// routing maps + hot bias from the slot list; slots with live[s] == 0 hold an expert that is not uploaded yet
+static void moe_cache_write_maps(llama_layer & l, const std::vector<char> & live) {
+    const int64_t n_expert = l.ffn_gate_exps->ne[2];
+    const int64_t S = l.ffn_gate_exps_hot->ne[2];
+    std::vector<int32_t> map_hot(n_expert, -1), map_cold(n_expert);
+    std::vector<float> bias(n_expert, -1e30f);
+    for (int64_t e = 0; e < n_expert; e++) {
+        map_cold[e] = (int32_t) e;
+    }
+    for (int64_t s = 0; s < S; s++) {
+        if (live[s]) {
+            const int32_t e = l.moe_slot_expert[s];
+            map_hot[e] = (int32_t) s;
+            map_cold[e] = -1;
+            bias[e] = 0.0f;
+        }
+    }
+    ggml_backend_tensor_set(l.moe_map_hot,  map_hot.data(),  0, n_expert*sizeof(int32_t));
+    ggml_backend_tensor_set(l.moe_map_cold, map_cold.data(), 0, n_expert*sizeof(int32_t));
+    ggml_backend_tensor_set(l.moe_bias_hot, bias.data(),     0, n_expert*sizeof(float));
+}
+
+int32_t llama_model_moe_cache_begin_hot(llama_model * model, int32_t il, const int32_t * experts, int32_t n_experts) {
+    if (llama_model_moe_cache_slots(model, il) <= 0) {
+        return -1;
+    }
+    auto & l = model->layers[il];
+    const int64_t n_expert = l.ffn_gate_exps->ne[2];
+    const int64_t S = l.ffn_gate_exps_hot->ne[2];
+
+    std::vector<char> want(n_expert, 0);
+    int64_t n_want = 0;
+    for (int32_t i = 0; i < n_experts && n_want < S; i++) {
+        const int32_t e = experts[i];
+        if (e >= 0 && e < n_expert && !want[e]) {
+            want[e] = 1;
+            n_want++;
+        }
+    }
+    std::vector<char> resident(n_expert, 0);
+    std::vector<int64_t> free_slots;
+    for (int64_t s = 0; s < S; s++) {
+        const int32_t e = l.moe_slot_expert[s];
+        if (want[e]) {
+            resident[e] = 1;
+        } else {
+            free_slots.push_back(s);
+        }
+    }
+    // a slot taken by a new expert leaves the routing now and is filled while decoding goes on
+    std::vector<char> live(S, 1);
+    l.moe_pending.clear();
+    size_t fi = 0;
+    for (int64_t e = 0; e < n_expert && fi < free_slots.size(); e++) {
+        if (!want[e] || resident[e]) {
+            continue;
+        }
+        const int64_t s = free_slots[fi++];
+        l.moe_slot_expert[s] = (int32_t) e;
+        l.moe_pending.push_back({ s, (int32_t) e });
+        live[s] = 0;
+    }
+    if (!l.moe_pending.empty()) {
+        moe_cache_write_maps(l, live);
+    }
+    return (int32_t) l.moe_pending.size();
+}
+
+void llama_model_moe_cache_upload(llama_model * model, int32_t il) {
+    auto & l = model->layers[il];
+    const ggml_tensor * srcs[3] = { l.ffn_gate_exps, l.ffn_up_exps, l.ffn_down_exps };
+    ggml_tensor * dsts[3] = { l.ffn_gate_exps_hot, l.ffn_up_exps_hot, l.ffn_down_exps_hot };
+    std::vector<uint8_t> slab;
+    for (const auto & [s, e] : l.moe_pending) {
+        for (int t = 0; t < 3; t++) {
+            const size_t nb = srcs[t]->nb[2];
+            if (ggml_backend_buffer_is_host(srcs[t]->buffer)) {
+                ggml_backend_tensor_set(dsts[t], (const char *) srcs[t]->data + e*nb, s*nb, nb);
+            } else {
+                slab.resize(nb);
+                ggml_backend_tensor_get(srcs[t], slab.data(), e*nb, nb);
+                ggml_backend_tensor_set(dsts[t], slab.data(), s*nb, nb);
+            }
+        }
+    }
+}
+
+void llama_model_moe_cache_end_hot(llama_model * model, int32_t il) {
+    auto & l = model->layers[il];
+    if (l.moe_pending.empty() || !l.moe_bias_hot) {
+        return;
+    }
+    moe_cache_write_maps(l, std::vector<char>(l.ffn_gate_exps_hot->ne[2], 1));
+    l.moe_pending.clear();
 }
 
 int32_t llama_model_n_layer_nextn(const llama_model * model) {
