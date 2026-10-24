@@ -730,6 +730,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         if (ggml_cuda_flash_attn_ext_listed_supported(device, dst)) {
             return BEST_FATTN_KERNEL_MMA_F16; // ggml_cuda_flash_attn_ext takes it to the listed-cells kernel
         }
+        if (ggml_get_op_params_i32(dst, 5) != 0) {
+            return BEST_FATTN_KERNEL_NONE; // the sparse MMA kernel reads the mask at the cells, not per list entry
+        }
         const bool sparse_shape = gqa_opt_applies && max_bias == 0.0f && (
             (K->ne[0] == 256 && V->ne[0] == 256 && gqa_ratio >   4) ||
             (K->ne[0] == 512 && V->ne[0] == 512 && gqa_ratio %  8 == 0) ||

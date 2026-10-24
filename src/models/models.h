@@ -2322,6 +2322,7 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * k_cur,
                     ggml_tensor * v_cur,
                     ggml_tensor * top_k,
+                    ggml_tensor * top_k_mask, // the mask per list entry, or nullptr to read the KQ mask at the cells
                           float   kq_scale,
                             int   il);
 
@@ -2329,14 +2330,16 @@ struct llama_model_qwen4exp : public llama_model_base {
         // so the layers sharing a ratio share one input set
         std::map<uint32_t, llm_graph_input_qsa *> qsa_inps;
 
-        // QSA: token indices this layer's queries may attend to, or nullptr for dense
+        // QSA: token indices this layer's queries may attend to, or nullptr for dense. top_k_mask gets the attention
+        // mask of the listed cells per entry when the visibility comes from position tables, else nullptr
         ggml_tensor * build_qsa_top_k(
   const llama_memory_hybrid_idx_context * mctx_hyb,
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
                     ggml_tensor * kq_mask,
                             int * sections,
-                            int   il);
+                            int   il,
+                    ggml_tensor ** top_k_mask);
 
         ggml_tensor * build_layer_attn_linear(
              llm_graph_input_rs * inp,

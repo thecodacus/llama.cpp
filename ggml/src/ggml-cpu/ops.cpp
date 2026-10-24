@@ -8702,10 +8702,14 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     GGML_ASSERT(nb1 <= nb2);
     GGML_ASSERT(nb2 <= nb3);
 
-    // with a cell list, a cell outside the query row's list is skipped like a hidden one
+    // with a cell list, a cell outside the query row's list is skipped like a hidden one; a listed cell takes its mask
+    // value from the mask row (at the cell, or at the list entry with a mask per entry)
+    const bool mask_per_entry = cells && ggml_get_op_params_i32(dst, 5) != 0;
     thread_local std::vector<uint8_t> listed;
+    thread_local std::vector<float>   listed_mv;
     if (cells) {
         listed.assign(nek1, 0);
+        listed_mv.assign(nek1, -INFINITY);
     }
 
     // broadcast factors
@@ -8773,8 +8777,10 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         const int32_t * row_cells = cells ? (const int32_t *) ((const char *) cells->data + iq1*cells->nb[1] + (iq3%cells->ne[3])*cells->nb[3]) : NULL;
         if (row_cells) {
             for (int64_t j = 0; j < cells->ne[0]; ++j) {
-                if (row_cells[j] >= 0 && row_cells[j] < nek1) {
-                    listed[row_cells[j]] = 1;
+                const int32_t c = row_cells[j];
+                if (c >= 0 && c < nek1) {
+                    listed[c]    = 1;
+                    listed_mv[c] = mp ? GGML_CPU_FP16_TO_FP32(mp[mask_per_entry ? j : c]) : 0.0f;
                 }
             }
         }
@@ -8798,7 +8804,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             if (row_cells && !listed[ic]) {
                 continue;
             }
-            const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
+            const float mv = row_cells ? slope*listed_mv[ic] : (mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f);
             if (mv == -INFINITY) {
                 continue;
             }

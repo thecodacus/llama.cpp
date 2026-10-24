@@ -1176,8 +1176,9 @@ struct llm_graph_context {
                 int64_t   n_kv_max,
                   float   kq_scale,
                     int   il,
-            ggml_tensor * kv_cells = nullptr) const; // sparse attention: I32 [n_cells, n_tokens/n_stream, 1, n_stream],
+            ggml_tensor * kv_cells = nullptr,        // sparse attention: I32 [n_cells, n_tokens/n_stream, 1, n_stream],
                                                      // the cells each query attends (kq_mask still hides cells)
+                     bool kv_cells_mask = false) const; // kq_mask is [n_cells, ...] and holds each list entry's value
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

@@ -2100,7 +2100,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                         e1++;
                                     }
                                     const size_t off = e0*nb;
-                                    const size_t end = std::min(nbytes, e1*nb + (padded - nbytes));
+                                    const size_t end = std::min<size_t>(nbytes, e1*nb + (padded - nbytes));
                                     ggml_backend_tensor_set_async(pf->backend, input_cpy, (const char *) input->data + off, off, end - off);
                                     e0 = e1;
                                 }

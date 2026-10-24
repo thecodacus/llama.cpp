@@ -280,9 +280,11 @@ void llama_memory_hybrid_idx::set_input_qsa(
         ggml_tensor * bias,
         const llama_ubatch * ubatch,
         uint32_t ratio,
-        bool blk_bias) const {
+        bool blk_bias,
+        const llama_qsa_vis * vis) const {
     GGML_ASSERT(ratio > 0);
     GGML_ASSERT(get_mem_idx() != nullptr);
+    GGML_ASSERT(!vis || (blk_bias && ubatch->token != nullptr && "the tables replace the block bias and, for text, the mask"));
 
     GGML_ASSERT(ggml_backend_buffer_is_host(cell_blk->buffer));
 
@@ -298,7 +300,7 @@ void llama_memory_hybrid_idx::set_input_qsa(
     int32_t * dst_cell_blk  = (int32_t *) cell_blk->data;
     int32_t * dst_blk_cells = (int32_t *) blk_cells->data;
     int32_t * dst_blk_pos   = (int32_t *) blk_pos->data;
-    float   * dst_bias      = (float   *) bias->data;
+    float   * dst_bias      = bias ? (float *) bias->data : nullptr;
 
     // a block is keyed on (sequence set, index bucket): a unified cache counts every sequence
     // from zero, so the bucket alone would pool two sequences into one block
@@ -514,6 +516,49 @@ void llama_memory_hybrid_idx::set_input_qsa(
             cur_cell_blk[j] = blk_of[j] < 0 ? dead_bid : blk_of[j];
         }
 
+        // the visibility tables: one column per sequence of the stream's tokens, in order of appearance
+        std::vector<llama_seq_id> vis_cols;
+        if (vis) {
+            for (int64_t ii = 0; ii < n_tps; ++ii) {
+                const llama_seq_id seq_id = ubatch->seq_id[s*n_tps + ii][0];
+                if (std::find(vis_cols.begin(), vis_cols.end(), seq_id) == vis_cols.end()) {
+                    vis_cols.push_back(seq_id);
+                }
+            }
+
+            const int64_t n_col = vis->cell_idx->ne[1];
+            GGML_ASSERT((int64_t) vis_cols.size() <= n_col);
+
+            float * cell_idx = (float *) vis->cell_idx->data + s*n_col*n_kv;
+            float * blk_idx  = (float *) vis->blk_idx->data  + s*n_blocks;
+            float * blk_ok   = (float *) vis->blk_ok->data   + s*n_col*n_blocks;
+
+            for (int64_t col = 0; col < n_col; ++col) {
+                const llama_seq_id seq_id = col < (int64_t) vis_cols.size() ? vis_cols[col] : -1;
+
+                for (int64_t j = 0; j < n_kv; ++j) {
+                    float v = 1e30f; // after every token: never visible
+                    if (seq_id >= 0 && !cells.is_empty(j) && cells.seq_has(j, seq_id)) {
+                        v = (float) (ranked ? rank[j] : cells.pos_get(j));
+                    }
+                    cell_idx[col*n_kv + j] = v;
+                }
+
+                for (int64_t b = 0; b < n_blocks; ++b) {
+                    bool ok = false;
+                    if (seq_id >= 0) {
+                        // the spare block holds the unpooled tail cells: its bias is the tail value for every token
+                        ok = b < n_bid ? cells.seq_has((uint32_t) bid_cell[b], seq_id) : (have_dead && b == dead_bid);
+                    }
+                    blk_ok[col*n_blocks + b] = ok ? 0.0f : -INFINITY;
+                }
+            }
+
+            for (int64_t b = 0; b < n_blocks; ++b) {
+                blk_idx[b] = b < n_bid ? (float) bid_idx[b] : 1e30f;
+            }
+        }
+
         for (int64_t ii = 0; ii < n_tps; ++ii) {
             const int64_t      i      = s*n_tps + ii;
             const llama_seq_id seq_id = ubatch->seq_id[i][0];
@@ -545,6 +590,18 @@ void llama_memory_hybrid_idx::set_input_qsa(
 
             // the tail is an incomplete block and is always visible, as in the reference
             const int64_t tail_start = (q + 1)/r*r;
+
+            if (vis) {
+                const int64_t col = std::find(vis_cols.begin(), vis_cols.end(), seq_id) - vis_cols.begin();
+
+                ((int32_t *) vis->tok_col ->data)[s*n_tps + ii] = (int32_t) col;
+                ((float   *) vis->tok_q   ->data)[s*n_tps + ii] = (float) q;
+                ((float   *) vis->tok_tail->data)[s*n_tps + ii] = (float) tail_start;
+            }
+
+            if (blk_bias && !dst_bias) {
+                continue;
+            }
 
             if (blk_bias) {
                 // a block sits wholly inside or outside the tail, so one value covers it
@@ -679,8 +736,9 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         ggml_tensor * bias,
         const llama_ubatch * ubatch,
         uint32_t ratio,
-        bool blk_bias) const {
+        bool blk_bias,
+        const llama_qsa_vis * vis) const {
     GGML_ASSERT(mem != nullptr);
 
-    mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
+    mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias, vis);
 }

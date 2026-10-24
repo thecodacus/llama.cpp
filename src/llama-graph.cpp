@@ -1087,7 +1087,10 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
     mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
 
-    mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    // the mask is left unallocated when no node reads it (QSA's indexer and sparse attention can take position tables)
+    if (inp_attn->self_kq_mask && inp_attn->self_kq_mask->buffer) {
+        mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    }
 
     if (inp_attn->self_k_rot) {
         mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
@@ -1139,7 +1142,10 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
 
-    mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    // the mask is left unallocated when no node reads it (QSA's indexer and sparse attention can take position tables)
+    if (inp_attn->self_kq_mask && inp_attn->self_kq_mask->buffer) {
+        mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    }
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
@@ -2624,7 +2630,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
              int64_t   n_kv_max,
                float   kq_scale,
                  int   il,
-         ggml_tensor * kv_cells) const {
+         ggml_tensor * kv_cells,
+                bool   kv_cells_mask) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -2641,24 +2648,25 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
 
     if (kv_cells && !use_flash_attn) {
-        // without flash attention the listed cells become a mask of their own: hidden everywhere else
-        ggml_tensor * listed = ggml_fill(ctx0, kq_mask, -INFINITY);
-
-        // rows of size 1: [n_kv, n_batch, 1, n_stream] -> [1, n_kv, n_batch, n_stream]
-        listed = ggml_view_4d(ctx0, listed, 1, listed->ne[0], listed->ne[1], listed->ne[3], listed->nb[0], listed->nb[1], listed->nb[2], 0);
+        // without flash attention the listed cells become a mask of their own: hidden everywhere else. one value
+        // repeated: a tensor of this shape filled at creation would be a graph leaf, held from the start of the graph
+        const int64_t n_kv = k->ne[1];
+        ggml_tensor * listed = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1), -INFINITY);
+        listed = ggml_repeat_4d(ctx0, listed, 1, n_kv, kv_cells->ne[1], kv_cells->ne[3]);
 
         // [n_cells, n_batch, 1, n_stream] -> [n_cells, n_batch, n_stream, 1]
         ggml_tensor * cells = ggml_view_4d(ctx0, kv_cells, kv_cells->ne[0], kv_cells->ne[1], kv_cells->ne[3], 1,
                 kv_cells->nb[1], kv_cells->nb[2], kv_cells->ne[3]*kv_cells->nb[3], 0);
 
-        // one zero repeated: a zero-filled tensor of this shape would be a graph leaf, held from the start of the graph
-        ggml_tensor * zeros = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1), 0.0f);
-        zeros = ggml_repeat_4d(ctx0, zeros, 1, cells->ne[0], cells->ne[1], cells->ne[2]);
-        listed = ggml_set_rows(ctx0, listed, zeros, cells);
+        // the listed cells take the mask's value for them: given per entry, or read at the cell. rows of size 1:
+        // [n_kv or n_cells, n_batch, 1, n_stream] -> [1, n_kv or n_cells, n_batch, n_stream]
+        ggml_tensor * mrows = ggml_view_4d(ctx0, kq_mask, 1, kq_mask->ne[0], kq_mask->ne[1], kq_mask->ne[3],
+                kq_mask->nb[0], kq_mask->nb[1], kq_mask->nb[3], 0);
+        ggml_tensor * values = kv_cells_mask ? ggml_cast(ctx0, mrows, GGML_TYPE_F32) : ggml_get_rows(ctx0, mrows, cells);
+        listed = ggml_set_rows(ctx0, listed, values, cells);
 
-        // back to [n_kv, n_batch, 1, n_stream], combined in place with the mask: the filled copy is this layer's own
-        listed = ggml_view_4d(ctx0, listed, listed->ne[1], listed->ne[2], 1, listed->ne[3], listed->nb[2], listed->nb[3], listed->nb[3], 0);
-        kq_mask = ggml_add_inplace(ctx0, listed, kq_mask);
+        // back to [n_kv, n_batch, 1, n_stream]
+        kq_mask = ggml_view_4d(ctx0, listed, listed->ne[1], listed->ne[2], 1, listed->ne[3], listed->nb[2], listed->nb[3], listed->nb[3], 0);
     }
 
     if (use_flash_attn) {
@@ -2686,7 +2694,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
         if (kv_cells) {
             // the kernel attends the listed cells only; no copy of the mask per layer
-            ggml_flash_attn_ext_set_indices(cur, kv_cells);
+            ggml_flash_attn_ext_set_indices(cur, kv_cells, kv_cells_mask);
         }
         ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
 

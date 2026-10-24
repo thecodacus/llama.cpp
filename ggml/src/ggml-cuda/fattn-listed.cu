@@ -154,7 +154,8 @@ static __device__ __forceinline__ void fattn_listed_q8_wait() {
 
 template <typename smem_t>
 static __device__ __forceinline__ void fattn_listed_collect_cells(
-        smem_t & S, const int b, const int32_t * list, const half * mrow, const int n_list, const int n_kv, const int lane) {
+        smem_t & S, const int b, const int32_t * list, const half * mrow, const int n_list, const int n_kv,
+        const bool mask_per_entry, const int lane) {
     static_assert(FATTN_LISTED_CH == WARP_SIZE, "one cell per lane");
     int next  = S.next;
     int count = 0;
@@ -162,7 +163,7 @@ static __device__ __forceinline__ void fattn_listed_collect_cells(
         int   c = next + lane < n_list ? list[next + lane] : -1;
         float m = -INFINITY;
         if (c >= 0 && c < n_kv) {
-            m = __half2float(mrow[c]) * 1.4426950408889634f;
+            m = __half2float(mrow[mask_per_entry ? next + lane : c]) * 1.4426950408889634f;
         }
         const bool     visible = m != -INFINITY;
         const uint32_t ballot  = __ballot_sync(0xFFFFFFFF, visible);
@@ -199,10 +200,10 @@ static __global__ void flash_attn_ext_listed_q8(
         const int64_t nb01, const int64_t nb02, const int64_t nb03,
         const int64_t nb11, const int64_t nb12, const int64_t nb13,
         const int64_t nb21, const int64_t nb22, const int64_t nb23,
-        const int ne31, const int ne33, const int64_t nb31, const int64_t nb33, const int rk3) {
+        const int ne31, const int ne33, const int64_t nb31, const int64_t nb33, const int rk3, const bool mask_per_entry) {
 #if defined(GGML_USE_HIP) || !defined(__CUDA_ARCH__) || __CUDA_ARCH__ < GGML_CUDA_CC_TURING
     GGML_UNUSED_VARS(Q, K, V, mask, cells, dst, scale_log2, n_list, n_kv, ne01, ne02, gqa, nb01, nb02, nb03,
-        nb11, nb12, nb13, nb21, nb22, nb23, ne31, ne33, nb31, nb33, rk3);
+        nb11, nb12, nb13, nb21, nb22, nb23, ne31, ne33, nb31, nb33, rk3, mask_per_entry);
     NO_DEVICE_CODE;
 #else
     __shared__ fattn_listed_q8_smem S;
@@ -250,12 +251,12 @@ static __global__ void flash_attn_ext_listed_q8(
 
     // the first chunk copied, the second one's cells collected
     if (warp == 0) {
-        fattn_listed_collect_cells(S, 0, list, mrow, n_list, n_kv, lane);
+        fattn_listed_collect_cells(S, 0, list, mrow, n_list, n_kv, mask_per_entry, lane);
     }
     __syncthreads();
     fattn_listed_q8_copy(S, 0, Kb, nb11, Vb, nb21, tid);
     if (warp == 0) {
-        fattn_listed_collect_cells(S, 1, list, mrow, n_list, n_kv, lane);
+        fattn_listed_collect_cells(S, 1, list, mrow, n_list, n_kv, mask_per_entry, lane);
     }
     fattn_listed_q8_wait();
     __syncthreads();
@@ -411,7 +412,7 @@ static __global__ void flash_attn_ext_listed_q8(
         __syncthreads();        // P V is done with stage b and s, every copy has landed
 
         if (more && warp == 0) {
-            fattn_listed_collect_cells(S, b, list, mrow, n_list, n_kv, lane);
+            fattn_listed_collect_cells(S, b, list, mrow, n_list, n_kv, mask_per_entry, lane);
         }
         __syncthreads();
     }
@@ -443,10 +444,10 @@ static __global__ void flash_attn_ext_listed(
         const int64_t nb01, const int64_t nb02, const int64_t nb03,
         const int64_t nb11, const int64_t nb12, const int64_t nb13,
         const int64_t nb21, const int64_t nb22, const int64_t nb23,
-        const int ne31, const int ne33, const int64_t nb31, const int64_t nb33, const int rk3) {
+        const int ne31, const int ne33, const int64_t nb31, const int64_t nb33, const int rk3, const bool mask_per_entry) {
 #if defined(GGML_USE_HIP) || !defined(__CUDA_ARCH__) || __CUDA_ARCH__ < GGML_CUDA_CC_TURING
     GGML_UNUSED_VARS(Q, K, V, mask, cells, dst, scale_log2, n_list, n_kv, ne01, ne02, gqa, nb01, nb02, nb03,
-        nb11, nb12, nb13, nb21, nb22, nb23, ne31, ne33, nb31, nb33, rk3);
+        nb11, nb12, nb13, nb21, nb22, nb23, ne31, ne33, nb31, nb33, rk3, mask_per_entry);
     NO_DEVICE_CODE;
 #else
     __shared__ fattn_listed_smem S;
@@ -503,7 +504,7 @@ static __global__ void flash_attn_ext_listed(
                 int   c = next + lane < n_list ? list[next + lane] : -1;
                 float m = -INFINITY;
                 if (c >= 0 && c < n_kv) {
-                    m = __half2float(mrow[c]) * 1.4426950408889634f;
+                    m = __half2float(mrow[mask_per_entry ? next + lane : c]) * 1.4426950408889634f;
                 }
                 const bool     visible = m != -INFINITY;
                 const uint32_t ballot  = __ballot_sync(0xFFFFFFFF, visible);
@@ -713,7 +714,8 @@ void ggml_cuda_flash_attn_ext_listed(ggml_backend_cuda_context & ctx, ggml_tenso
             (const int32_t *) cells->data, (float *) dst->data, scale*1.4426950408889634f,
             int(cells->ne[0]), int(K->ne[1]), int(Q->ne[1]), int(Q->ne[2]), int(Q->ne[2] / K->ne[2]),
             Q->nb[1], Q->nb[2], Q->nb[3], K->nb[1], K->nb[2], K->nb[3], V->nb[1], V->nb[2], V->nb[3],
-            int(mask->ne[1]), int(mask->ne[3]), mask->nb[1], mask->nb[3], int(Q->ne[3] / K->ne[3]));
+            int(mask->ne[1]), int(mask->ne[3]), mask->nb[1], mask->nb[3], int(Q->ne[3] / K->ne[3]),
+            ggml_get_op_params_i32(dst, 5) != 0);
     };
 
     switch (K->type) {
