@@ -2465,6 +2465,16 @@ extern "C" {
             struct ggml_tensor * a,
             int32_t              n_kv_max);
 
+    // Attend only the cells listed in indices (I32 [n_kv_max, mask->ne[1], 1, mask->ne[3]]: for each query row and
+    // sequence of the mask, n_kv_max cell indices, -1 for none). The mask still gives each listed cell its value, so a
+    // listed cell the mask hides stays hidden: with mask_per_entry the mask is [n_kv_max, ...] and holds the value of
+    // each list entry, otherwise it is [n_kv, ...] and is read at the listed cells. Sets n_kv_max. Only backends that
+    // read the list run such an op.
+    GGML_API void ggml_flash_attn_ext_set_indices(
+            struct ggml_tensor * a,
+            struct ggml_tensor * indices,
+            bool                 mask_per_entry);
+
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);

@@ -242,6 +242,11 @@ llama_memory_context_ptr llama_kv_cache_iswa::init_batch(llama_batch_allocr & ba
     return std::make_unique<llama_kv_cache_iswa_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
 }
 
+void llama_kv_cache_iswa::set_reserve_cells(uint32_t n_cells) {
+    kv_base->set_reserve_cells(n_cells);
+    kv_swa ->set_reserve_cells(n_cells);
+}
+
 llama_memory_context_ptr llama_kv_cache_iswa::init_full() {
     return std::make_unique<llama_kv_cache_iswa_context>(this);
 }

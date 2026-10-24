@@ -144,6 +144,7 @@ struct llama_model_loader {
     size_t size_done = 0;
     size_t size_data = 0;
     std::vector<std::pair<size_t, size_t>> mmaps_used;
+    std::vector<std::pair<size_t, size_t>> mmaps_pin; // like mmaps_used, without the lazy tensors
 
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
     struct ggml_backend_buft_comparator {
@@ -171,6 +172,11 @@ struct llama_model_loader {
 
     // track tensors that had to be moved for debugging:
     size_t n_tensors_moved = 0;
+
+    // weights kept in host memory with mmap: copied into pinned buffers when the mapped memory cannot be pinned
+    int    pin_copy        = -1; // unknown until the first such tensor
+    size_t pin_copy_bytes  = 0;
+    size_t pin_copy_budget = 0;
     std::string first_tensor_moved_name;
     std::string first_tensor_moved_type_name;
     ggml_backend_buffer_type_t first_moved_from_buft = nullptr;

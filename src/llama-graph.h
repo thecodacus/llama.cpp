@@ -1175,7 +1175,10 @@ struct llm_graph_context {
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                 int64_t   n_kv_max,
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            ggml_tensor * kv_cells = nullptr,        // sparse attention: I32 [n_cells, n_tokens/n_stream, 1, n_stream],
+                                                     // the cells each query attends (kq_mask still hides cells)
+                     bool kv_cells_mask = false) const; // kq_mask is [n_cells, ...] and holds each list entry's value
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 
@@ -1194,6 +1197,14 @@ struct llm_graph_context {
                     int   il) const;
 
     llm_graph_input_attn_kv * build_attn_inp_kv() const;
+
+    // stores the layer's K and V in the cache, rotated as build_attn rotates them, without the attention: for a ubatch
+    // with no outputs that only has to fill the cache
+    void build_kv_store(
+            llm_graph_input_attn_kv * inp,
+            ggml_tensor * k_cur, // [n_embd_head_k, n_head_k, n_tokens]
+            ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens]
+                    int   il) const;
 
     ggml_tensor * build_attn(
             llm_graph_input_attn_kv * inp,

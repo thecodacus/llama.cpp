@@ -5,6 +5,7 @@
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
+#include "fattn-listed.cuh"
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 __launch_bounds__(256, 1)
@@ -123,10 +124,11 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ggml_backend_cuda_context
     memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
 
     const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
+    // a cell list (src[5]) must take the sparse kernel: the mask alone would admit every visible cell
     return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) &&
         mask != nullptr && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
         mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
-        K->ne[1] >= std::max<int64_t>(4096, 2LL*n_kv_max);
+        (dst->src[5] != nullptr || K->ne[1] >= std::max<int64_t>(4096, 2LL*n_kv_max));
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
 
@@ -721,6 +723,23 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_NONE;
     }
 
+    // a cell list (src[5]) is read only by the sparse MMA kernel: its head sizes and query-head groups
+    // (ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse), or none, so the op runs where the list is honoured.
+    // groups of 8 query heads are taken for more than 4 per K/V head; a last partial group is masked
+    if (dst->src[5] != nullptr) {
+        if (ggml_cuda_flash_attn_ext_listed_supported(device, dst)) {
+            return BEST_FATTN_KERNEL_MMA_F16; // ggml_cuda_flash_attn_ext takes it to the listed-cells kernel
+        }
+        if (ggml_get_op_params_i32(dst, 5) != 0) {
+            return BEST_FATTN_KERNEL_NONE; // the sparse MMA kernel reads the mask at the cells, not per list entry
+        }
+        const bool sparse_shape = gqa_opt_applies && max_bias == 0.0f && (
+            (K->ne[0] == 256 && V->ne[0] == 256 && gqa_ratio >   4) ||
+            (K->ne[0] == 512 && V->ne[0] == 512 && gqa_ratio %  8 == 0) ||
+            (K->ne[0] == 576 && V->ne[0] == 512 && gqa_ratio % 16 == 0));
+        return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && sparse_shape ? BEST_FATTN_KERNEL_MMA_F16 : BEST_FATTN_KERNEL_NONE;
+    }
+
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
@@ -837,6 +856,11 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+
+    if (dst->src[5] != nullptr && ggml_cuda_flash_attn_ext_listed_supported(ctx.device, dst)) {
+        ggml_cuda_flash_attn_ext_listed(ctx, dst);
+        return;
+    }
 
     // Fused turbo MMA decode gate (DEFAULT ON — see ggml_cuda_turbo_mma_fused; GGML_TURBO_MMA_FUSED=0 disables).
     // Routes turbo4-K==turbo4-V, D in {128,256}, decode (Q->ne[1] <= 4) onto the GQA-packed

@@ -129,6 +129,9 @@ public:
 
     llama_memory_context_ptr init_full() override;
 
+    void set_reserve_cells(uint32_t n_cells) override { reserve_cells = n_cells; }
+    uint32_t get_reserve_cells() const { return reserve_cells; }
+
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     bool get_can_shift() const override;
@@ -266,6 +269,7 @@ private:
 
     // required padding
     const uint32_t n_pad = 1;
+    uint32_t reserve_cells = 0; // set_reserve_cells
 
     // SWA
     const uint32_t n_swa = 0;

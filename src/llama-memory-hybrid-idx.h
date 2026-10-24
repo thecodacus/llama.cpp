@@ -12,6 +12,21 @@
 // llama_memory_hybrid plus a third cache with one indexer key per token, for block-sparse attention (qwen4exp QSA)
 // the indexer is a side buffer over the attention cells: same size, padding, streams and slots, so cell j is one token in both
 
+// the visibility the QSA indexer and its sparse attention need, as small tables in place of the [n_kv, n_tokens] attention
+// mask and the [n_blocks, n_tokens] block bias. per stream, a sequence column per sequence of the stream's tokens:
+//   a cell is visible to a token iff cell_idx[cell, col] <= tok_q[token]
+//   a block's bias for a token is blk_ok[block, col] + 1e9 if blk_idx[block] >= tok_tail[token], else blk_ok[block, col]
+// (cell_idx is the cell's position, or its rank when an image repeats positions, and 1e30 for an empty cell or one of
+// another sequence; blk_ok is 0, or -inf for a block of another sequence)
+struct llama_qsa_vis {
+    ggml_tensor * cell_idx = nullptr; // F32 [n_kv, n_col, ns]
+    ggml_tensor * blk_idx  = nullptr; // F32 [n_blocks, ns]
+    ggml_tensor * blk_ok   = nullptr; // F32 [n_blocks, n_col, ns]
+    ggml_tensor * tok_col  = nullptr; // I32 [n_tokens/ns, ns]
+    ggml_tensor * tok_q    = nullptr; // F32 [n_tokens/ns, ns]
+    ggml_tensor * tok_tail = nullptr; // F32 [n_tokens/ns, ns]
+};
+
 class llama_memory_hybrid_idx : public llama_memory_hybrid {
 public:
     llama_memory_hybrid_idx(
@@ -52,6 +67,9 @@ public:
 
     llama_memory_context_ptr init_full() override;
 
+    // the indexer cache tracks the attention cache cell for cell
+    void set_reserve_cells(uint32_t n_cells) override;
+
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     void clear(bool data) override;
@@ -83,9 +101,11 @@ public:
     //   bias      F32 [n_kv, n_tokens/ns, ns] -inf where invisible, large where always visible
     // blk_bias asks for the bias per block instead: [n_blocks, n_tokens/ns, ns]
     // the caller then adds the attention mask, the only part of the bias that varies within a block
+    // vis (with blk_bias, for a ubatch of text tokens) asks for the visibility tables instead of the bias, which may then
+    // be nullptr: no [n_tokens, n_kv] input at all
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
-                       bool blk_bias) const;
+                       bool blk_bias, const llama_qsa_vis * vis = nullptr) const;
 
 private:
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
@@ -143,7 +163,7 @@ public:
 
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
-                       bool blk_bias) const;
+                       bool blk_bias, const llama_qsa_vis * vis = nullptr) const;
 
 private:
     const llama_memory_hybrid_idx * mem = nullptr;

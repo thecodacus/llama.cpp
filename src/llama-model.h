@@ -345,6 +345,7 @@ struct llama_layer {
     struct ggml_tensor * ffn_up_exps_hot   = nullptr;
     struct ggml_tensor * moe_map_hot       = nullptr; // i32[n_expert]: pack slot or -1
     struct ggml_tensor * moe_map_cold      = nullptr; // i32[n_expert]: global id or -1
+    const int32_t      * moe_hot_ids       = nullptr; // host copy: the experts in the pack, ffn_gate_exps_hot->ne[2] of them
     struct ggml_tensor * ffn_gate_inp_b    = nullptr;
     struct ggml_tensor * ffn_gate_exps_b   = nullptr;
     struct ggml_tensor * ffn_down_exps_b   = nullptr;
@@ -746,6 +747,21 @@ struct llama_model {
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
+    // MoE expert cache: the layers it covers are known at load, the packs (GPU copies of their hottest experts)
+    // are built at load for a fixed slot count, or on first use when the slots are fitted to the free memory
+    bool    moe_cache_has_layers()   const;
+    bool    moe_cache_resident()     const;
+    bool    moe_cache_built()        const; // packs were built at least once (at load for a fixed slot count)
+    bool    moe_cache_auto()         const;
+    int32_t moe_cache_borrow_param() const;
+
+    // free all packs
+    void moe_cache_release() const;
+
+    // probe = one slot per layer and no upload, to size the compute buffers against; otherwise the fixed slot
+    // count, or as many slots as fit in the free memory minus the margin; returns false if no pack was built
+    bool moe_cache_build(bool probe) const;
+
     // total number of parameters in the model
     uint64_t n_elements() const;
 
@@ -769,6 +785,11 @@ struct llama_model {
 
     ggml_cgraph * build_graph(const llm_graph_params & params) const;
 
+    // read the rows of host weight `table` named by the I32 tensor `ids` in the background, many at a time: a table
+    // read lazily from disk (PLE / n-gram embeddings) then serves the graph's gather from memory instead of one page
+    // fault after another on the compute threads. only a hint, the gather reads the rows either way
+    void prefetch_rows(const ggml_tensor * table, const ggml_tensor * ids) const;
+
     virtual void load_stats  (llama_model_loader & ml) = 0;
     virtual void load_hparams(llama_model_loader & ml) = 0;
     virtual void load_vocab  (llama_model_loader & ml) = 0;
@@ -784,6 +805,12 @@ protected:
 
     struct impl;
     std::unique_ptr<impl> pimpl;
+
+    // allocate the pack of group gi with n_slots per layer, false if it does not fit
+    bool moe_pack_alloc(size_t gi, int n_slots) const;
+
+    // copy the hot experts of pack i into its buffer and write its id maps, returns the bytes copied
+    size_t moe_pack_upload(size_t i) const;
 };
 
 llama_model * llama_model_create(llm_arch arch, const llama_model_params & params);

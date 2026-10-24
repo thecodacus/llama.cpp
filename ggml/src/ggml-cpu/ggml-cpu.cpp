@@ -683,6 +683,10 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     if (strcmp(name, "ggml_backend_cpu_set_threadpool") == 0) {
         return (void *)ggml_backend_cpu_set_threadpool;
     }
+    // flash attention reads the cell list of ggml_flash_attn_ext_set_indices
+    if (strcmp(name, "ggml_backend_flash_attn_ext_indices") == 0) {
+        return (void *)ggml_flash_attn_ext_set_indices;
+    }
 
     return NULL;
 

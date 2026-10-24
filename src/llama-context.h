@@ -55,6 +55,9 @@ struct llama_context {
     //   - etc.
     void sched_reserve();
 
+    // MoE expert cache borrowing: free the packs for a large batch (off = true) or upload them again
+    void moe_cache_switch(bool off);
+
     void synchronize();
 
     const llama_model   & get_model()   const;
@@ -344,6 +347,22 @@ private:
     ggml_backend_sched_ptr sched;
 
     bool sched_need_reserve = true;
+
+    // this context builds and lends the MoE expert cache packs of the model
+    bool moe_cache_on = false;
+
+    // the configured ubatch: while the cache is lent, n_ubatch is the largest size up to this that fits in its memory
+    uint32_t n_ubatch_max = 0;
+
+    // the KV cells the lent buffers are reserved for: the batch that lent them reaches far fewer cells than n_ctx
+    uint32_t lend_cells = 0;
+
+    // set while the lent memory is fitted: a pipelined reserve that does not fit fails instead of falling back, or
+    // the reserve does not pipeline at all
+    bool pipeline_required = false;
+    bool pipeline_blocked  = false;
+
+    int64_t n_decode_calls = 0;
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;

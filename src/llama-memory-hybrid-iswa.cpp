@@ -127,6 +127,10 @@ llama_memory_context_ptr llama_memory_hybrid_iswa::init_batch(llama_batch_allocr
     return std::make_unique<llama_memory_hybrid_iswa_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
 }
 
+void llama_memory_hybrid_iswa::set_reserve_cells(uint32_t n_cells) {
+    mem_attn->set_reserve_cells(n_cells);
+}
+
 llama_memory_context_ptr llama_memory_hybrid_iswa::init_full() {
     return std::make_unique<llama_memory_hybrid_iswa_context>(this);
 }

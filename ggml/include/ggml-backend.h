@@ -338,6 +338,10 @@ extern "C" {
     // when enabled, CPU splits run on a worker thread so that independent splits
     // on other backends execute concurrently with them
     GGML_API void                 ggml_backend_sched_set_async_cpu(ggml_backend_sched_t sched, bool enable);
+
+    // experts (slices along ne[2]) of a host MUL_MAT_ID weight that the device keeps elsewhere, so the matmul never
+    // reads them from the staged copy: expert prefetch copies only the others. n = 0 clears the list
+    GGML_API void                 ggml_backend_sched_set_resident_experts(ggml_backend_sched_t sched, const struct ggml_tensor * weight, const int32_t * experts, int n);
     GGML_API ggml_backend_t       ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node);
 
     // Split graph without allocating it

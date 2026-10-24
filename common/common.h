@@ -585,7 +585,9 @@ struct common_params {
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
 
     std::string moe_cache_profile = ""; // MoE expert cache routing profile CSV (empty = disabled)
-    int32_t     moe_cache_slots   = 0;  // MoE expert cache slots per layer (0 = disabled)
+    int32_t     moe_cache_slots   = -1;  // MoE expert cache slots per layer (0 = disabled, -1 = fit to the free memory)
+    int32_t     moe_cache_margin  = 512; // MiB left free per GPU when the slots are fitted
+    int32_t     moe_cache_borrow  = -1;  // batches of at least this many tokens borrow the cache memory (0 = disabled, -1 = auto)
 
     bool single_turn       = false; // single turn chat conversation
 

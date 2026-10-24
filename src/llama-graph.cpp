@@ -1087,7 +1087,10 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
     mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
 
-    mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    // the mask is left unallocated when no node reads it (QSA's indexer and sparse attention can take position tables)
+    if (inp_attn->self_kq_mask && inp_attn->self_kq_mask->buffer) {
+        mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    }
 
     if (inp_attn->self_k_rot) {
         mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
@@ -1139,7 +1142,10 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
 
-    mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    // the mask is left unallocated when no node reads it (QSA's indexer and sparse attention can take position tables)
+    if (inp_attn->self_kq_mask && inp_attn->self_kq_mask->buffer) {
+        mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    }
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
@@ -2064,7 +2070,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // no pre-FFN weighting) — the dual chains below reproduce exactly that
     ggml_tensor * ids_hot  = nullptr;
     ggml_tensor * ids_cold = nullptr;
-    const bool use_moe_packs = moe_cache && moe_cache->moe_map_hot && !gate_up_exps &&
+    const bool use_moe_packs = moe_cache && moe_cache->moe_map_hot && !cparams.moe_packs_off && !gate_up_exps &&
         !up_exps_s && !gate_exps_s && !down_exps_s &&
         type_op == LLM_FFN_SILU && gate_exps && !up_exps_b && !gate_exps_b && !weight_before_ffn &&
         (il < 0 || hparams.swiglu_clamp_exp[il] <= 1e-6f);
@@ -2074,6 +2080,17 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ids_cold = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, moe_cache->moe_map_cold, ids_flat), n_expert_used, n_tokens);
         cb(ids_hot,  "ffn_moe_ids_hot",  il);
         cb(ids_cold, "ffn_moe_ids_cold", il);
+    }
+
+    // the cold chain never reads the pack's experts, so staging its weights on the GPU for a large batch can skip them;
+    // any other path reads every expert, so the list is cleared. the scheduler keeps it until the layer is built again
+    if (moe_cache) {
+        const int n_hot = use_moe_packs ? (int) moe_cache->ffn_gate_exps_hot->ne[2] : 0;
+        for (const ggml_tensor * w : { gate_exps, up_exps, down_exps }) {
+            if (w) {
+                ggml_backend_sched_set_resident_experts(sched, w, moe_cache->moe_hot_ids, n_hot);
+            }
+        }
     }
 
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
@@ -2156,6 +2173,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // split stays free of cross-backend inputs.
         ggml_tensor * cold = build_pack_chain(gate_exps, up_exps, down_exps, ids_cold);
         cb(cold, "ffn_moe_down_cold", il);
+
+        // with borrowing only the pack-free batches offload the experts, here the cold chain stays on the CPU
+        if (cparams.moe_cache_borrow > 0) {
+            ggml_tensor * act = cold->src[1];
+            ggml_tensor * cold_nodes[4] = { act->src[0], act->src[1], act, cold };
+            for (ggml_tensor * t : cold_nodes) {
+                ggml_backend_sched_set_tensor_backend(sched, t, backend_cpu);
+            }
+        }
 
         ggml_tensor * hot = build_pack_chain(moe_cache->ffn_gate_exps_hot, moe_cache->ffn_up_exps_hot, moe_cache->ffn_down_exps_hot, ids_hot);
         cb(hot, "ffn_moe_down_hot", il);
@@ -2317,7 +2343,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     if (!weight_before_ffn) {
-        experts = ggml_mul(ctx0, experts, weights);
+        // in place: nothing else reads the unweighted outputs, and a copy is n_embd x n_expert_used x n_tokens
+        // (800 MiB at 2560 x 10 x 8192)
+        experts = ggml_mul_inplace(ctx0, experts, weights);
         cb(experts, "ffn_moe_weighted", il);
     }
 
@@ -2601,7 +2629,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * v_mla,
              int64_t   n_kv_max,
                float   kq_scale,
-                 int   il) const {
+                 int   il,
+         ggml_tensor * kv_cells,
+                bool   kv_cells_mask) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -2616,6 +2646,29 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     ggml_tensor * cur;
 
     const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
+
+    if (kv_cells && !use_flash_attn) {
+        // without flash attention the listed cells become a mask of their own: hidden everywhere else. one value
+        // repeated: a tensor of this shape filled at creation would be a graph leaf, held from the start of the graph
+        const int64_t n_kv = k->ne[1];
+        ggml_tensor * listed = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1), -INFINITY);
+        listed = ggml_repeat_4d(ctx0, listed, 1, n_kv, kv_cells->ne[1], kv_cells->ne[3]);
+
+        // [n_cells, n_batch, 1, n_stream] -> [n_cells, n_batch, n_stream, 1]
+        ggml_tensor * cells = ggml_view_4d(ctx0, kv_cells, kv_cells->ne[0], kv_cells->ne[1], kv_cells->ne[3], 1,
+                kv_cells->nb[1], kv_cells->nb[2], kv_cells->ne[3]*kv_cells->nb[3], 0);
+
+        // the listed cells take the mask's value for them: given per entry, or read at the cell. rows of size 1:
+        // [n_kv or n_cells, n_batch, 1, n_stream] -> [1, n_kv or n_cells, n_batch, n_stream]
+        ggml_tensor * mrows = ggml_view_4d(ctx0, kq_mask, 1, kq_mask->ne[0], kq_mask->ne[1], kq_mask->ne[3],
+                kq_mask->nb[0], kq_mask->nb[1], kq_mask->nb[3], 0);
+        ggml_tensor * values = kv_cells_mask ? ggml_cast(ctx0, mrows, GGML_TYPE_F32) : ggml_get_rows(ctx0, mrows, cells);
+        listed = ggml_set_rows(ctx0, listed, values, cells);
+
+        // back to [n_kv, n_batch, 1, n_stream]
+        kq_mask = ggml_view_4d(ctx0, listed, listed->ne[1], listed->ne[2], 1, listed->ne[3], listed->nb[2], listed->nb[3], listed->nb[3], 0);
+    }
+
     if (use_flash_attn) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
 
@@ -2639,6 +2692,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
         ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
+        if (kv_cells) {
+            // the kernel attends the listed cells only; no copy of the mask per layer
+            ggml_flash_attn_ext_set_indices(cur, kv_cells, kv_cells_mask);
+        }
         ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
 
         // TurboQuant: inverse WHT on FA output when V values are WHT-rotated.
@@ -2868,6 +2925,35 @@ llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
 }
 
+void llm_graph_context::build_kv_store(
+        llm_graph_input_attn_kv * inp,
+        ggml_tensor * k_cur,
+        ggml_tensor * v_cur,
+        int           il) const {
+    if (inp->self_k_rot) {
+        k_cur = llama_mul_mat_hadamard(ctx0, k_cur, inp->self_k_rot);
+    }
+
+    if (inp->self_v_rot) {
+        v_cur = llama_mul_mat_hadamard(ctx0, v_cur, inp->self_v_rot);
+    }
+
+    // expand k later to enable rope fusion which directly writes into k-v cache
+    ggml_build_forward_expand(gf, v_cur);
+    ggml_build_forward_expand(gf, k_cur);
+
+    const auto * mctx_cur = inp->mctx;
+
+    // store to KV cache
+    {
+        const auto & k_idxs = inp->get_k_idxs();
+        const auto & v_idxs = inp->get_v_idxs();
+
+        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+    }
+}
+
 ggml_tensor * llm_graph_context::build_attn(
         llm_graph_input_attn_kv * inp,
         ggml_tensor * wo,
@@ -2885,30 +2971,15 @@ ggml_tensor * llm_graph_context::build_attn(
 
     if (inp->self_k_rot) {
         q_cur = llama_mul_mat_hadamard(ctx0, q_cur, inp->self_k_rot);
-        k_cur = llama_mul_mat_hadamard(ctx0, k_cur, inp->self_k_rot);
-    }
-
-    if (inp->self_v_rot) {
-        v_cur = llama_mul_mat_hadamard(ctx0, v_cur, inp->self_v_rot);
     }
 
     // these nodes are added to the graph together so that they are not reordered
     // by doing so, the number of splits in the graph is reduced
-    // expand k later to enable rope fusion which directly writes into k-v cache
     ggml_build_forward_expand(gf, q_cur);
-    ggml_build_forward_expand(gf, v_cur);
-    ggml_build_forward_expand(gf, k_cur);
+
+    build_kv_store(inp, k_cur, v_cur, il);
 
     const auto * mctx_cur = inp->mctx;
-
-    // store to KV cache
-    {
-        const auto & k_idxs = inp->get_k_idxs();
-        const auto & v_idxs = inp->get_v_idxs();
-
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
-        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
-    }
 
     ggml_tensor * kq_mask = inp->get_kq_mask();
 
@@ -3084,10 +3155,10 @@ ggml_tensor * llm_graph_context::build_attn(
     // reshape top_k indices: [n_top_k, n_batch, 1, n_stream] -> [n_top_k, n_batch, n_stream, 1]
     ggml_tensor * top_k_3d = ggml_view_4d(ctx0, top_k, top_k->ne[0], top_k->ne[1], top_k->ne[3], 1, top_k->nb[1], top_k->nb[2], top_k->ne[3]*top_k->nb[3], 0);
 
-    // prepare zero-filled tensor with rows of size 1: [1, n_top_k, n_batch, n_stream]
-    // this will be our source of zero values for unmasking top k mask elements
-    ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, top_k_3d->ne[0], top_k_3d->ne[1], top_k_3d->ne[2]);
-    zeros = ggml_fill(ctx0, zeros, 0.0f);
+    // the source of zero values for unmasking top k mask elements: one zero repeated to [1, n_top_k, n_batch, n_stream];
+    // a zero-filled tensor of that shape would be a graph leaf, which the allocator holds from the start of the graph
+    ggml_tensor * zeros = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1), 0.0f);
+    zeros = ggml_repeat_4d(ctx0, zeros, 1, top_k_3d->ne[0], top_k_3d->ne[1], top_k_3d->ne[2]);
 
     // modify KQ mask by unmasking elements that are in top_k indices
     // ggml_set_rows([1, n_kv, n_batch, n_stream], [1, n_top_k, n_batch, n_stream], [n_top_k, n_batch, n_stream, 1])

@@ -1824,6 +1824,30 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
 
+    // one 2D weight against contiguous activations of more dimensions is a single 2D product: the kernels below are
+    // picked by ne11, so a [ne10, 4, n_tokens] input would run a vector kernel once per token instead of one GEMM.
+    // the rows are packed (a contiguous tensor's nb[1] is arbitrary when ne[1] is 1)
+    if (ne02 == 1 && ne03 == 1 && ne12*ne13 > 1 && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)) {
+        ggml_tensor src1_2d = *src1;
+        src1_2d.ne[1] = ne11*ne12*ne13;
+        src1_2d.ne[2] = 1;
+        src1_2d.ne[3] = 1;
+        src1_2d.nb[1] = ggml_row_size(src1->type, ne10);
+        src1_2d.nb[2] = src1_2d.nb[1]*src1_2d.ne[1];
+        src1_2d.nb[3] = src1_2d.nb[2];
+
+        ggml_tensor dst_2d = *dst;
+        dst_2d.ne[1] = ne1*ne2*ne3;
+        dst_2d.ne[2] = 1;
+        dst_2d.ne[3] = 1;
+        dst_2d.nb[1] = ggml_row_size(dst->type, ne0);
+        dst_2d.nb[2] = dst_2d.nb[1]*dst_2d.ne[1];
+        dst_2d.nb[3] = dst_2d.nb[2];
+
+        ggml_cuda_mul_mat(ctx, src0, &src1_2d, &dst_2d);
+        return;
+    }
+
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
     // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
     // Therefore, in such cases use cuBLAS.
@@ -2468,6 +2492,8 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    // a copy from pageable memory is staged on the current device: it has to be this backend's
+    ggml_cuda_set_device(cuda_ctx->device);
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
 
@@ -2477,6 +2503,7 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    ggml_cuda_set_device(cuda_ctx->device);
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
 
@@ -2606,6 +2633,18 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
     }
 
     return use_cuda_graph;
+}
+
+// a matmul over many tokens: prompt processing, not a decode step
+static bool ggml_cuda_graph_is_large_batch(const ggml_cgraph * cgraph) {
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if ((node->op == GGML_OP_MUL_MAT    && node->src[1]->ne[1] >= 512) ||
+            (node->op == GGML_OP_MUL_MAT_ID && node->src[1]->ne[2] >= 512)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // a captured graph hard-codes its shapes, so with one key per split an alternating shape
@@ -3163,6 +3202,10 @@ static bool ggml_cuda_match_moe_weighted_reduction(
     if (mul_count == 2) {
         ops[1] = GGML_OP_MUL;
     }
+    // a weighting done in place is itself a view of the expert outputs, and views of it resolve to that base
+    const ggml_tensor * weighted_base = weighted->view_src ? weighted->view_src : weighted;
+    const size_t        weighted_offs = weighted->view_src ? weighted->view_offs : 0;
+
     std::vector<const ggml_tensor *> views;
     views.reserve(n_expert_used);
     const ggml_tensor * previous = nullptr;
@@ -3173,11 +3216,11 @@ static bool ggml_cuda_match_moe_weighted_reduction(
 
         if (candidate->op == GGML_OP_VIEW) {
             const int expert = (int) views.size();
-            if (expert >= n_expert_used || candidate->src[0] != weighted || candidate->view_src != weighted ||
+            if (expert >= n_expert_used || candidate->src[0] != weighted || candidate->view_src != weighted_base ||
                     candidate->type != GGML_TYPE_F32 || candidate->ne[0] != weighted->ne[0] ||
                     candidate->ne[1] != n_tokens || candidate->ne[2] != 1 || candidate->ne[3] != 1 ||
                     candidate->nb[0] != weighted->nb[0] || candidate->nb[1] != weighted->nb[2] ||
-                    candidate->view_offs != (size_t) expert * weighted->nb[1]) {
+                    candidate->view_offs != weighted_offs + (size_t) expert * weighted->nb[1]) {
                 return false;
             }
             views.push_back(candidate);
@@ -3204,8 +3247,31 @@ static bool ggml_cuda_match_moe_weighted_reduction(
         return false;
     }
 
+    // the nodes checked for outside uses: a weighting done in place writes into the expert outputs, so the node that
+    // produced them is part of the check as well (the fused kernel reads them as they are, and nothing else may)
+    std::vector<int>     idxs;
+    std::vector<ggml_op> idx_ops;
+    if (weighted_base != weighted && weighted_base != first) {
+        int base_idx = -1;
+        for (int k = node_idx - 1; k >= 0; --k) {
+            if (cgraph->nodes[k] == weighted_base) {
+                base_idx = k;
+                break;
+            }
+        }
+        if (base_idx < 0) {
+            return false;
+        }
+        idxs.push_back(base_idx);
+        idx_ops.push_back(weighted_base->op);
+    }
+    for (int k = 0; k < node_count; ++k) {
+        idxs.push_back(node_idx + k);
+        idx_ops.push_back(ops[k]);
+    }
+
     const int output_idx = node_idx + node_count - 1;
-    if (!ggml_can_fuse_subgraph(cgraph, node_idx, node_count, ops.data(), &output_idx, 1)) {
+    if (!ggml_can_fuse_subgraph_ext(cgraph, idxs.data(), (int) idxs.size(), idx_ops.data(), &output_idx, 1)) {
         return false;
     }
 
@@ -3443,6 +3509,23 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         }
 
         return true;
+    }
+
+    if (ops.size() == 3 && ops.begin()[0] == GGML_OP_REPEAT && ops.begin()[1] == GGML_OP_MUL && ops.begin()[2] == GGML_OP_ADD) {
+        const ggml_tensor * rep = cgraph->nodes[node_idx];
+        const ggml_tensor * mul = cgraph->nodes[node_idx+1];
+        const ggml_tensor * add = cgraph->nodes[node_idx+2];
+        const ggml_tensor * b   = rep->src[0];
+        const ggml_tensor * w   = mul->src[0] == rep ? mul->src[1] : mul->src[0];
+        const ggml_tensor * a   = add->src[0] == mul ? add->src[1] : add->src[0];
+
+        for (const ggml_tensor * t : { b, w, a, rep, mul, add }) {
+            if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous_rows(t)) {
+                return false;
+            }
+        }
+        // the add's other operand is read in full, the repeated one and the multiplier by broadcasting
+        return ggml_is_contiguous(add) && ggml_are_same_shape(a, add) && ggml_can_repeat(b, add) && ggml_can_repeat(w, add);
     }
 
     if (ops.size() == 3 && ops.begin()[0] == GGML_OP_SCALE && ops.begin()[1] == GGML_OP_UNARY && ops.begin()[2] == GGML_OP_SCALE
@@ -4203,6 +4286,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 1;
     }
 
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_REPEAT, GGML_OP_MUL, GGML_OP_ADD }, {})) {
+        ggml_cuda_op_repeat_mul_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+        return 2;
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {
@@ -4478,7 +4566,13 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
-            if (!graph->warmup_complete) {
+            if (ggml_cuda_graph_is_large_batch(cgraph)) {
+                // captured on every call: a large batch's shapes change from one call to the next (the context
+                // grows), so it never passes the warm-up, and its thousands of kernels launched one by one fill the
+                // device queue and hold the host, which then cannot feed another device (pipeline parallelism)
+                use_cuda_graph = true;
+                cuda_graph_update_required = properties_changed || graph->instance == nullptr;
+            } else if (!graph->warmup_complete) {
                 // Warmup: need at least 2 calls with no property change on the 2nd call
                 if (!properties_changed) {
                     graph->warmup_complete = true;
@@ -4520,6 +4614,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 static void ggml_backend_cuda_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
+    ggml_cuda_set_device(cuda_ctx->device);
     CUDA_CHECK(cudaEventRecord((cudaEvent_t)event->context, cuda_ctx->stream()));
 }
 
@@ -4876,8 +4971,14 @@ void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * tot
     *total /= share_count;
 }
 
+// pinning of host weights is off by default, GGML_CUDA_REGISTER_HOST=1 turns it on
+static bool ggml_cuda_register_host_enabled() {
+    const char * env = getenv("GGML_CUDA_REGISTER_HOST");
+    return env != nullptr && atoi(env) != 0;
+}
+
 bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
-    if (getenv("GGML_CUDA_REGISTER_HOST") == nullptr) {
+    if (!ggml_cuda_register_host_enabled()) {
         return false;
     }
 
@@ -4887,7 +4988,7 @@ bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
         // clear the error
         (void)cudaGetLastError();
 
-        GGML_LOG_DEBUG("%s: failed to register %.2f MiB of pinned memory: %s\n", __func__,
+        GGML_LOG_INFO("%s: failed to register %.2f MiB of pinned memory: %s\n", __func__,
                            size / 1024.0 / 1024.0, cudaGetErrorString(err));
         return false;
     }
@@ -4899,8 +5000,28 @@ bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
 #endif // CUDART_VERSION >= 11010 || defined(GGML_USE_MUSA)
 }
 
+// whether pinning is on but mapped (read-only) memory cannot be pinned on every device, so the weights kept in
+// host memory have to be copied into pinned buffers instead of mapped to be pinned
+static bool ggml_backend_cuda_host_pin_needs_copy() {
+    if (!ggml_cuda_register_host_enabled()) {
+        return false;
+    }
+#if CUDART_VERSION >= 11010 && !defined(GGML_USE_MUSA) && !defined(GGML_USE_HIP)
+    for (int device = 0; device < ggml_cuda_info().device_count; ++device) {
+        int supported = 0;
+        if (cudaDeviceGetAttribute(&supported, cudaDevAttrHostRegisterReadOnlySupported, device) != cudaSuccess || !supported) {
+            (void)cudaGetLastError();
+            return true;
+        }
+    }
+    return false;
+#else
+    return true;
+#endif
+}
+
 void ggml_backend_cuda_unregister_host_buffer(void * buffer) {
-    if (getenv("GGML_CUDA_REGISTER_HOST") == nullptr) {
+    if (!ggml_cuda_register_host_enabled()) {
         return;
     }
 
@@ -5744,8 +5865,15 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_unregister_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_unregister_host_buffer;
     }
+    if (strcmp(name, "ggml_backend_host_pin_needs_copy") == 0) {
+        return (void *)ggml_backend_cuda_host_pin_needs_copy;
+    }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    // flash attention reads the cell list of ggml_flash_attn_ext_set_indices (sparse kernel shapes only, see supports_op)
+    if (strcmp(name, "ggml_backend_flash_attn_ext_indices") == 0) {
+        return (void *)ggml_flash_attn_ext_set_indices;
     }
     return nullptr;
 }

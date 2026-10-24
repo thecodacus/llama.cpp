@@ -166,6 +166,174 @@ gated_delta_net_cuda(const float * q,
     }
 }
 
+// The scalar-gate recurrence for many tokens: a block owns GDN_COLS value columns of one head, and each thread holds
+// S_v/GDN_ROW_GROUPS rows of one column in registers. The block stages a token's q and k in shared memory once (not
+// once per warp) and sums the row groups there, and the next token's inputs are loaded while this one computes, so
+// the token loop does not wait on global memory.
+#define GDN_COLS       32
+#define GDN_ROW_GROUPS 4
+
+template <int S_v, bool keep_rs_t>
+__global__ void __launch_bounds__(GDN_COLS * GDN_ROW_GROUPS, 2)
+gated_delta_net_cols_cuda(const float * q,
+                          const float * k,
+                          const float * v,
+                          const float * g,
+                          const float * beta,
+                          const float * curr_state,
+                          float *       dst,
+                          float *       state,
+                          int64_t       H,
+                          int64_t       n_tokens,
+                          int64_t       sq1,
+                          int64_t       sq2,
+                          int64_t       sq3,
+                          int64_t       sv1,
+                          int64_t       sv2,
+                          int64_t       sv3,
+                          int64_t       sb1,
+                          int64_t       sb2,
+                          int64_t       sb3,
+                          const uint3   neqk1_magic,
+                          const uint3   rq3_magic,
+                          float         scale,
+                          int64_t       state_slot_stride,
+                          int           K) {
+    constexpr int n_threads = GDN_COLS * GDN_ROW_GROUPS;
+    constexpr int rows      = S_v / GDN_ROW_GROUPS;          // state rows per thread
+    constexpr int loads     = (S_v + n_threads - 1) / n_threads; // q and k values each thread stages per token
+
+    __shared__ float sq[S_v];
+    __shared__ float sk[S_v];
+    __shared__ float red[GDN_ROW_GROUPS][GDN_COLS];
+
+    const uint32_t h_idx    = blockIdx.x;
+    const uint32_t sequence = blockIdx.y;
+    const int      c        = threadIdx.x;
+    const int      rg       = threadIdx.y;
+    const int      tid      = rg * GDN_COLS + c;
+    const int      col      = blockIdx.z * GDN_COLS + c;
+    const int      row0     = rg * rows;
+
+    const uint32_t iq1 = fastmodulo(h_idx, neqk1_magic);
+    const uint32_t iq3 = fastdiv(sequence, rq3_magic);
+
+    // the state is stored transposed, M[col][i] = S[i][col]: a thread's rows of its column are contiguous
+    state      += (sequence * H + h_idx) * S_v * S_v;
+    curr_state += (sequence * H + h_idx) * S_v * S_v + col * S_v + row0;
+    float * attn_data = dst + (sequence * n_tokens * H + h_idx) * S_v;
+
+    const float * q_s = q    + iq3 * sq3 + iq1 * sq1;
+    const float * k_s = k    + iq3 * sq3 + iq1 * sq1;
+    const float * v_s = v    + sequence * sv3 + h_idx * sv1 + col;
+    const float * g_s = g    + sequence * sb3 + h_idx * sb1;
+    const float * b_s = beta + sequence * sb3 + h_idx * sb1;
+
+    ggml_cuda_pdl_sync();
+
+    float s[rows];
+#pragma unroll
+    for (int r = 0; r < rows; r++) {
+        s[r] = curr_state[r];
+    }
+
+    float nq[loads];
+    float nk[loads];
+    float nv = 0.0f;
+    float ng = 0.0f;
+    float nb = 0.0f;
+    auto fetch = [&](int64_t t) {
+#pragma unroll
+        for (int u = 0; u < loads; u++) {
+            const int i = tid + u * n_threads;
+            if (i < S_v) {
+                nq[u] = q_s[t * sq2 + i];
+                nk[u] = k_s[t * sq2 + i];
+            }
+        }
+        nv = v_s[t * sv2];
+        ng = g_s[t * sb2];
+        nb = b_s[t * sb2];
+    };
+    if (n_tokens > 0) {
+        fetch(0);
+    }
+
+    for (int64_t t = 0; t < n_tokens; t++) {
+        const float v_t    = nv;
+        const float g_val  = expf(ng);
+        const float beta_t = nb;
+
+        __syncthreads();
+#pragma unroll
+        for (int u = 0; u < loads; u++) {
+            const int i = tid + u * n_threads;
+            if (i < S_v) {
+                sq[i] = nq[u];
+                sk[i] = nk[u];
+            }
+        }
+        __syncthreads();
+        if (t + 1 < n_tokens) {
+            fetch(t + 1);
+        }
+
+        // kv[col] = (S^T @ k)[col], summed over the row groups in shared memory
+        float kv = 0.0f;
+#pragma unroll
+        for (int r = 0; r < rows; r++) {
+            kv += s[r] * sk[row0 + r];
+        }
+        red[rg][c] = kv;
+        __syncthreads();
+        float kv_col = 0.0f;
+#pragma unroll
+        for (int j = 0; j < GDN_ROW_GROUPS; j++) {
+            kv_col += red[j][c];
+        }
+
+        // S[i][col] = g * S[i][col] + k[i] * delta[col], attn[col] = (S^T @ q)[col]
+        const float delta_col = (v_t - g_val * kv_col) * beta_t;
+        float attn = 0.0f;
+#pragma unroll
+        for (int r = 0; r < rows; r++) {
+            s[r]  = g_val * s[r] + sk[row0 + r] * delta_col;
+            attn += s[r] * sq[row0 + r];
+        }
+        __syncthreads();
+        red[rg][c] = attn;
+        __syncthreads();
+        if (rg == 0) {
+            float attn_col = 0.0f;
+#pragma unroll
+            for (int j = 0; j < GDN_ROW_GROUPS; j++) {
+                attn_col += red[j][c];
+            }
+            attn_data[t * S_v * H + col] = attn_col * scale;
+        }
+
+        if constexpr (keep_rs_t) {
+            // snapshot slot mapping: slot 0 = most recent state, slot s = s tokens back
+            const int target_slot = (int) n_tokens - 1 - (int) t;
+            if (target_slot >= 0 && target_slot < K) {
+                float * slot = state + target_slot * state_slot_stride + col * S_v + row0;
+#pragma unroll
+                for (int r = 0; r < rows; r++) {
+                    slot[r] = s[r];
+                }
+            }
+        }
+    }
+
+    if constexpr (!keep_rs_t) {
+        float * out = state + col * S_v + row0;
+#pragma unroll
+        for (int r = 0; r < rows; r++) {
+            out[r] = s[r];
+        }
+    }
+}
+
 template <bool KDA, bool keep_rs_t>
 static void launch_gated_delta_net(
         const float * q_d, const float * k_d, const float * v_d,
@@ -185,6 +353,24 @@ static void launch_gated_delta_net(
 
     const uint3 neqk1_magic = init_fastdiv_values(neqk1);
     const uint3 rq3_magic   = init_fastdiv_values(rq3);
+
+    if constexpr (!KDA) {
+        if (n_tokens > 1 && (S_v == 64 || S_v == 128)) {
+            const dim3 cols_grid(H, n_seqs, S_v / GDN_COLS);
+            const dim3 cols_block(GDN_COLS, GDN_ROW_GROUPS, 1);
+            const ggml_cuda_kernel_launch_params cols_params = ggml_cuda_kernel_launch_params(cols_grid, cols_block, 0, stream);
+            if (S_v == 64) {
+                ggml_cuda_kernel_launch(gated_delta_net_cols_cuda<64, keep_rs_t>, cols_params,
+                    q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens, sq1, sq2, sq3, sv1, sv2, sv3,
+                    sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+            } else {
+                ggml_cuda_kernel_launch(gated_delta_net_cols_cuda<128, keep_rs_t>, cols_params,
+                    q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens, sq1, sq2, sq3, sv1, sv2, sv3,
+                    sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+            }
+            return;
+        }
+    }
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
     switch (S_v) {

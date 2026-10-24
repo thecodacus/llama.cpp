@@ -93,6 +93,10 @@ struct llama_memory_i {
     // simulate full cache, used for allocating worst-case compute buffers
     virtual llama_memory_context_ptr init_full() = 0;
 
+    // cap the cells a full context (init_full) reserves for, 0 = all of them: a batch that reaches only the first
+    // n_cells cells needs buffers for that many, not for the whole cache. memories that ignore it reserve for all
+    virtual void set_reserve_cells(uint32_t n_cells) { GGML_UNUSED(n_cells); }
+
     // prepare for any pending memory updates, such as shifts, copies, etc.
     // status == LLAMA_MEMORY_STATUS_NO_UPDATE if there is nothing to update
     virtual llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) = 0;
