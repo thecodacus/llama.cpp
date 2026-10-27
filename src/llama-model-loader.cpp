@@ -417,6 +417,8 @@ namespace GGUFMeta {
     template bool llama_model_loader::get_arr<std::vector<int32_t>>(enum llm_kv kid, std::vector<int32_t> & result, bool required);
     template bool llama_model_loader::get_arr<std::array<uint32_t, LLAMA_MAX_LAYERS>>(enum llm_kv kid, std::array<uint32_t, LLAMA_MAX_LAYERS> & result, bool required);
     template bool llama_model_loader::get_arr<std::vector<uint32_t>>(enum llm_kv kid, std::vector<uint32_t> & result, bool required);
+    template bool llama_model_loader::get_arr<uint32_t>(const std::string & key, std::vector<uint32_t> & result, bool required);
+    template bool llama_model_loader::get_arr<std::vector<uint64_t>>(enum llm_kv kid, std::vector<uint64_t> & result, bool required);
     template bool llama_model_loader::get_arr<std::array<uint64_t, LLAMA_MAX_PLE_NGRAM>>(enum llm_kv kid, std::array<uint64_t, LLAMA_MAX_PLE_NGRAM> & result, bool required);
     template bool llama_model_loader::get_arr<std::array<uint64_t, LLAMA_MAX_PLE_HEADS>>(enum llm_kv kid, std::array<uint64_t, LLAMA_MAX_PLE_HEADS> & result, bool required);
 
@@ -444,6 +446,8 @@ namespace GGUFMeta {
     template bool llama_model_loader::get_key<bool>       (enum llm_kv kid, bool & result,        bool required);
     template bool llama_model_loader::get_key<float>      (enum llm_kv kid, float & result,       bool required);
     template bool llama_model_loader::get_key<uint32_t>   (enum llm_kv kid, uint32_t & result,    bool required);
+    template bool llama_model_loader::get_key<uint32_t>   (const std::string & key, uint32_t & result, bool required);
+    template bool llama_model_loader::get_key<int32_t>    (enum llm_kv kid, int32_t & result,     bool required);
     template bool llama_model_loader::get_key<std::string>(enum llm_kv kid, std::string & result, bool required);
 
     template<>
@@ -675,6 +679,42 @@ llama_model_loader::llama_model_loader(
             }
 
             LLAMA_LOG_INFO("%s: additional %d GGUFs metadata loaded.\n",  __func__, n_split - 1);
+        }
+
+        // DeepSeek-V4.1 in the ISTA layout keeps its Engram tables in a GGUF of their own, named by <arch>.engram.file and
+        // kept next to the model
+        const int engram_kid = gguf_find_key(metadata, (arch_name + ".engram.file").c_str());
+        if (engram_kid >= 0) {
+            const size_t dir_end = fname.find_last_of("/\\");
+            const std::string engram_path = (dir_end == std::string::npos ? std::string() : fname.substr(0, dir_end + 1)) +
+                gguf_get_val_str(metadata, engram_kid);
+
+            struct gguf_init_params engram_params = {
+                /*.no_alloc = */ true,
+                /*.ctx      = */ &ctx,
+            };
+            gguf_context_ptr ctx_gguf { gguf_init_from_file(engram_path.c_str(), engram_params) };
+            if (!ctx_gguf) {
+                throw std::runtime_error(format("%s: failed to load the Engram GGUF %s", __func__, engram_path.c_str()));
+            }
+
+            files.emplace_back(new llama_file(engram_path.c_str(), "rb", use_direct_io));
+            contexts.emplace_back(ctx);
+
+            const uint16_t engram_idx = (uint16_t) (files.size() - 1);
+            int n_engram = 0;
+            for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
+                std::string tensor_name = std::string(cur->name);
+                if (weights_map.find(tensor_name) != weights_map.end()) {
+                    throw std::runtime_error(format("invalid model: tensor '%s' is duplicated", ggml_get_name(cur)));
+                }
+                n_elements += ggml_nelements(cur);
+                n_bytes    += ggml_nbytes(cur);
+                weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), engram_idx, ctx_gguf.get(), cur));
+                n_engram++;
+            }
+
+            LLAMA_LOG_INFO("%s: %d Engram tensors from %s\n", __func__, n_engram, engram_path.c_str());
         }
     } else if (file != nullptr) {
         struct ggml_context * ctx = NULL;
@@ -1323,6 +1363,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             if (!buft) {
                 throw std::runtime_error(format("failed to find a compatible buffer type for tensor %s", tn.str().c_str()));
             }
+        }
+
+        // the deepseek41 Engram table (~200 GB) is a CPU get_rows gather table: never put it in device memory
+        if (get_arch() == LLM_ARCH_DEEPSEEK41 && tn.tensor == LLM_TENSOR_PER_LAYER_TOKEN_EMBD && !ggml_backend_buft_is_host(buft)) {
+            LLAMA_LOG_WARN("llama_model_loader: %s (%zu MiB %s) must stay in host memory; ignoring placement on %s, using %s\n",
+                    tn.str().c_str(), ggml_nbytes(t_meta) / 1024 / 1024, ggml_type_name(t_meta->type),
+                    ggml_backend_buft_name(buft), ggml_backend_buft_name(ggml_backend_cpu_buffer_type()));
+            buft = ggml_backend_cpu_buffer_type();
         }
 
         // avoid using a host buffer when using mmap, unless the device cannot pin mapped memory: then the weights
