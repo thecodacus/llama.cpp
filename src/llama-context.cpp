@@ -120,6 +120,9 @@ llama_context::llama_context(
     cparams.offload_kqv             = params.offload_kqv;
     cparams.sched_async_cpu         = params.sched_async_cpu;
     cparams.moe_cache_borrow        = 0;
+    cparams.moe_cache_dyn           = 0;
+    cparams.moe_cache_mask          = -1;
+    cparams.moe_cache_decay         = 0.9f;
     cparams.moe_packs_off           = !model.moe_cache_resident();
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
@@ -289,6 +292,9 @@ llama_context::llama_context(
             borrow = 0;
         }
         cparams.moe_cache_borrow = (uint32_t) borrow;
+        cparams.moe_cache_dyn    = (uint32_t) std::max(0, model.moe_cache_dyn_param());
+        cparams.moe_cache_mask   = model.moe_cache_mask_param();
+        cparams.moe_cache_decay  = model.moe_cache_decay_param();
         if (borrow > 0) {
             LLAMA_LOG_INFO("%s: batches of %d+ tokens borrow the expert cache memory\n", __func__, borrow);
         }
@@ -2279,9 +2285,9 @@ void llama_context::moe_dyn_finish() {
 }
 
 void llama_context::moe_dyn_after(uint32_t n_tokens) {
-    static const int   win   = getenv("GGML_MOE_CACHE_DYN")   ? atoi(getenv("GGML_MOE_CACHE_DYN"))   : 0;
-    static const float decay = getenv("GGML_MOE_CACHE_DECAY") ? atof(getenv("GGML_MOE_CACHE_DECAY")) : 0.9f;
-    if (win <= 0 || !moe_cache_on || cparams.moe_packs_off || !model.moe_cache_resident()) {
+    const uint32_t win   = cparams.moe_cache_dyn;
+    const float    decay = cparams.moe_cache_decay;
+    if (win == 0 || !moe_cache_on || cparams.moe_packs_off || !model.moe_cache_resident()) {
         return;
     }
     // the maps change between graphs only: wait for this decode's graph before touching them
@@ -2290,7 +2296,7 @@ void llama_context::moe_dyn_after(uint32_t n_tokens) {
         moe_dyn_finish();
     }
     moe_dyn_since += n_tokens;
-    if (moe_dyn_since < (uint32_t) win) {
+    if (moe_dyn_since < win) {
         return;
     }
     moe_dyn_since = 0;

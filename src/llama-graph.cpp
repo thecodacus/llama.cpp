@@ -2111,11 +2111,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(selection_probs, "ffn_moe_probs_masked", il);
     }
 
-    // MoE expert cache demand count (fork): GGML_MOE_CACHE_COUNT=1 (or GGML_MOE_CACHE_DYN) adds the router's raw top-k picks of every batch that
-    // uses the pack to the layer's moe_demand counters (read and reset by llama_model_moe_cache_take_demand)
-    static const bool moe_count = getenv("GGML_MOE_CACHE_COUNT") != nullptr ||
-        (getenv("GGML_MOE_CACHE_DYN") != nullptr && atoi(getenv("GGML_MOE_CACHE_DYN")) > 0);
-    if (selected_experts_in == nullptr && moe_count && moe_cache && moe_cache->moe_demand && !cparams.moe_packs_off) {
+    // MoE expert cache demand count (fork): with --moe-cache-dyn, the router's raw top-k picks of every batch that uses
+    // the pack are added to the layer's moe_demand counters (read and reset by llama_model_moe_cache_take_demand)
+    if (selected_experts_in == nullptr && cparams.moe_cache_dyn > 0 && moe_cache && moe_cache->moe_demand && !cparams.moe_packs_off) {
         ggml_tensor * top    = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [k, n_tokens]
         ggml_tensor * vals   = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, selection_probs, 1, n_expert, n_tokens), top); // [1, k, n_tokens]
         ggml_tensor * thresh = ggml_cont(ctx0, ggml_view_2d(ctx0, vals, 1, n_tokens, vals->nb[2], (n_expert_used - 1)*vals->nb[1])); // k-th score
@@ -2125,9 +2123,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, demand, moe_cache->moe_demand));
     }
 
-    // MoE expert cache hot mask (fork): GGML_MOE_CACHE_MASK=N restricts routing to the GPU pack except the
-    // router's top-N raw picks (N=0: pack only). Unset/-1: lossless, routing untouched.
-    static const int moe_mask_honor = getenv("GGML_MOE_CACHE_MASK") ? atoi(getenv("GGML_MOE_CACHE_MASK")) : -1;
+    // MoE expert cache hot mask (fork): --moe-cache-mask N restricts routing to the GPU pack except the
+    // router's top-N raw picks (N=0: pack only). -1 (default): lossless, routing untouched.
+    const int moe_mask_honor = cparams.moe_cache_mask;
     if (selected_experts_in == nullptr && moe_mask_honor >= 0 && moe_cache && moe_cache->moe_bias_hot && !cparams.moe_packs_off) {
         ggml_tensor * masked = ggml_add(ctx0, selection_probs, moe_cache->moe_bias_hot); // [n_expert, n_tokens]
         if (moe_mask_honor > 0) {
