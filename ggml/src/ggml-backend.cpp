@@ -21,6 +21,7 @@
 #include <string.h>
 #include <algorithm>
 #include <condition_variable>
+#include <deque>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -801,6 +802,69 @@ struct ggml_backend_sched_split {
 // async execution of CPU splits (GGML_SCHED_ASYNC_CPU): a persistent worker
 // computes a CPU split while the main thread keeps launching later splits that
 // do not depend on it, so an independent GPU split overlaps the CPU compute
+// GGML_SCHED_READAHEAD=N: N threads fault in the pages of the host weights the next splits copy to a device, so a
+// weight in a memory-mapped file (a model larger than RAM) is read with N requests in flight instead of one page fault
+// at a time; GGML_SCHED_READAHEAD_MB (default 8192) bounds how far ahead of the running split they read
+struct ggml_sched_readahead {
+    std::vector<std::thread> workers;
+    std::mutex m;
+    std::condition_variable cv;
+    std::deque<std::pair<const char *, size_t>> q;
+    bool stop = false;
+
+    explicit ggml_sched_readahead(int n) {
+        for (int i = 0; i < n; i++) {
+            workers.emplace_back([this] { run(); });
+        }
+    }
+
+    ~ggml_sched_readahead() {
+        {
+            std::lock_guard<std::mutex> lk(m);
+            stop = true;
+            q.clear();
+        }
+        cv.notify_all();
+        for (auto & w : workers) {
+            w.join();
+        }
+    }
+
+    void enqueue(const void * data, size_t size) {
+        const size_t chunk = 4u << 20;
+        {
+            std::lock_guard<std::mutex> lk(m);
+            for (size_t off = 0; off < size; off += chunk) {
+                q.emplace_back((const char *) data + off, std::min(chunk, size - off));
+            }
+        }
+        cv.notify_all();
+    }
+
+    void run() {
+        for (;;) {
+            std::pair<const char *, size_t> c;
+            {
+                std::unique_lock<std::mutex> lk(m);
+                cv.wait(lk, [this] { return stop || !q.empty(); });
+                if (stop) {
+                    return;
+                }
+                c = q.front();
+                q.pop_front();
+            }
+            // one read per page faults it in; the sum keeps the reads from being optimized out
+            volatile char sink = 0;
+            char acc = 0;
+            for (size_t off = 0; off < c.second; off += 4096) {
+                acc += c.first[off];
+            }
+            sink = acc;
+            (void) sink;
+        }
+    }
+};
+
 struct ggml_sched_cpu_async {
     std::thread             worker;
     std::mutex              mtx;
@@ -945,6 +1009,10 @@ struct ggml_backend_sched {
 
     // async CPU split execution (GGML_SCHED_ASYNC_CPU); NULL when disabled
     struct ggml_sched_cpu_async * cpu_async;
+
+    // host readahead (GGML_SCHED_READAHEAD); NULL when disabled
+    struct ggml_sched_readahead * readahead;
+    size_t readahead_bytes;
 
     int debug;
 
@@ -1987,10 +2055,40 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     int prev_backend_id = -1;
 
+    // host readahead: the host weights a device split copies in, queued up to readahead_bytes ahead of the running split
+    int    ra_next   = 0;   // the next split whose weights are not queued yet
+    size_t ra_queued = 0;   // bytes queued so far
+    size_t ra_passed = 0;   // bytes of the splits already run
+    auto ra_weights = [sched](struct ggml_backend_sched_split * sp, bool queue) -> size_t {
+        ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[sp->backend_id]);
+        if (dev == NULL || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            return 0;
+        }
+        size_t n = 0;
+        for (int j = 0; j < sp->n_inputs; j++) {
+            const ggml_tensor * in = sp->inputs[j];
+            if (in->buffer == NULL || in->data == NULL || !ggml_backend_buffer_is_host(in->buffer) ||
+                ggml_backend_buffer_get_usage(in->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS || ggml_nbytes(in) < (1u << 20)) {
+                continue;
+            }
+            n += ggml_nbytes(in);
+            if (queue) {
+                sched->readahead->enqueue(in->data, ggml_nbytes(in));
+            }
+        }
+        return n;
+    };
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        if (sched->readahead) {
+            while (ra_next < sched->n_splits && (ra_next <= split_id || ra_queued - ra_passed < sched->readahead_bytes)) {
+                ra_queued += ra_weights(&splits[ra_next++], true);
+            }
+            ra_passed += ra_weights(split, false);
+        }
         // expert weights of this split staged through prefetch slots, restored after the split is launched
         int n_split_prefetch = 0;
         int split_set = 0;
@@ -2398,6 +2496,12 @@ ggml_backend_sched_t ggml_backend_sched_new(
         sched->prefetch[b].n_slots = prefetch_n_slots <= 1 ? 3 : std::min(prefetch_n_slots, GGML_SCHED_MAX_PREFETCH_SLOTS);
     }
 
+    const char * GGML_SCHED_READAHEAD = getenv("GGML_SCHED_READAHEAD");
+    const int readahead_threads = GGML_SCHED_READAHEAD ? atoi(GGML_SCHED_READAHEAD) : 0;
+    sched->readahead = readahead_threads > 0 ? new ggml_sched_readahead(readahead_threads) : NULL;
+    const char * GGML_SCHED_READAHEAD_MB = getenv("GGML_SCHED_READAHEAD_MB");
+    sched->readahead_bytes = (size_t) (GGML_SCHED_READAHEAD_MB ? atoll(GGML_SCHED_READAHEAD_MB) : 8192) << 20;
+
 
     ggml_backend_sched_reset(sched);
 
@@ -2428,6 +2532,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         }
     }
     delete sched->cpu_async;
+    delete sched->readahead;
     delete sched->prefetch_resident;
     ggml_gallocr_free(sched->galloc);
     ggml_free(sched->ctx);

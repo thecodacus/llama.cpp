@@ -22,6 +22,27 @@ static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
 
+// RAM the kernel can hand out without swapping (0 = unknown)
+static size_t llama_ram_available() {
+#ifdef __linux__
+    FILE * f = fopen("/proc/meminfo", "r");
+    if (!f) {
+        return 0;
+    }
+    char line[256];
+    size_t kb = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (sscanf(line, "MemAvailable: %zu kB", &kb) == 1) {
+            break;
+        }
+    }
+    fclose(f);
+    return kb*kiB;
+#else
+    return 0;
+#endif
+}
+
 const char * llama_file_version_name(llama_fver version) {
     switch (version) {
         case GGUF_FILE_VERSION_V1: return "GGUF V1 (support until nov 2023)";
@@ -1540,6 +1561,23 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
 void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
     // note: read_lazy also requires mmap; this condition make sure it's usable even when --load-mode is not set to mmap
     if (use_mmap || lazy.any()) {
+        // prefetching more than fits in free RAM reads the files once and evicts most of it again before use:
+        // then the pages come in when they are used
+        if (prefetch && use_mmap) {
+            size_t n_prefetch = 0;
+            for (uint32_t idx = 0; idx < files.size(); idx++) {
+                n_prefetch += files[idx]->size();
+                for (const auto & range : lazy.for_file(idx)) {
+                    n_prefetch -= std::min(range.second - range.first, n_prefetch);
+                }
+            }
+            const size_t avail = llama_ram_available();
+            if (avail > 0 && n_prefetch > avail) {
+                LLAMA_LOG_INFO("%s: the model (%.1f GiB) is larger than the free RAM (%.1f GiB): not prefetching it\n",
+                        __func__, n_prefetch / (double) GiB, avail / (double) GiB);
+                prefetch = false;
+            }
+        }
         mappings.reserve(files.size());
         mmaps_used.reserve(files.size());
         mmaps_pin.reserve(files.size());
