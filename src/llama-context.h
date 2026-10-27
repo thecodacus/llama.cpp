@@ -353,7 +353,7 @@ private:
     // this context builds and lends the MoE expert cache packs of the model
     bool moe_cache_on = false;
 
-    // dynamic re-election of the packs (fork, GGML_MOE_CACHE_DYN): uploads run on moe_dyn_worker while decoding goes on
+    // dynamic re-election of the packs (fork, --moe-cache-dyn): uploads run on moe_dyn_worker while decoding goes on
     std::thread moe_dyn_worker;
     std::atomic<bool> moe_dyn_done{false};
     std::vector<int> moe_dyn_layers;               // layers with uploads in flight

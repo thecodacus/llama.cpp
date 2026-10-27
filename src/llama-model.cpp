@@ -1915,13 +1915,15 @@ void llama_model_base::init_moe_expert_cache() {
             n_slots = atoi(slots_env);
         }
     }
-    if (profile_path == nullptr || profile_path[0] == '\0' || n_slots == 0) {
+    // without a profile the cache is on only with --moe-cache-dyn, which re-elects its experts from the live routing
+    const bool no_profile = profile_path == nullptr || profile_path[0] == '\0';
+    if ((no_profile && params.moe_cache_dyn <= 0) || n_slots == 0) {
         return;
     }
 
     // routing profile: moe-trace CSV (pos,layer,id0,...), decode rows only
     std::map<int, std::map<int, int64_t>> freq; // layer -> expert -> count
-    {
+    if (!no_profile) {
         FILE * f = fopen(profile_path, "r");
         if (!f) {
             LLAMA_LOG_WARN("%s: cannot open profile '%s' - expert cache disabled\n", __func__, profile_path);
@@ -1944,9 +1946,12 @@ void llama_model_base::init_moe_expert_cache() {
         }
         fclose(f);
     }
-    if (freq.empty()) {
+    if (!no_profile && freq.empty()) {
         LLAMA_LOG_WARN("%s: profile '%s' has no decode rows - expert cache disabled\n", __func__, profile_path);
         return;
+    }
+    if (no_profile) {
+        LLAMA_LOG_INFO("%s: expert cache without a profile: it starts from the first experts of each layer and re-elects them every %d tokens\n", __func__, params.moe_cache_dyn);
     }
 
     ggml_backend_dev_t dev_first = nullptr;
@@ -1963,7 +1968,7 @@ void llama_model_base::init_moe_expert_cache() {
     std::map<ggml_backend_dev_t, std::vector<int>> pack_layers_by_dev;
     for (int il = 0; il < (int) layers.size(); il++) {
         const auto & l = layers[il];
-        if (l.ffn_gate_exps && l.ffn_up_exps && l.ffn_down_exps && freq.count(il) &&
+        if (l.ffn_gate_exps && l.ffn_up_exps && l.ffn_down_exps && (no_profile || freq.count(il)) &&
             l.ffn_gate_exps->buffer && ggml_backend_buft_is_host(ggml_backend_buffer_get_type(l.ffn_gate_exps->buffer))) {
             ggml_backend_dev_t dev = dev_layer(il);
             if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
@@ -1985,7 +1990,12 @@ void llama_model_base::init_moe_expert_cache() {
         for (int il : pack_layers) {
             const int64_t n_expert = layers[il].ffn_gate_exps->ne[2];
 
-            std::vector<std::pair<int64_t, int32_t>> ranked; // (-count, expert)
+            std::vector<std::pair<int64_t, int32_t>> ranked; // (-count, expert); no profile: every expert, in order
+            if (no_profile) {
+                for (int64_t e = 0; e < n_expert; e++) {
+                    ranked.push_back({0, (int32_t) e});
+                }
+            }
             for (const auto & [e, c] : freq[il]) {
                 if (e < n_expert) {
                     ranked.push_back({-c, e});
@@ -2100,6 +2110,18 @@ bool llama_model::moe_cache_auto() const {
 
 int32_t llama_model::moe_cache_borrow_param() const {
     return params.moe_cache_borrow;
+}
+
+int32_t llama_model::moe_cache_dyn_param() const {
+    return params.moe_cache_dyn;
+}
+
+int32_t llama_model::moe_cache_mask_param() const {
+    return params.moe_cache_mask;
+}
+
+float llama_model::moe_cache_decay_param() const {
+    return params.moe_cache_decay;
 }
 
 void llama_model::moe_cache_release() const {
@@ -3093,6 +3115,9 @@ llama_model_params llama_model_default_params() {
         /*.moe_cache_slots             =*/ -1,
         /*.moe_cache_margin            =*/ 512,
         /*.moe_cache_borrow            =*/ -1,
+        /*.moe_cache_dyn               =*/ 0,
+        /*.moe_cache_mask              =*/ -1,
+        /*.moe_cache_decay             =*/ 0.9f,
         /*.model_shared                =*/ nullptr,
         /*.vocab_only                  =*/ false,
         /*.check_tensors               =*/ false,

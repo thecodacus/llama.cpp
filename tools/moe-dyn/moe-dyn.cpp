@@ -10,10 +10,8 @@
 //                     DYN_SAMPLE decode steps via the eval callback), applied with
 //                     llama_model_moe_cache_set_hot (resident experts stay, new ones are uploaded)
 //   DYN_MODE=static_cb  like static, but with the eval callback installed (measures the hook's own overhead)
-//   DYN_MODE=dyn2     like dyn, but the router demand is counted inside the graph (needs GGML_MOE_CACHE_COUNT=1,
-//                     every step, no eval callback) and the uploads run on a worker thread while decoding goes on:
-//                     begin_hot (between decodes) -> upload (worker) -> end_hot (after the decode the worker finished in)
-//   GGML_MOE_CACHE_MASK=N (read by the graph) restricts routing to the pack except the top-N raw picks.
+// The library's own re-election (in-graph counts, uploads on a worker thread) runs with --moe-cache-dyn N in any mode,
+// best with static; --moe-cache-mask N restricts routing to the pack except the top-N raw picks.
 //
 // The cache persists across tasks, as in a server. Output: jsonl {"id","output"} per task + a RESULT line.
 //
@@ -32,10 +30,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
-#include <atomic>
 #include <map>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -124,10 +120,10 @@ int main(int argc, char ** argv) {
         if (s > 0) { n_cached++; slots = s; }
     }
     LOG_INF("mode=%s cached layers=%d slots=%d mask=%s win=%d sample=%d\n", mode.c_str(), n_cached, slots,
-            getenv("GGML_MOE_CACHE_MASK") ? getenv("GGML_MOE_CACHE_MASK") : "off", win, sample);
+            params.moe_cache_mask >= 0 ? std::to_string(params.moe_cache_mask).c_str() : "off", win, sample);
 
-    long long uploads = 0, reelections = 0, skipped = 0;
-    double t_reelect = 0, t_prefill = 0, t_decode = 0, t_upload = 0;
+    long long uploads = 0, reelections = 0;
+    double t_reelect = 0, t_prefill = 0, t_decode = 0;
     long long n_prefill = 0, n_decode = 0, since = 0;
     using clk = std::chrono::steady_clock;
 
@@ -151,51 +147,6 @@ int main(int argc, char ** argv) {
         t_reelect += std::chrono::duration<double>(clk::now() - t0).count();
     };
 
-    // dyn2: async re-election
-    std::thread worker;
-    std::atomic<bool> worker_done{false};
-    std::vector<int> pending_layers;
-    std::vector<float> demand;
-    auto finish = [&]() {   // between decodes: wait for the uploads, then route to the new experts
-        if (!worker.joinable()) return;
-        const auto t0 = clk::now();
-        worker.join();
-        for (int il : pending_layers) llama_model_moe_cache_end_hot(model, il);
-        pending_layers.clear();
-        t_reelect += std::chrono::duration<double>(clk::now() - t0).count();
-    };
-    auto reelect2 = [&]() {
-        if (worker.joinable()) { skipped++; return; }   // the previous uploads are still running
-        const auto t0 = clk::now();
-        std::vector<int> order;
-        for (int il = 0; il < n_layer; il++) {
-            const int S = llama_model_moe_cache_slots(model, il);
-            if (S <= 0) continue;
-            demand.resize(4096);   // >= n_expert
-            const int ne = llama_model_moe_cache_take_demand(model, il, demand.data(), (int) demand.size());
-            if (ne <= 0) continue;
-            auto & sc = score[il];
-            if (sc.empty()) sc.assign(ne, 0.0f);
-            for (int e = 0; e < ne; e++) sc[e] = sc[e] * decay + demand[e];
-            order.resize(ne);
-            for (int e = 0; e < ne; e++) order[e] = e;
-            const int Sk = std::min(S, ne);
-            std::partial_sort(order.begin(), order.begin() + Sk, order.end(), [&sc](int a, int b) { return sc[a] > sc[b]; });
-            const int32_t up = llama_model_moe_cache_begin_hot(model, il, order.data(), Sk);
-            if (up > 0) { uploads += up; pending_layers.push_back(il); }
-        }
-        reelections++;
-        t_reelect += std::chrono::duration<double>(clk::now() - t0).count();
-        if (pending_layers.empty()) return;
-        worker_done = false;
-        worker = std::thread([&, layers = pending_layers]() {
-            const auto tw = clk::now();
-            for (int il : layers) llama_model_moe_cache_upload(model, il);
-            t_upload += std::chrono::duration<double>(clk::now() - tw).count();
-            worker_done = true;
-        });
-    };
-
     std::ifstream tf(tasks_path);
     FILE * out = fopen(out_path, "w");
     std::string line;
@@ -208,7 +159,6 @@ int main(int argc, char ** argv) {
         const std::string id = task["id"];
         const int max_new = task.value("max_tokens", 400);
         llama_memory_clear(llama_get_memory(ctx), true);
-        finish();   // a prefill batch may free the packs, no uploads may be in flight then
         std::vector<llama_token> ptoks = common_tokenize(ctx, task["prompt"].get<std::string>(), false, true);
         int pos = 0;
         auto t0 = clk::now();
@@ -227,7 +177,6 @@ int main(int argc, char ** argv) {
         t_prefill += prefill_s;
         n_prefill += (long long) ptoks.size();
         if (mode == "dyn") { reelect(); since = 0; }   // the prompt sets the topic before decoding starts
-        if (mode == "dyn2") { reelect2(); since = 0; }
 
         std::string text;
         t0 = clk::now();
@@ -243,10 +192,6 @@ int main(int argc, char ** argv) {
             if (llama_decode(ctx, batch)) { LOG_ERR("decode failed on %s\n", id.c_str()); return 1; }
             n_decode++;
             if (mode == "dyn" && ++since >= win) { reelect(); since = 0; }
-            if (mode == "dyn2") {
-                if (worker.joinable() && worker_done) finish();
-                if (++since >= win) { reelect2(); since = 0; }
-            }
         }
         t_decode += std::chrono::duration<double>(clk::now() - t0).count();
         nlohmann::json o = {{"id", id}, {"output", text}, {"prefill_tokens", ptoks.size()}, {"prefill_s", prefill_s}};
@@ -256,7 +201,6 @@ int main(int argc, char ** argv) {
             LOG_INF("%d tasks, decode %.1f tok/s, prefill %.1f tok/s\n", n_done, n_decode / t_decode, n_prefill / t_prefill);
         }
     }
-    finish();
     fclose(out);
     llama_batch_free(batch);
     n_cached = 0;
@@ -265,11 +209,11 @@ int main(int argc, char ** argv) {
         if (s > 0) { n_cached++; slots = std::max(slots, s); }
     }
     LOG_INF("RESULT mode=%s mask=%s slots=%d tasks=%d prefill=%.1f tok/s decode=%.2f tok/s decode_tokens=%lld "
-            "reelections=%lld uploads/reelection/layer=%.2f reelect_time=%.1fs (%.1f%% of decode) skipped=%lld upload_time=%.1fs\n",
-            mode.c_str(), getenv("GGML_MOE_CACHE_MASK") ? getenv("GGML_MOE_CACHE_MASK") : "off", slots, n_done,
+            "reelections=%lld uploads/reelection/layer=%.2f reelect_time=%.1fs (%.1f%% of decode)\n",
+            mode.c_str(), params.moe_cache_mask >= 0 ? std::to_string(params.moe_cache_mask).c_str() : "off", slots, n_done,
             n_prefill / t_prefill, n_decode / t_decode, n_decode, reelections,
             reelections && n_cached ? (double) uploads / reelections / n_cached : 0.0, t_reelect,
-            100.0 * t_reelect / std::max(1e-9, t_decode), skipped, t_upload);
+            100.0 * t_reelect / std::max(1e-9, t_decode));
     llama_backend_free();
     return 0;
 }

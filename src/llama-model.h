@@ -347,7 +347,7 @@ struct llama_layer {
     struct ggml_tensor * moe_map_cold      = nullptr; // i32[n_expert]: global id or -1
     struct ggml_tensor * moe_bias_hot      = nullptr; // f32[n_expert]: 0 if in the pack, -1e30 if not (hot mask)
     std::vector<int32_t> moe_slot_expert;              // host: pack slot -> expert id (moe_hot_ids points here)
-    struct ggml_tensor * moe_demand        = nullptr; // f32[n_expert]: raw router top-k picks since the last take (GGML_MOE_CACHE_COUNT)
+    struct ggml_tensor * moe_demand        = nullptr; // f32[n_expert]: raw router top-k picks since the last take (--moe-cache-dyn)
     std::vector<std::pair<int64_t, int32_t>> moe_pending; // async re-pack: (slot, expert) uploads between begin_hot and end_hot
     const int32_t      * moe_hot_ids       = nullptr; // host copy: the experts in the pack, ffn_gate_exps_hot->ne[2] of them
     struct ggml_tensor * ffn_gate_inp_b    = nullptr;
@@ -758,6 +758,9 @@ struct llama_model {
     bool    moe_cache_built()        const; // packs were built at least once (at load for a fixed slot count)
     bool    moe_cache_auto()         const;
     int32_t moe_cache_borrow_param() const;
+    int32_t moe_cache_dyn_param()    const;
+    int32_t moe_cache_mask_param()   const;
+    float   moe_cache_decay_param()  const;
 
     // free all packs
     void moe_cache_release() const;
