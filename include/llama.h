@@ -375,6 +375,7 @@ extern "C" {
         uint32_t n_rs_seq;              // number of recurrent-state snapshots per seq for rollback (0 = no rollback) [EXPERIMENTAL]
         uint32_t n_outputs_max;         // max outputs in a ubatch (0 = n_batch)
         uint32_t n_outputs_max_per_seq; // max outputs per sequence (0 = n_outputs_max)
+        uint32_t n_layer_major;         // a batch of several ubatches runs this many layers over all its ubatches, then the next layers (0 = off)
         int32_t  n_threads;             // number of threads to use for generation
         int32_t  n_threads_batch;       // number of threads to use for batch processing
 

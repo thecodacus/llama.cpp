@@ -2508,6 +2508,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
     return sched;
 }
 
+bool ggml_backend_sched_readahead(ggml_backend_sched_t sched, const void * data, size_t size) {
+    if (!sched->readahead) {
+        return false;
+    }
+    sched->readahead->enqueue(data, size);
+    return true;
+}
+
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;

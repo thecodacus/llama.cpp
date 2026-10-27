@@ -363,6 +363,14 @@ private:
     void moe_dyn_after(uint32_t n_tokens); // end of a decode
     void moe_dyn_finish();                 // wait for the uploads and route to them
 
+    // layer-major prompt processing (fork, --layer-major): the layer range of the next graph, and per ubatch the
+    // tensors one range passes on to the next
+    int32_t lm_il_start = 0;
+    int32_t lm_il_end   = 0;
+    const llm_graph_carry * lm_carry_in = nullptr;
+    std::vector<llm_graph_carry> lm_carry;
+    void readahead_layers(int32_t il0, int32_t il1); // queue the host weights of these layers on the readahead threads
+
     // the configured ubatch: while the cache is lent, n_ubatch is the largest size up to this that fits in its memory
     uint32_t n_ubatch_max = 0;
 

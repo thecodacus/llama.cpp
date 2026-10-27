@@ -257,6 +257,12 @@ llama_context::llama_context(
     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
             cparams.n_outputs_max : std::min(params.n_outputs_max_per_seq, cparams.n_outputs_max);
 
+    cparams.n_layer_major = params.n_layer_major;
+    if (cparams.n_layer_major > 0 && !model.graph_layer_ranges()) {
+        LLAMA_LOG_WARN("%s: --layer-major is not supported by this model, disabling it\n", __func__);
+        cparams.n_layer_major = 0;
+    }
+
     // Initialize backend samplers here so they are part of the sampling graph
     // before the reserve passes run later in this function. This avoids a later
     // re-reserve when graph nodes change.
@@ -344,6 +350,9 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: n_rs_seq              = %u\n",   __func__, cparams.n_rs_seq);
     LLAMA_LOG_INFO("%s: n_outputs_max         = %u\n",   __func__, cparams.n_outputs_max);
     LLAMA_LOG_INFO("%s: n_outputs_max_per_seq = %u\n",   __func__, cparams.n_outputs_max_per_seq);
+    if (cparams.n_layer_major > 0) {
+        LLAMA_LOG_INFO("%s: n_layer_major         = %u\n",   __func__, cparams.n_layer_major);
+    }
 
     if (cparams.n_ctx_seq < hparams.n_ctx_train) {
         LLAMA_LOG_INFO("%s: n_ctx_seq (%u) < n_ctx_train (%u) -- the full capacity of the model will not be utilized\n",
@@ -1856,6 +1865,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     n_decode_calls++;
 
+    lm_il_start = 0;
+    lm_il_end   = 0;
+    lm_carry_in = nullptr;
+    lm_carry.clear();
+
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -2025,11 +2039,101 @@ int llama_context::decode(const llama_batch & batch_inp) {
         llama_sampler_backend_begin(entry.second);
     }
 
+    // MoE expert cache: build it on first use (fitted slots), lend its memory to large batches, upload it again after.
+    // fitted slots wait for the second decode: the first is the warm-up, which runs before a draft model is loaded
+    const auto moe_cache_borrow = [&](uint32_t n_tokens) {
+        if (moe_cache_on && (n_decode_calls > 1 || !model.moe_cache_auto())) {
+            const bool off = cparams.moe_cache_borrow > 0 && n_tokens >= cparams.moe_cache_borrow;
+            if (off != cparams.moe_packs_off) {
+                moe_cache_switch(off);
+            }
+        }
+    };
+
+    // layer-major: the layer ranges before the last one run over all ubatches first, so each range's weights are
+    // read once per batch; the loop below runs the last range. the cache is lent or not for the whole batch
+    const bool layer_major = cparams.n_layer_major > 0 && cparams.n_layer_major < hparams.n_layer() &&
+        n_tokens_all > cparams.n_ubatch && !cparams.embeddings &&
+        std::find(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(), true) == cparams.embeddings_layer_inp.end() &&
+        mctx->replay();
+    if (layer_major) {
+        moe_cache_borrow(mctx->get_ubatch().n_tokens);
+
+        const int32_t n_layer = (int32_t) hparams.n_layer();
+        const int32_t n_group = (int32_t) cparams.n_layer_major;
+        const int32_t il_last = ((n_layer - 1)/n_group)*n_group;
+
+        lm_carry.clear();
+        for (int32_t il0 = 0; il0 < il_last; il0 += n_group) {
+            mctx->rewind();
+            size_t iu = 0;
+            do {
+                const auto & ubatch = mctx->get_ubatch();
+                if (iu == lm_carry.size()) {
+                    lm_carry.emplace_back();
+                }
+                lm_il_start = il0;
+                lm_il_end   = il0 + n_group;
+                lm_carry_in = &lm_carry[iu];
+                n_outputs   = 0;
+
+                ggml_status status;
+                const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+                if (!res) {
+                    // every ubatch of the batch has layers without KV: remove the whole batch from the memory
+                    for (llama_seq_id s = 0; s < (llama_seq_id) cparams.n_seq_max; ++s) {
+                        const llama_pos p0 = balloc->seq_pos_min(s);
+                        if (p0 >= 0) {
+                            memory->seq_rm(s, p0, -1);
+                        }
+                    }
+                    lm_il_start = 0;
+                    lm_il_end   = 0;
+                    lm_carry_in = nullptr;
+                    switch (status) {
+                        case GGML_STATUS_ABORTED:      return  2;
+                        case GGML_STATUS_ALLOC_FAILED: return -2;
+                        case GGML_STATUS_FAILED:       return -3;
+                        case GGML_STATUS_SUCCESS:      GGML_ABORT("should not happen");
+                    }
+                }
+
+                llm_graph_carry next;
+                for (const auto & [name, t] : res->t_carry) {
+                    auto & item = next[name];
+                    item.type = t->type;
+                    std::copy(t->ne, t->ne + GGML_MAX_DIMS, item.ne);
+                    item.data.resize(ggml_nbytes(t));
+                    ggml_backend_t backend_t = ggml_backend_sched_get_tensor_backend(sched.get(), t);
+                    GGML_ASSERT(backend_t != nullptr);
+                    ggml_backend_tensor_get_async(backend_t, t, item.data.data(), 0, item.data.size());
+                }
+                ggml_backend_sched_synchronize(sched.get());
+                lm_carry[iu] = std::move(next);
+
+                // the next range's weights come in while the other ubatches run this range from RAM
+                if (iu == 0) {
+                    readahead_layers(il0 + n_group, il0 + 2*n_group);
+                }
+                ++iu;
+            } while (mctx->next());
+        }
+
+        mctx->rewind();
+        lm_il_start = il_last;
+        lm_il_end   = 0;
+    }
+
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
+    size_t  i_ubatch       = 0;
 
     do {
         const auto & ubatch = mctx->get_ubatch();
+
+        if (layer_major) {
+            lm_carry_in = &lm_carry[i_ubatch];
+        }
 
         // count the outputs in this ubatch
         {
@@ -2047,13 +2151,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
             n_outputs = n_outputs_new;
         }
 
-        // MoE expert cache: build it on first use (fitted slots), lend its memory to large batches, upload it again after.
-        // fitted slots wait for the second decode: the first is the warm-up, which runs before a draft model is loaded
-        if (moe_cache_on && (n_decode_calls > 1 || !model.moe_cache_auto())) {
-            const bool off = cparams.moe_cache_borrow > 0 && ubatch.n_tokens >= cparams.moe_cache_borrow;
-            if (off != cparams.moe_packs_off) {
-                moe_cache_switch(off);
-            }
+        if (!layer_major) {
+            moe_cache_borrow(ubatch.n_tokens);
         }
 
         ggml_status status;
@@ -2212,7 +2311,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
+        ++i_ubatch;
     } while (mctx->next());
+
+    lm_il_start = 0;
+    lm_il_end   = 0;
+    lm_carry_in = nullptr;
+    lm_carry.clear();
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
@@ -2789,7 +2894,7 @@ llm_graph_params llama_context::graph_params(
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype) const {
-    return {
+    llm_graph_params params = {
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
         /*.cparams     =*/ cparams,
@@ -2806,6 +2911,24 @@ llm_graph_params llama_context::graph_params(
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
     };
+    params.il_start = lm_il_start;
+    params.il_end   = lm_il_end;
+    params.carry    = lm_carry_in;
+    return params;
+}
+
+void llama_context::readahead_layers(int32_t il0, int32_t il1) {
+    for (const auto & [name, t] : model.tensors_by_name) {
+        int il = -1;
+        if (sscanf(name.c_str(), "blk.%d.", &il) != 1 || il < il0 || il >= il1) {
+            continue;
+        }
+        if (t->buffer && ggml_backend_buffer_is_host(t->buffer) &&
+            ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+            !ggml_backend_sched_readahead(sched.get(), t->data, ggml_nbytes(t))) {
+            return;
+        }
+    }
 }
 
 ggml_status llama_context::graph_compute(
@@ -3941,6 +4064,7 @@ llama_context_params llama_context_default_params() {
         /*.n_rs_seq                    =*/ 0,
         /*.n_outputs_max               =*/ 0,
         /*.n_outputs_max_per_seq       =*/ 1,
+        /*.n_layer_major               =*/ 0,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
         /*.ctx_type                    =*/ LLAMA_CONTEXT_TYPE_DEFAULT,

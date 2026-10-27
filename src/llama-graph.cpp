@@ -1387,6 +1387,8 @@ void llm_graph_result::reset() {
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
 
+    t_carry.clear();
+
     t_sampled.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
@@ -1550,9 +1552,65 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cb_func          (params.cb),
     res              (params.res),
     ctx0             (res->get_ctx()),
-    gf               (res->get_gf()) {
+    gf               (res->get_gf()),
+    il_start         (params.il_start),
+    il_end           (params.il_end > 0 ? params.il_end : (int32_t) n_layer),
+    carry            (params.carry) {
         res->set_params(params);
     }
+
+void llm_graph_input_carry::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+
+    for (const auto & [name, t] : tensors) {
+        // a carried tensor no layer of this range reads is not allocated
+        if (!t->buffer) {
+            continue;
+        }
+        const auto & item = carry->at(name);
+        GGML_ASSERT(item.data.size() == ggml_nbytes(t));
+        ggml_backend_tensor_set(t, item.data.data(), 0, item.data.size());
+    }
+}
+
+bool llm_graph_input_carry::can_reuse(const llm_graph_params & params) {
+    carry = params.carry;
+
+    bool res = carry != nullptr;
+    for (const auto & [name, t] : tensors) {
+        const auto it = res ? carry->find(name) : carry->end();
+        res = res && it != carry->end() && it->second.type == t->type;
+        for (int i = 0; res && i < GGML_MAX_DIMS; ++i) {
+            res = it->second.ne[i] == t->ne[i];
+        }
+    }
+    return res;
+}
+
+ggml_tensor * llm_graph_context::build_carry_in(const char * name) {
+    const auto it = carry ? carry->find(name) : llm_graph_carry::const_iterator();
+    if (!carry || it == carry->end()) {
+        return nullptr;
+    }
+    if (!inp_carry) {
+        inp_carry = static_cast<llm_graph_input_carry *>(res->add_input(std::make_unique<llm_graph_input_carry>(carry)));
+    }
+    const auto & item = it->second;
+    ggml_tensor * t = ggml_new_tensor(ctx0, item.type, GGML_MAX_DIMS, item.ne);
+    ggml_set_input(t);
+    ggml_set_name(t, (std::string("carry-") + name).c_str());
+    inp_carry->tensors.emplace_back(name, t);
+    return t;
+}
+
+void llm_graph_context::build_carry_out(const char * name, ggml_tensor * t) const {
+    if (!ggml_is_contiguous(t)) {
+        t = ggml_cont(ctx0, t);
+    }
+    ggml_set_output(t);
+    ggml_build_forward_expand(gf, t);
+    res->t_carry.emplace_back(name, t);
+}
 
 void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
     if (cb_func) {

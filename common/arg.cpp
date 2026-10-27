@@ -2832,6 +2832,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_BORROW"));
     add_opt(common_arg(
+        {"--layer-major"}, "N",
+        "a batch larger than the ubatch runs N layers over all its ubatches, then the next N, so the weights of each "
+        "layer are read once per batch instead of once per ubatch (for a model larger than RAM; use -b larger than -ub; "
+        "with GGML_SCHED_READAHEAD the next N layers are read while the other ubatches run; default: 0 = off)",
+        [](common_params & params, int value) {
+            params.n_layer_major = value;
+        }
+    ).set_env("LLAMA_ARG_LAYER_MAJOR"));
+    add_opt(common_arg(
         {"--moe-cache-dyn"}, "N",
         "re-elect the cached experts every N decoded tokens from the router's recent picks (the uploads overlap decoding); "
         "without --moe-cache-profile this turns the expert cache on and fills it this way (default: 0 = off)",

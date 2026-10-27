@@ -207,6 +207,9 @@ public:
     bool next() override;
     bool apply() override;
 
+    bool replay() override;
+    void rewind() override;
+
     llama_memory_status get_status() const override;
     const llama_ubatch & get_ubatch() const override;
 
@@ -241,6 +244,10 @@ private:
 
     uint32_t n_kv = 0;
 
+    // replay: the window cells after the first run of each ubatch (a later ubatch can reuse the cells of an earlier one)
+    bool replaying = false;
+    std::vector<llama_kv_cells_vec> cells_after;
+
     const llama_memory_status status;
 };
 
@@ -258,6 +265,7 @@ public:
             std::vector<llama_ubatch> ubatches);
 
     bool next();
+    void rewind() { i_cur = 0; }
 
     uint32_t get_n_kv() const;
 
@@ -359,6 +367,10 @@ public:
 
     bool next()  override;
     bool apply() override;
+
+    // the compressed caches need nothing: their rows are written per layer and their masks come from the plans
+    bool replay() override;
+    void rewind() override;
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;

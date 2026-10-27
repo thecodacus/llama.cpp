@@ -860,9 +860,10 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
     // gathering token and Engram rows in set_input (bitwise the same rows)
     static const bool host_gather = dsv41_env_on("LLAMA_DSV41_HOST_GATHER");
 
-    ggml_tensor * inp = build_inp_embd(model.tok_embd);
+    // layer-major prompt processing: a later layer range starts from the tensors the range before passed on
+    ggml_tensor * inp = il_start == 0 ? build_inp_embd(model.tok_embd) : nullptr;
     ggml_tensor * inp_pos = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_out_ids = il_end == n_layer ? build_inp_out_ids() : nullptr;
     llm_graph_input_dsv4 * inp_dsv4 = build_inp_dsv4();
     ggml_build_forward_expand(gf, inp_dsv4->get_raw()->self_kq_mask);
 
@@ -908,13 +909,36 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
     res->add_input(std::move(inp41));
 
     const int64_t hc = hparams.dsv4_hc_mult;
-    ggml_tensor * inpL = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, inp, n_embd, 1, n_tokens), n_embd, hc, n_tokens, 1);
-    cb(inpL, "hc_init", -1);
+    ggml_tensor * inpL = nullptr;
 
     // single-pass mHC: the pre-mix used to collapse the stream lags one sublayer
     ggml_tensor * pre_prev = nullptr;
 
-    for (int il = 0; il < n_layer; ++il) {
+    if (il_start == 0) {
+        inpL = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, inp, n_embd, 1, n_tokens), n_embd, hc, n_tokens, 1);
+        cb(inpL, "hc_init", -1);
+    } else {
+        inpL     = build_carry_in("inpL");
+        pre_prev = build_carry_in("pre_prev");
+        GGML_ASSERT(inpL && pre_prev);
+        // the first layers of this range can use the top-k, the candidate blocks and the compressed rows of a layer
+        // in an earlier range
+        const int32_t ts = hparams.dsv41_topk_src[il_start];
+        if (ts >= 0 && ts < il_start) {
+            topk_of[ts] = build_carry_in("topk");
+        }
+        const int32_t ks = hparams.dsv41_kv_src[il_start];
+        if (ks >= 0 && ks < il_start) {
+            comp_row_of[ks] = build_carry_in("comp_row");
+        }
+        cand_sel = build_carry_in("cand_sel");
+        if (cand_sel) {
+            const auto & ci = inp41_ptr->cand_csa ? inp_dsv4->get_csa() : inp_dsv4->get_hca();
+            cand_n_comp = ci.kq_mask->ne[0];
+        }
+    }
+
+    for (int il = il_start; il < il_end; ++il) {
         const auto & layer = model.layers[il];
 
         const int e = model.engram_index(il);
@@ -999,6 +1023,23 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
         inpL = build_hc_post(cur, residual, post, comb, il);
         inpL = build_cvec(inpL, il);
         cb(inpL, "l_out", il);
+    }
+
+    if (il_end < n_layer) {
+        build_carry_out("inpL", inpL);
+        build_carry_out("pre_prev", pre_prev);
+        const int32_t ts = hparams.dsv41_topk_src[il_end];
+        if (ts >= 0 && ts < il_end && topk_of[ts]) {
+            build_carry_out("topk", topk_of[ts]);
+        }
+        const int32_t ks = hparams.dsv41_kv_src[il_end];
+        if (ks >= 0 && ks < il_end && comp_row_of[ks]) {
+            build_carry_out("comp_row", comp_row_of[ks]);
+        }
+        if (cand_sel) {
+            build_carry_out("cand_sel", cand_sel);
+        }
+        return;
     }
 
     // no hc_head: collapse with the last FFN's pre-mix
