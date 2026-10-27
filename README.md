@@ -3,8 +3,8 @@
 Faster **mixture-of-experts (MoE) models on consumer GPUs** when the experts don't fit in VRAM.
 This is [llama.cpp](https://github.com/ggml-org/llama.cpp) plus a handful of changes for the
 `--n-cpu-moe` case (experts in system RAM, the rest on the GPU). The expert cache turns on when you
-give it a routing profile; everything it needs after that sizes itself (see
-[Flags and defaults](#flags-and-defaults)). Models without a profile run as upstream.
+give it a routing profile, or `--moe-cache-dyn N` without one; everything it needs after that sizes
+itself (see [Flags and defaults](#flags-and-defaults)). Without either flag a model runs as upstream.
 
 | Feature | What it does | How to turn it on |
 | --- | --- | --- |
@@ -14,6 +14,7 @@ give it a routing profile; everything it needs after that sizes itself (see
 | **Routing profiles** | `llama-moe-trace` records which experts a model picks, with your real sampling settings, so the cache knows what to keep. | `llama-moe-trace` (see below) |
 | **Async CPU splits** | CPU and GPU halves of each MoE layer run at the same time. | on by default with the cache (`--no-sched-async-cpu` to disable) |
 | **Prefill speedups** | Pins the expert weights kept in RAM and prefetches them on a second CUDA stream, double-buffered per GPU. | `GGML_CUDA_REGISTER_HOST=1` `GGML_SCHED_PREFETCH_EXPERTS=6` |
+| **DeepSeek-V4.1-Flash** | `deepseek41`, from ISTA-DASLab's GSQ-RCO GGUFs (the Engram tables in their own file next to the shards), with the expert cache. | see [DeepSeek-V4.1-Flash](#deepseek-v41-flash) |
 | **Qwen3.8-Flash-Next MTP** | `--spec-type draft-mtp` works for `qwen4exp` with its separate draft head. | `-md mtp-*.gguf --spec-type draft-mtp` |
 
 Measured decode speed on one **RTX 3060 12 GB** (`-ngl 99 -ncmoe 99 -fa 1`):
@@ -31,7 +32,8 @@ On **two RTX 3060s**, Qwen3.8-Flash-Next with the cache split across both cards 
 (see [Two GPUs](#two-gpus)). With prefill borrowing and prefetch, the GSQ-RCO IQ3_XXS build of the
 same model reads a 17k-token prompt at **437 tok/s**, up from 61 with its experts on the CPU.
 
-Cache-capable architectures: `qwen35moe`, `qwen4exp` (Qwen3.8-Flash-Next), `deepseek2`, `laguna`.
+Cache-capable architectures: `qwen35moe`, `qwen4exp` (Qwen3.8-Flash-Next), `deepseek2`, `deepseek41`
+(DeepSeek-V4.1-Flash), `laguna`.
 Other models run unchanged.
 
 ## Quick start
@@ -122,6 +124,44 @@ no gain); at `-c 131072` `-ub 8192` settles on 2048 pipelined (a 58k-token promp
 579 tok/s. `--load-mode none` reads the weights into pinned buffers, which is what lets the prefetch
 copies run at full PCIe speed on GeForce cards. Lending the cache memory took 0.5–1.3 s and
 uploading it again about 2 s per long prompt.
+
+### DeepSeek-V4.1-Flash
+
+Runs the GSQ-RCO GGUFs from [ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF)
+(763B parameters, 384 experts per layer, 6 per token). Put the four shards of one set and
+`DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf` in one folder: the backbone names its Engram file, and the
+loader opens it from there. The Engram tables (111 GB) are read one row per token, lazily, and never
+go to the GPU. No routing profile is needed: `--moe-cache-dyn` fills the cache from the live routing.
+
+```bash
+GGML_SCHED_PREFETCH_EXPERTS=3 \
+./build/bin/llama-server -m DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00004.gguf \
+  -ngl 99 -ncmoe 99 -fa on -c 8192 -ub 2048 -b 2048 --jinja \
+  -lm mmap --lazy-mode on --no-sched-async-cpu \
+  --moe-cache-dyn 32 --moe-cache-mask 2
+```
+
+`-lm mmap` is needed: the 129 GiB backbone (IQ2_XXS) is larger than the RAM of a normal PC, and
+the experts the cache does not hold are paged in from the files. Use an NVMe drive. Drop
+`--moe-cache-mask 2` for output identical to the full model.
+
+Measured on one RTX 3060 12 GB with 52 GB of RAM: 4 GSM8K questions, greedy, thinking off,
+14 cache slots per layer. Decode is given for the first and the fourth request, as the page cache warms:
+
+| Flags | Decode tok/s | GSM8K |
+| --- | --- | --- |
+| profile, static cache | 4.0 -> 5.1 | 4/4 |
+| `--moe-cache-dyn 32` | 3.7 -> 6.5 | 4/4 |
+| `--moe-cache-dyn 32 --moe-cache-mask 2` | 7.8 -> 15.2 | 4/4 |
+
+Started from a cold page cache, `--moe-cache-dyn 32 --moe-cache-mask 2` decoded at 6.7 -> 10.7 tok/s.
+It read 46-63 MB per token from the SSD once warm, but 178 GB while loading, so the first start
+takes about 4 minutes. With the mask, a second GPU did not help: two RTX 3060s (49 + 45 slots per
+layer, `-sm layer`) decoded at 13.5 tok/s, the cards taking turns on every token.
+
+The mask is not lossless: with 14 of 384 experts per layer cached, it decides 4 of the 6 experts of
+most tokens. GSM8K held on the questions above, but a larger evaluation is still to do. Not in this
+build: the DSpark draft model, vision, and DSML tool-call parsing.
 
 ### Several models behind one server
 
