@@ -16,11 +16,13 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstring>
 #include <numeric>
 #include <sstream>
+#include <thread>
 #include <string>
 #include <unordered_set>
 
@@ -65,6 +67,53 @@ static bool can_reuse_kq_mask(
 }
 
 // impl
+
+bool llm_graph_host_rows_supported(const ggml_tensor * tab) {
+    if (!tab || !tab->buffer || !tab->data || !ggml_backend_buffer_is_host(tab->buffer) || tab->view_src) {
+        return false;
+    }
+    if (tab->nb[0] != ggml_type_size(tab->type) || tab->ne[2] != 1 || tab->ne[3] != 1) {
+        return false;
+    }
+    return tab->type == GGML_TYPE_F32 || ggml_get_type_traits(tab->type)->to_float != nullptr;
+}
+
+void llm_graph_host_get_rows(const ggml_tensor * tab, const int32_t * ids, int64_t n_ids, float * dst) {
+    const int64_t nc = tab->ne[0];
+    const ggml_to_float_t to_float = tab->type == GGML_TYPE_F32 ? nullptr : ggml_get_type_traits(tab->type)->to_float;
+
+    auto run = [&](int64_t i0, int64_t i1) {
+        for (int64_t i = i0; i < i1; ++i) {
+            const int64_t r = ids[i];
+            GGML_ASSERT(r >= 0 && r < tab->ne[1]);
+            const char * src = (const char *) tab->data + r*tab->nb[1];
+            if (to_float) {
+                to_float(src, dst + i*nc, nc);
+            } else {
+                memcpy(dst + i*nc, src, nc*sizeof(float));
+            }
+        }
+    };
+
+    // split prompt-sized gathers over a few threads (the CPU GET_ROWS they replace is multi-threaded)
+    const int64_t n_elem = n_ids*nc;
+    const int     n_thr  = (int) std::min<int64_t>(8, std::max<int64_t>(1, n_elem >> 18));
+    if (n_thr <= 1) {
+        run(0, n_ids);
+        return;
+    }
+    std::vector<std::thread> workers;
+    const int64_t per = (n_ids + n_thr - 1)/n_thr;
+    for (int t = 1; t < n_thr; ++t) {
+        const int64_t i0 = std::min<int64_t>(n_ids, t*per);
+        const int64_t i1 = std::min<int64_t>(n_ids, i0 + per);
+        workers.emplace_back(run, i0, i1);
+    }
+    run(0, std::min<int64_t>(n_ids, per));
+    for (auto & w : workers) {
+        w.join();
+    }
+}
 
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     if (ubatch->token) {
@@ -198,6 +247,11 @@ void llm_graph_input_pos_bucket_kv::set_input(const llama_ubatch * ubatch) {
 
 void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
     GGML_ASSERT(out_ids);
+
+    // a ubatch without outputs leaves it unallocated (deepseek41's graph reads it only for the outputs)
+    if (!out_ids->buffer) {
+        return;
+    }
 
     const int64_t n_tokens = ubatch->n_tokens;
 
@@ -1782,7 +1836,7 @@ ggml_tensor * llm_graph_context::build_ffn(
                     const float limit = hparams.swiglu_clamp_shexp[il];
                     constexpr float eps = 1e-6f;
                     if (limit > eps) {
-                        if (arch == LLM_ARCH_DEEPSEEK4 || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0)) {
+                        if (arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41 || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0)) {
                             cur = ggml_swiglu_clamp(ctx0, cur, tmp, limit);
                         } else {
                             tmp = ggml_clamp(ctx0, tmp, -limit, limit);
@@ -2095,14 +2149,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     cb(selected_experts, "ffn_moe_topk", il);
 
     // MoE expert cache: split routed ids into hot-pack ids and cold ids.
-    // scope: plain fused-SILU gated FFN (no clamp, no expert biases/scales,
+    // scope: fused-SILU gated FFN, clamped or not (no expert biases/scales,
     // no pre-FFN weighting) — the dual chains below reproduce exactly that
     ggml_tensor * ids_hot  = nullptr;
     ggml_tensor * ids_cold = nullptr;
     const bool use_moe_packs = moe_cache && moe_cache->moe_map_hot && !cparams.moe_packs_off && !gate_up_exps &&
         !up_exps_s && !gate_exps_s && !down_exps_s &&
-        type_op == LLM_FFN_SILU && gate_exps && !up_exps_b && !gate_exps_b && !weight_before_ffn &&
-        (il < 0 || hparams.swiglu_clamp_exp[il] <= 1e-6f);
+        type_op == LLM_FFN_SILU && gate_exps && !up_exps_b && !gate_exps_b && !weight_before_ffn;
     if (use_moe_packs) {
         ggml_tensor * ids_flat = ggml_cont_1d(ctx0, selected_experts, n_expert_used*n_tokens); // topk ids are a strided view
         ids_hot  = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, moe_cache->moe_map_hot,  ids_flat), n_expert_used, n_tokens);
@@ -2148,8 +2201,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_tensor * weights_sum = ggml_sum_rows(ctx0, weights); // [1, n_tokens]
         cb(weights_sum, "ffn_moe_weights_sum", il);
 
-        // Avoid division by zero, clamp to smallest number representable by F16
-        weights_sum = ggml_clamp(ctx0, weights_sum, 6.103515625e-5, INFINITY);
+        if (arch == LLM_ARCH_DEEPSEEK41) {
+            // model.py Gate.forward: weights / (sum + 1e-20); the sum can fall below the F16 clamp below
+            weights_sum = ggml_scale_bias(ctx0, weights_sum, 1.0f, 1e-20f);
+        } else {
+            // Avoid division by zero, clamp to smallest number representable by F16
+            weights_sum = ggml_clamp(ctx0, weights_sum, 6.103515625e-5, INFINITY);
+        }
         cb(weights_sum, "ffn_moe_weights_sum_clamped", il);
 
         weights = ggml_div(ctx0, weights, weights_sum); // [n_expert_used, n_tokens]
@@ -2183,12 +2241,24 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // ops (that migrates the hot pack weights to CPU every layer). Skipped
         // (-1) rows are zero and swiglu(0,0) = 0, so the two chain outputs are
         // disjoint and one add reconstructs the exact single-tensor result.
+        // the activation of the single-chain path below, clamped where the model clamps: a skipped row stays 0
+        const float clamp_limit = il >= 0 ? hparams.swiglu_clamp_exp[il] : 0.0f;
+        auto build_pack_act = [&](ggml_tensor * gate, ggml_tensor * up_p) {
+            if (clamp_limit <= 1e-6f) {
+                return ggml_swiglu_split(ctx0, gate, up_p);
+            }
+            if (arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41 || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0)) {
+                return ggml_swiglu_clamp(ctx0, gate, up_p, clamp_limit);
+            }
+            ggml_tensor * gate_act = ggml_clamp(ctx0, ggml_silu(ctx0, gate), -INFINITY, clamp_limit);
+            return ggml_mul(ctx0, gate_act, ggml_clamp(ctx0, up_p, -clamp_limit, clamp_limit));
+        };
         auto build_pack_chain = [&](ggml_tensor * w_gate, ggml_tensor * w_up, ggml_tensor * w_down, ggml_tensor * ids) {
             ggml_tensor * gate = ggml_mul_mat_id(ctx0, w_gate, cur, ids);
             gate->op_params[0] = 1; // ids may contain -1
             ggml_tensor * up_p = ggml_mul_mat_id(ctx0, w_up, cur, ids);
             up_p->op_params[0] = 1;
-            ggml_tensor * act = ggml_swiglu_split(ctx0, gate, up_p);
+            ggml_tensor * act = build_pack_act(gate, up_p);
             ggml_tensor * down = ggml_mul_mat_id(ctx0, w_down, act, ids);
             down->op_params[0] = 1;
             return down;
@@ -2205,10 +2275,20 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
         // with borrowing only the pack-free batches offload the experts, here the cold chain stays on the CPU
         if (cparams.moe_cache_borrow > 0) {
-            ggml_tensor * act = cold->src[1];
-            ggml_tensor * cold_nodes[4] = { act->src[0], act->src[1], act, cold };
-            for (ggml_tensor * t : cold_nodes) {
+            // every node from the down matmul back to the gate and up matmuls (a clamped activation has several)
+            ggml_backend_sched_set_tensor_backend(sched, cold, backend_cpu);
+            std::vector<ggml_tensor *> cold_nodes = { cold->src[1] };
+            while (!cold_nodes.empty()) {
+                ggml_tensor * t = cold_nodes.back();
+                cold_nodes.pop_back();
                 ggml_backend_sched_set_tensor_backend(sched, t, backend_cpu);
+                if (t->op != GGML_OP_MUL_MAT_ID) {
+                    for (ggml_tensor * s : t->src) {
+                        if (s) {
+                            cold_nodes.push_back(s);
+                        }
+                    }
+                }
             }
         }
 
@@ -2282,7 +2362,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                         const float limit = hparams.swiglu_clamp_exp[il];
                         constexpr float eps = 1e-6f;
                         if (limit > eps) {
-                            if (arch == LLM_ARCH_DEEPSEEK4 || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0)) {
+                            if (arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41 || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0)) {
                                 cur = ggml_swiglu_clamp(ctx0, cur, up, limit);
                             } else {
                                 up = ggml_clamp(ctx0, up, -limit, limit);

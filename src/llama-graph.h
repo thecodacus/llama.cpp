@@ -123,6 +123,10 @@ protected:
 
 using llm_graph_input_ptr = std::unique_ptr<llm_graph_input_i>;
 
+// dst[i] = row ids[i] of host table tab as F32, same conversion as CPU GET_ROWS (bitwise equal)
+bool llm_graph_host_rows_supported(const ggml_tensor * tab);
+void llm_graph_host_get_rows(const ggml_tensor * tab, const int32_t * ids, int64_t n_ids, float * dst);
+
 class llm_graph_input_embd : public llm_graph_input_i {
 public:
     llm_graph_input_embd(int64_t n_embd) : n_embd(n_embd) {}
