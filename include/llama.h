@@ -345,6 +345,9 @@ extern "C" {
         int32_t      moe_cache_slots;   // experts cached per layer (0 = disabled, < 0 = fit to the free memory on first use)
         int32_t      moe_cache_margin;  // MiB left free per device when the slots are fitted
         int32_t      moe_cache_borrow;  // batches of at least this many tokens free the cache memory and use it (0 = disabled, < 0 = auto)
+        int32_t      moe_cache_dyn;     // re-elect the cached experts every this many decoded tokens (0 = disabled); without a profile it turns the cache on
+        int32_t      moe_cache_mask;    // route only to cached experts, except the router's top N picks (< 0 = disabled)
+        float        moe_cache_decay;   // weight of the earlier windows in the re-election
         // target for a draft head that declares nextn_shared_target_tensors; must outlive this model
         const struct llama_model * model_shared;
 
@@ -600,6 +603,17 @@ extern "C" {
     LLAMA_API int32_t llama_model_n_embd_out   (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_layer      (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_layer_nextn(const struct llama_model * model);
+    // MoE expert cache (fork): slots of layer il (0 = no pack in use), and re-pack its hot set.
+    // set_hot keeps resident experts in place, uploads the rest; returns uploads or -1. Call between decodes.
+    LLAMA_API int32_t llama_model_moe_cache_slots  (const struct llama_model * model, int32_t il);
+    LLAMA_API int32_t llama_model_moe_cache_set_hot(struct llama_model * model, int32_t il, const int32_t * experts, int32_t n_experts);
+    // in-graph router demand (counted with --moe-cache-dyn): copy layer il's counts into out[n >= n_expert] and reset them
+    LLAMA_API int32_t llama_model_moe_cache_take_demand(struct llama_model * model, int32_t il, float * out, int32_t n);
+    // async re-pack: begin_hot takes the new experts' slots out of the routing and returns how many need uploading
+    // (between decodes); upload copies them (any thread, while decoding); end_hot routes to them (between decodes)
+    LLAMA_API int32_t llama_model_moe_cache_begin_hot(struct llama_model * model, int32_t il, const int32_t * experts, int32_t n_experts);
+    LLAMA_API void    llama_model_moe_cache_upload   (struct llama_model * model, int32_t il);
+    LLAMA_API void    llama_model_moe_cache_end_hot  (struct llama_model * model, int32_t il);
     LLAMA_API int32_t llama_model_n_head       (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_head_kv    (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_swa        (const struct llama_model * model);

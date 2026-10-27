@@ -2057,6 +2057,33 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(selection_probs, "ffn_moe_probs_masked", il);
     }
 
+    // MoE expert cache demand count (fork): with --moe-cache-dyn, the router's raw top-k picks of every batch that uses
+    // the pack are added to the layer's moe_demand counters (read and reset by llama_model_moe_cache_take_demand)
+    if (selected_experts_in == nullptr && cparams.moe_cache_dyn > 0 && moe_cache && moe_cache->moe_demand && !cparams.moe_packs_off) {
+        ggml_tensor * top    = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [k, n_tokens]
+        ggml_tensor * vals   = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, selection_probs, 1, n_expert, n_tokens), top); // [1, k, n_tokens]
+        ggml_tensor * thresh = ggml_cont(ctx0, ggml_view_2d(ctx0, vals, 1, n_tokens, vals->nb[2], (n_expert_used - 1)*vals->nb[1])); // k-th score
+        ggml_tensor * picked = ggml_step(ctx0, ggml_scale_bias(ctx0, ggml_sub(ctx0, selection_probs, thresh), 1.0f, 1e-30f)); // 1 = in the top-k
+        ggml_tensor * counts = ggml_sum_rows(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, picked))); // [1, n_expert]
+        ggml_tensor * demand = ggml_add(ctx0, moe_cache->moe_demand, ggml_reshape_1d(ctx0, counts, n_expert));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, demand, moe_cache->moe_demand));
+    }
+
+    // MoE expert cache hot mask (fork): --moe-cache-mask N restricts routing to the GPU pack except the
+    // router's top-N raw picks (N=0: pack only). -1 (default): lossless, routing untouched.
+    const int moe_mask_honor = cparams.moe_cache_mask;
+    if (selected_experts_in == nullptr && moe_mask_honor >= 0 && moe_cache && moe_cache->moe_bias_hot && !cparams.moe_packs_off) {
+        ggml_tensor * masked = ggml_add(ctx0, selection_probs, moe_cache->moe_bias_hot); // [n_expert, n_tokens]
+        if (moe_mask_honor > 0) {
+            ggml_tensor * top  = ggml_argsort_top_k(ctx0, selection_probs, moe_mask_honor); // [N, n_tokens]
+            ggml_tensor * vals = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, selection_probs, 1, n_expert, n_tokens), top);
+            masked = ggml_set_rows(ctx0, ggml_reshape_3d(ctx0, masked, 1, n_expert, n_tokens), vals, top);
+            masked = ggml_reshape_2d(ctx0, masked, n_expert, n_tokens);
+        }
+        cb(masked, "ffn_moe_probs_hotmask", il);
+        selection_probs = masked;
+    }
+
     // select experts
     ggml_tensor * selected_experts = selected_experts_in;
     if (selected_experts == nullptr) {

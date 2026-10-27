@@ -2832,6 +2832,28 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_BORROW"));
     add_opt(common_arg(
+        {"--moe-cache-dyn"}, "N",
+        "re-elect the cached experts every N decoded tokens from the router's recent picks (the uploads overlap decoding); "
+        "without --moe-cache-profile this turns the expert cache on and fills it this way (default: 0 = off)",
+        [](common_params & params, int value) {
+            params.moe_cache_dyn = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_DYN"));
+    add_opt(common_arg(
+        {"--moe-cache-mask"}, "N",
+        "route each token only to cached experts, except the router's top N picks; faster, but it changes the output (default: -1 = off)",
+        [](common_params & params, int value) {
+            params.moe_cache_mask = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_MASK"));
+    add_opt(common_arg(
+        {"--moe-cache-decay"}, "F",
+        string_format("weight of the earlier windows when the cached experts are re-elected (default: %.2f)", (double) params.moe_cache_decay),
+        [](common_params & params, const std::string & value) {
+            params.moe_cache_decay = std::stof(value);
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_DECAY"));
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",

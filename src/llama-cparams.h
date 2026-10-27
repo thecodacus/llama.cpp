@@ -57,6 +57,10 @@ struct llama_cparams {
 
     // MoE expert cache: batches of at least moe_cache_borrow tokens run with the packs freed (0 = never)
     uint32_t moe_cache_borrow;
+    // dynamic re-election every moe_cache_dyn decoded tokens (0 = off), hot mask honouring the top moe_cache_mask picks (-1 = off)
+    uint32_t moe_cache_dyn;
+    int32_t  moe_cache_mask;
+    float    moe_cache_decay;
     bool     moe_packs_off;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
