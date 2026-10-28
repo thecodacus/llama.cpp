@@ -212,6 +212,8 @@ before.
 | pinned group reads | 108.7 tok/s | 111.8 tok/s |
 | + whole-layer reads for the server's last 4096-token batch | 174.0 tok/s | 205.3 tok/s |
 | + one pass over the prompt (server) | 209.4 tok/s | 229.0 tok/s |
+| + carry kept on the GPU | 290.8 tok/s | 342.3 tok/s |
+| + Engram rows read ahead | 314.0 tok/s | 348.3 tok/s |
 
 A batch that uses about every expert reads the whole model once. The server used to split a prompt at
 user messages and `n_ubatch + 4` tokens before its end to make context checkpoints there, and each
