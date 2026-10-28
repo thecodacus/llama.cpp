@@ -393,6 +393,7 @@ public:
     bool next()  override;
     bool apply() override;
 
+    bool replay() override;
     void rewind() override { i_cur = 0; }
 
     llama_memory_status  get_status() const override;
@@ -462,6 +463,10 @@ private:
 
     // the index of the cur ubatch to process
     size_t i_cur = 0;
+
+    // replay: the cells after the first run of each ubatch
+    bool replaying = false;
+    std::vector<llama_kv_cells_vec> cells_after;
 
     slot_info_vec_t sinfos;
 

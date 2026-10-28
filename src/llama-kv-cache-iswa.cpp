@@ -345,6 +345,16 @@ bool llama_kv_cache_iswa_context::apply() {
     return res;
 }
 
+bool llama_kv_cache_iswa_context::replay() {
+    return ctx_base->replay() && ctx_swa->replay();
+}
+
+void llama_kv_cache_iswa_context::rewind() {
+    ctx_base->rewind();
+    ctx_swa->rewind();
+    i_next = 0;
+}
+
 llama_memory_status llama_kv_cache_iswa_context::get_status() const {
     return status;
 }

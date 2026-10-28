@@ -108,6 +108,19 @@ public:
 
     std::vector<mem_cell> cells;
 
+    // the slot bookkeeping (not the states), to put back the state of an earlier ubatch
+    struct slots {
+        uint32_t head;
+        uint32_t used;
+        uint32_t n;
+        int32_t  rs_z;
+        std::vector<uint32_t> rs_idx;
+        std::vector<mem_cell> cells;
+    };
+
+    slots get_slots() const { return { head, used, n, rs_z, rs_idx, cells }; }
+    void  set_slots(const slots & s) { head = s.head; used = s.used; n = s.n; rs_z = s.rs_z; rs_idx = s.rs_idx; cells = s.cells; }
+
     // per layer
     std::vector<ggml_tensor *> r_l;
     std::vector<ggml_tensor *> s_l;
@@ -159,6 +172,9 @@ public:
     bool next()  override;
     bool apply() override;
 
+    bool replay() override;
+    void rewind() override { i_next = 0; }
+
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
 
@@ -183,6 +199,10 @@ private:
     llama_memory_recurrent * mem;
 
     size_t i_next = 0;
+
+    // replay: the slots after the first run of each ubatch
+    bool replaying = false;
+    std::vector<llama_memory_recurrent::slots> slots_after;
 
     std::vector<llama_ubatch> ubatches;
 
