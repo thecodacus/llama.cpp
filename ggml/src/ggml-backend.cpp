@@ -942,6 +942,9 @@ struct ggml_backend_sched_prefetch {
     ggml_backend_event_t  ready[GGML_SCHED_MAX_PREFETCH_SLOTS];
     ggml_backend_event_t  free_ev[GGML_SCHED_MAX_PREFETCH_SLOTS];
     bool                  used[GGML_SCHED_MAX_PREFETCH_SLOTS];
+    // the host weight a slot holds in full from an earlier split, NULL if none: a later split (the next ubatch of a
+    // layer-major batch) reads it from there without copying it again
+    const ggml_tensor *   held[GGML_SCHED_MAX_PREFETCH_SLOTS];
     int                   n_pos;  // staged weights per split: a set holds one slot per position (gate, up, down)
     int                   n_sets; // sets in the ring: a split takes a whole set, the next split the next one
     int                   cur;    // the set the next split takes
@@ -1885,7 +1888,19 @@ static void ggml_backend_sched_prefetch_disable(ggml_backend_sched_t sched, int 
         ggml_backend_buffer_free(pf->slots[i]);
         pf->slots[i] = NULL;
         pf->used[i] = false;
+        pf->held[i] = NULL;
     }
+}
+
+// a prefetch slot of the backend holds this host weight in full
+static bool ggml_backend_sched_prefetch_holds(ggml_backend_sched_t sched, int backend_id, const ggml_tensor * input) {
+    const struct ggml_backend_sched_prefetch * pf = &sched->prefetch[backend_id];
+    for (int i = 0; i < pf->n_sets*pf->n_pos; i++) {
+        if (pf->held[i] == input) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // the expert matmul of the split that reads this copy of a host weight, when the batch is large enough for prefetch to
@@ -2002,6 +2017,7 @@ static bool ggml_backend_sched_prefetch_init(ggml_backend_sched_t sched, int bac
         }
         pf->slots[i] = new_buf;
         pf->used[i]  = false;
+        pf->held[i]  = NULL;
     }
     return true;
 }
@@ -2067,8 +2083,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         size_t n = 0;
         for (int j = 0; j < sp->n_inputs; j++) {
             const ggml_tensor * in = sp->inputs[j];
+            // a weight a prefetch slot still holds is not read from host memory
             if (in->buffer == NULL || in->data == NULL || !ggml_backend_buffer_is_host(in->buffer) ||
-                ggml_backend_buffer_get_usage(in->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS || ggml_nbytes(in) < (1u << 20)) {
+                ggml_backend_buffer_get_usage(in->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS || ggml_nbytes(in) < (1u << 20) ||
+                ggml_backend_sched_prefetch_holds(sched, sp->backend_id, in)) {
                 continue;
             }
             n += ggml_nbytes(in);
@@ -2153,12 +2171,32 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     n_split_prefetch < pf->n_pos && split->graph.n_nodes > 0) {
                     if (ggml_backend_sched_prefetch_node(split, input, input_cpy) != NULL) {
                         {
-                            // the split takes the next set of the ring; its k-th staged weight goes to position k
+                            // the split takes the set that still holds its first weight, else the next set of the
+                            // ring; its k-th staged weight goes to position k
                             if (n_split_prefetch == 0) {
-                                split_set = pf->cur;
-                                pf->cur = (pf->cur + 1) % pf->n_sets;
+                                split_set = -1;
+                                for (int s = 0; s < pf->n_sets && split_set < 0; s++) {
+                                    if (pf->held[s*pf->n_pos] == input) {
+                                        split_set = s;
+                                    }
+                                }
+                                if (split_set < 0) {
+                                    split_set = pf->cur;
+                                    pf->cur = (pf->cur + 1) % pf->n_sets;
+                                }
                             }
                             const int slot = split_set*pf->n_pos + n_split_prefetch;
+                            if (pf->held[slot] == input) {
+                                // still on the device from an earlier split: no copy
+                                prefetch_input_cpy[n_split_prefetch]    = input_cpy;
+                                prefetch_saved_buffer[n_split_prefetch] = input_cpy->buffer;
+                                prefetch_saved_data[n_split_prefetch]   = input_cpy->data;
+                                input_cpy->buffer = pf->slots[slot];
+                                input_cpy->data   = ggml_backend_buffer_get_base(pf->slots[slot]);
+                                ggml_backend_event_wait(split_backend, pf->ready[slot]);
+                                split_prefetch_slot[n_split_prefetch++] = slot;
+                                continue;
+                            }
                             // wait for the previous user of this slot to finish computing
                             if (pf->used[slot]) {
                                 ggml_backend_event_wait(pf->backend, pf->free_ev[slot]);
@@ -2180,6 +2218,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                     resident = &it->second;
                                 }
                             }
+                            // only a full copy can be read again by a later split
+                            pf->held[slot] = resident == nullptr ? input : NULL;
                             if (resident == nullptr) {
                                 ggml_backend_tensor_set_async(pf->backend, input_cpy, input->data, 0, nbytes);
                             } else {
