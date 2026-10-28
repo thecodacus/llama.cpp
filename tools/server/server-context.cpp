@@ -3506,7 +3506,7 @@ private:
 
                     // layer-major prompt processing reads all the weights once per batch: the prompt is not split for
                     // checkpoints, except for its last 4 tokens
-                    const bool one_pass = params_base.n_layer_major > 0;
+                    const bool one_pass = llama_n_layer_major(ctx_tgt) > 0;
 
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {

@@ -1415,8 +1415,6 @@ void llm_graph_result::reset() {
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
 
-    t_carry.clear();
-
     t_sampled.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
@@ -1427,7 +1425,8 @@ void llm_graph_result::reset() {
     inputs.clear();
     fused_nodes.clear();
 
-    buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false));
+    // a second graph: the layer range a layer-major batch computes of the first
+    buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + 2*ggml_graph_overhead_custom(max_nodes, false));
 
     ggml_init_params params = {
         /*.mem_size   =*/ buf_compute_meta.size(),
@@ -1580,29 +1579,9 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cb_func          (params.cb),
     res              (params.res),
     ctx0             (res->get_ctx()),
-    gf               (res->get_gf()),
-    il_start         (params.il_start),
-    il_end           (params.il_end > 0 ? params.il_end : (int32_t) n_layer),
-    carry            (params.carry) {
+    gf               (res->get_gf()) {
         res->set_params(params);
     }
-
-ggml_tensor * llm_graph_context::build_carry_in(const char * name) const {
-    if (!carry) {
-        return nullptr;
-    }
-    const auto it = carry->find(name);
-    return it == carry->end() ? nullptr : it->second;
-}
-
-void llm_graph_context::build_carry_out(const char * name, ggml_tensor * t) const {
-    if (!ggml_is_contiguous(t)) {
-        t = ggml_cont(ctx0, t);
-    }
-    ggml_set_output(t);
-    ggml_build_forward_expand(gf, t);
-    res->t_carry.emplace_back(name, t);
-}
 
 void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
     if (cb_func) {

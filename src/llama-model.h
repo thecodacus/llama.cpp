@@ -831,9 +831,6 @@ struct llama_model {
     virtual void load_arch_tensors(llama_model_loader & ml) = 0;
     virtual std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const = 0;
 
-    // the graph can be built for a range of layers (llm_graph_params::il_start/il_end), for layer-major prompts
-    virtual bool graph_layer_ranges() const { return false; }
-
 protected:
     llama_model_params params;
 

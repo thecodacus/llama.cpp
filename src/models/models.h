@@ -1355,8 +1355,6 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
 
     void engram_hash(int e, const llama_ubatch & ubatch, const std::vector<llama_token> & prev, std::vector<int32_t> & out) const;
 
-    bool graph_layer_ranges() const override { return true; }
-
     void prefetch_batch_rows(const std::vector<llama_ubatch> & ubatches) const override;
 
     struct graph : public llama_model_deepseek4::graph {

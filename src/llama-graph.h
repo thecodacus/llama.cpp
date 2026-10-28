@@ -123,10 +123,6 @@ protected:
 
 using llm_graph_input_ptr = std::unique_ptr<llm_graph_input_i>;
 
-// layer-major prompt processing: the tensors a range of layers passed on to the next range, for one ubatch. they
-// live in buffers of their own (on the device when they fit) and a graph reads them like the KV cache
-using llm_graph_carry = std::map<std::string, ggml_tensor *>;
-
 // dst[i] = row ids[i] of host table tab as F32, same conversion as CPU GET_ROWS (bitwise equal)
 bool llm_graph_host_rows_supported(const ggml_tensor * tab);
 void llm_graph_host_get_rows(const ggml_tensor * tab, const int32_t * ids, int64_t n_ids, float * dst);
@@ -817,11 +813,6 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
-    // layer-major prompt processing: build only layers [il_start, il_end) (il_end 0 = all), from the carried tensors
-    int32_t il_start = 0;
-    int32_t il_end   = 0;
-    const llm_graph_carry * carry = nullptr;
-
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -857,11 +848,6 @@ struct llm_graph_params {
         }
 
         if (n_outputs != other.n_outputs) {
-            return false;
-        }
-
-        // a graph reads the carried tensors of its own ubatch
-        if (il_start != other.il_start || il_end != other.il_end || carry != other.carry) {
             return false;
         }
 
@@ -922,6 +908,7 @@ public:
     ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
 
     ggml_cgraph  * get_gf()  const { return gf; }
+    void set_gf(ggml_cgraph * graph) { gf = graph; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }
 
     int64_t get_max_nodes() const;
@@ -955,9 +942,6 @@ public:
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
 
     std::vector<ggml_tensor *> t_layer_inp;
-
-    // layer-major prompt processing: the tensors this layer range passes on to the next one
-    std::vector<std::pair<std::string, ggml_tensor *>> t_carry;
 
     std::vector<ggml_tensor *> t_sampled;
     std::vector<ggml_tensor *> t_sampled_probs;
@@ -1055,11 +1039,6 @@ struct llm_graph_context {
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
-
-    // layer-major prompt processing: the layers this graph builds; il_end == n_layer for the last range
-    int32_t il_start = 0;
-    int32_t il_end   = 0;
-    const llm_graph_carry * carry = nullptr;
 
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;
@@ -1179,11 +1158,6 @@ struct llm_graph_context {
     ggml_tensor * build_inp_pos() const;
     ggml_tensor * build_inp_attn_scale() const;
     ggml_tensor * build_inp_out_ids() const;
-
-    // layer-major prompt processing: the tensor the previous layer range passed on as `name` (nullptr if none)
-    ggml_tensor * build_carry_in(const char * name) const;
-    // pass t on to the next layer range as `name`
-    void build_carry_out(const char * name, ggml_tensor * t) const;
     ggml_tensor * build_inp_mean() const;
     ggml_tensor * build_inp_cls() const;
 
