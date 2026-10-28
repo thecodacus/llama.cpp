@@ -1560,48 +1560,12 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
         res->set_params(params);
     }
 
-void llm_graph_input_carry::set_input(const llama_ubatch * ubatch) {
-    GGML_UNUSED(ubatch);
-
-    for (const auto & [name, t] : tensors) {
-        // a carried tensor no layer of this range reads is not allocated
-        if (!t->buffer) {
-            continue;
-        }
-        const auto & item = carry->at(name);
-        GGML_ASSERT(item.data.size() == ggml_nbytes(t));
-        ggml_backend_tensor_set(t, item.data.data(), 0, item.data.size());
-    }
-}
-
-bool llm_graph_input_carry::can_reuse(const llm_graph_params & params) {
-    carry = params.carry;
-
-    bool res = carry != nullptr;
-    for (const auto & [name, t] : tensors) {
-        const auto it = res ? carry->find(name) : carry->end();
-        res = res && it != carry->end() && it->second.type == t->type;
-        for (int i = 0; res && i < GGML_MAX_DIMS; ++i) {
-            res = it->second.ne[i] == t->ne[i];
-        }
-    }
-    return res;
-}
-
-ggml_tensor * llm_graph_context::build_carry_in(const char * name) {
-    const auto it = carry ? carry->find(name) : llm_graph_carry::const_iterator();
-    if (!carry || it == carry->end()) {
+ggml_tensor * llm_graph_context::build_carry_in(const char * name) const {
+    if (!carry) {
         return nullptr;
     }
-    if (!inp_carry) {
-        inp_carry = static_cast<llm_graph_input_carry *>(res->add_input(std::make_unique<llm_graph_input_carry>(carry)));
-    }
-    const auto & item = it->second;
-    ggml_tensor * t = ggml_new_tensor(ctx0, item.type, GGML_MAX_DIMS, item.ne);
-    ggml_set_input(t);
-    ggml_set_name(t, (std::string("carry-") + name).c_str());
-    inp_carry->tensors.emplace_back(name, t);
-    return t;
+    const auto it = carry->find(name);
+    return it == carry->end() ? nullptr : it->second;
 }
 
 void llm_graph_context::build_carry_out(const char * name, ggml_tensor * t) const {

@@ -369,7 +369,12 @@ private:
     int32_t lm_il_start = 0;
     int32_t lm_il_end   = 0;
     const llm_graph_carry * lm_carry_in = nullptr;
-    std::vector<llm_graph_carry> lm_carry;
+    struct lm_carry_ubatch {
+        llm_graph_carry tensors;
+        std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> bufs;
+    };
+    std::vector<lm_carry_ubatch> lm_carry;
+    void carry_out(lm_carry_ubatch & lc, const std::string & name, ggml_tensor * t);
     void readahead_layers(int32_t il0, int32_t il1); // queue the host weights of these layers on the readahead threads
 
     // layer-major: the host weights of a layer range are read with pread into one of two buffers (pinned when the GPU

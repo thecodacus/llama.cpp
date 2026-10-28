@@ -2128,7 +2128,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 }
                 lm_il_start = il0;
                 lm_il_end   = il0 + n_group;
-                lm_carry_in = &lm_carry[iu];
+                lm_carry_in = &lm_carry[iu].tensors;
                 n_outputs   = 0;
 
                 ggml_status status;
@@ -2156,18 +2156,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     }
                 }
 
-                llm_graph_carry next;
                 for (const auto & [name, t] : res->t_carry) {
-                    auto & item = next[name];
-                    item.type = t->type;
-                    std::copy(t->ne, t->ne + GGML_MAX_DIMS, item.ne);
-                    item.data.resize(ggml_nbytes(t));
-                    ggml_backend_t backend_t = ggml_backend_sched_get_tensor_backend(sched.get(), t);
-                    GGML_ASSERT(backend_t != nullptr);
-                    ggml_backend_tensor_get_async(backend_t, t, item.data.data(), 0, item.data.size());
+                    carry_out(lm_carry[iu], name, t);
                 }
-                ggml_backend_sched_synchronize(sched.get());
-                lm_carry[iu] = std::move(next);
 
                 // without the group buffers, the next range's weights come into RAM while the other ubatches run this one
                 if (iu == 0 && !lm_read) {
@@ -2176,6 +2167,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 ++iu;
             } while (mctx->next());
 
+            // the next read goes to the buffer this range was copied from
+            ggml_backend_sched_synchronize(sched.get());
             clear_layers_src();
             cur ^= 1;
         }
@@ -2197,7 +2190,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         const auto & ubatch = mctx->get_ubatch();
 
         if (layer_major) {
-            lm_carry_in = &lm_carry[i_ubatch];
+            lm_carry_in = &lm_carry[i_ubatch].tensors;
         }
 
         // count the outputs in this ubatch
@@ -2385,7 +2378,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
     lm_il_start = 0;
     lm_il_end   = 0;
     lm_carry_in = nullptr;
-    lm_carry.clear();
+    if (!lm_carry.empty()) {
+        ggml_backend_sched_synchronize(sched.get());
+        lm_carry.clear();
+    }
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
@@ -3050,6 +3046,30 @@ std::future<bool> llama_context::read_layers(int32_t il0, int32_t il1, char * ds
         }
         return ok.load();
     });
+}
+
+// a carried tensor goes to a buffer of the ubatch, on the device of the graph when it fits there; the copy runs on
+// the device stream, after the graph and before the next one
+void llama_context::carry_out(lm_carry_ubatch & lc, const std::string & name, ggml_tensor * t) {
+    ggml_backend_t backend_t = ggml_backend_sched_get_tensor_backend(sched.get(), t);
+    GGML_ASSERT(backend_t != nullptr);
+    ggml_tensor *& dst = lc.tensors[name];
+    if (dst == t) {
+        return; // passed on unchanged
+    }
+    if (dst == nullptr || dst->type != t->type || !ggml_are_same_shape(dst, t)) {
+        ggml_init_params ip = { ggml_tensor_overhead(), nullptr, true };
+        ggml_context * ctx = ggml_init(ip);
+        dst = ggml_new_tensor(ctx, t->type, GGML_MAX_DIMS, t->ne);
+        ggml_set_name(dst, ("carry-" + name).c_str());
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_get_default_buffer_type(backend_t));
+        if (buf == nullptr) {
+            buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_cpu_buffer_type());
+        }
+        GGML_ASSERT(buf != nullptr);
+        lc.bufs.emplace_back(ggml_context_ptr(ctx), ggml_backend_buffer_ptr(buf));
+    }
+    ggml_backend_tensor_copy_async(backend_t, backend_t, t, dst);
 }
 
 void llama_context::set_layers_src(int32_t il0, int32_t il1, const char * base) {
