@@ -1160,6 +1160,9 @@ struct llama_model::impl {
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
 
+    // the buffers of the tensors read lazily (--lazy-mode)
+    std::unordered_set<ggml_backend_buffer_t> lazy_bufs;
+
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
 
@@ -1204,6 +1207,10 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
         this->params.tensor_split = pimpl->tensor_split_owned.data();
     }
     pimpl->has_tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
+}
+
+bool llama_model::is_lazy(const ggml_tensor * t) const {
+    return pimpl->lazy_bufs.count(t->buffer) > 0;
 }
 
 void llama_model::prefetch_rows(const ggml_tensor * table, const ggml_tensor * ids) const {
@@ -1844,6 +1851,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             // indicate that this buffer contains weights
             // this is used by ggml_backend_sched to improve op scheduling: ops that use a weight are preferably scheduled to the backend that contains the weight
             ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            if (ctx_key.lazy) {
+                pimpl->lazy_bufs.insert(buf.get());
+            }
         }
 
         pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::move(bufs));

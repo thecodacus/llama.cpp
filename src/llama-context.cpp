@@ -2923,7 +2923,8 @@ void llama_context::readahead_layers(int32_t il0, int32_t il1) {
         if (sscanf(name.c_str(), "blk.%d.", &il) != 1 || il < il0 || il >= il1) {
             continue;
         }
-        if (t->buffer && ggml_backend_buffer_is_host(t->buffer) &&
+        // a table read lazily (Engram, PLE) is read by rows: reading all of it would flush the page cache
+        if (t->buffer && ggml_backend_buffer_is_host(t->buffer) && !model.is_lazy(t) &&
             ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
             !ggml_backend_sched_readahead(sched.get(), t->data, ggml_nbytes(t))) {
             return;

@@ -803,6 +803,9 @@ struct llama_model {
     // fault after another on the compute threads. only a hint, the gather reads the rows either way
     void prefetch_rows(const ggml_tensor * table, const ggml_tensor * ids) const;
 
+    // the tensor is read lazily (--lazy-mode): only the rows a batch gathers come into RAM
+    bool is_lazy(const ggml_tensor * t) const;
+
     virtual void load_stats  (llama_model_loader & ml) = 0;
     virtual void load_hparams(llama_model_loader & ml) = 0;
     virtual void load_vocab  (llama_model_loader & ml) = 0;
