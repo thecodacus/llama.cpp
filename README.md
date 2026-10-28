@@ -178,7 +178,7 @@ GGML_SCHED_PREFETCH_EXPERTS=3 GGML_SCHED_READAHEAD=16 \
 ./build/bin/llama-server -m DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00004.gguf \
   -ngl 99 -ncmoe 99 -fa on -c 32768 -ub 4096 -b 32768 --jinja \
   -lm mmap --lazy-mode on --no-sched-async-cpu \
-  --moe-cache-dyn 32 --moe-cache-mask 2 --layer-major 3
+  --moe-cache-dyn 32 --moe-cache-mask 2 --layer-major 1
 ```
 
 Measured on one RTX 5060 Ti 16 GB with 58 GB of RAM (about 50 GB free for the page cache), a new
@@ -198,10 +198,19 @@ minute too: when it is larger than the free RAM, the loader no longer reads it a
 
 With `--layer-major 1` and `GGML_SCHED_PREFETCH_EXPERTS=3`, a layer's experts stay in the prefetch
 slots on the GPU for all ubatches: the first ubatch uploads them, the others read them from there,
-and the next layer replaces them. That uploads each expert once per prompt (about 119 GB here
-instead of about 600 GB) and prefilled at 76.9 tok/s, the same as `--layer-major 3`: the SSD is
-the limit. On the test machine the model files read back at about 1.7x their size (ZFS with
-16 KB records, written with gang blocks), so a 16k prompt still reads about 316 GB.
+and the next layer replaces them. Each expert is uploaded once per prompt (about 119 GB here instead
+of about 600 GB).
+
+A layer-major batch reads each layer group with `pread` (16 threads, 4 MiB reads) into one of two
+pinned buffers and uploads it from there, while the next group is read into the other buffer. Page
+faults on the mapping read at about 1.7 GB/s on the test machine, `pread` at 5-6 GB/s. If the
+buffers (two times the largest group) cannot be allocated, the weights come from the mapping as
+before.
+
+| Flags (with the pinned group reads) | 16.7k prompt | 19.2k prompt |
+| --- | --- | --- |
+| `--layer-major 1`, `GGML_SCHED_PREFETCH_EXPERTS=3` | 108.7 tok/s | 111.8 tok/s |
+| `--layer-major 3`, `GGML_SCHED_PREFETCH_EXPERTS=3` | 93.6 tok/s | 114.5 tok/s |
 
 ### Several models behind one server
 
