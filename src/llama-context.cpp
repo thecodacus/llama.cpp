@@ -1975,7 +1975,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // a batch whose first ubatch borrows the expert cache memory lends it before the batch is split, so the split uses
     // the ubatch size fitted to the lent memory. the buffers are reserved for the cells the batch can reach, twice
     // that for the batches that follow, and fitted again when a later batch reaches beyond them
-    if (moe_cache_on && (n_decode_calls > 1 || !model.moe_cache_auto()) && cparams.moe_cache_borrow > 0 &&
+    if (moe_cache_on && (!cparams.warmup || !model.moe_cache_auto()) && cparams.moe_cache_borrow > 0 &&
         std::min(n_tokens_all, n_ubatch_max) >= cparams.moe_cache_borrow) {
         uint32_t n_cells = n_tokens_all;
         for (llama_seq_id s = 0; memory && s < (llama_seq_id) cparams.n_seq_max; ++s) {
@@ -2042,9 +2042,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
     }
 
     // MoE expert cache: build it on first use (fitted slots), lend its memory to large batches, upload it again after.
-    // fitted slots wait for the second decode: the first is the warm-up, which runs before a draft model is loaded
+    // fitted slots skip the warm-up, which runs before a draft model is loaded
     const auto moe_cache_borrow = [&](uint32_t n_tokens) {
-        if (moe_cache_on && (n_decode_calls > 1 || !model.moe_cache_auto())) {
+        if (moe_cache_on && (!cparams.warmup || !model.moe_cache_auto())) {
             const bool off = cparams.moe_cache_borrow > 0 && n_tokens >= cparams.moe_cache_borrow;
             if (off != cparams.moe_packs_off) {
                 moe_cache_switch(off);
