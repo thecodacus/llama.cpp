@@ -2053,9 +2053,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
     };
 
     // layer-major: the layer ranges before the last one run over all ubatches first, so each range's weights are
-    // read once per batch; the loop below runs the last range. the cache is lent or not for the whole batch
+    // read once per batch; the loop below runs the last range. the cache is lent or not for the whole batch.
+    // a batch of one ubatch also runs this way when it uses about every expert and has the whole cache memory (or
+    // there is no cache): its layers are then read whole
+    const bool all_experts = (uint64_t) n_tokens_all*hparams.n_expert_used() >= 2*(uint64_t) hparams.n_expert &&
+        (!moe_cache_on || (cparams.moe_cache_borrow > 0 && n_tokens_all >= cparams.moe_cache_borrow));
     const bool layer_major = cparams.n_layer_major > 0 && cparams.n_layer_major < hparams.n_layer() &&
-        n_tokens_all > cparams.n_ubatch && !cparams.embeddings &&
+        all_experts && !cparams.embeddings &&
         std::find(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(), true) == cparams.embeddings_layer_inp.end() &&
         mctx->replay();
     if (layer_major) {

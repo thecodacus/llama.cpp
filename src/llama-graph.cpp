@@ -95,9 +95,10 @@ void llm_graph_host_get_rows(const ggml_tensor * tab, const int32_t * ids, int64
         }
     };
 
-    // split prompt-sized gathers over a few threads (the CPU GET_ROWS they replace is multi-threaded)
+    // split prompt-sized gathers over threads (the CPU GET_ROWS they replace is multi-threaded); rows of a table read
+    // lazily come from the disk one page fault each, as many as the prefetch_rows readers keep in flight
     const int64_t n_elem = n_ids*nc;
-    const int     n_thr  = (int) std::min<int64_t>(8, std::max<int64_t>(1, n_elem >> 18));
+    const int     n_thr  = (int) std::min<int64_t>(32, std::max<int64_t>(1, n_elem >> 18));
     if (n_thr <= 1) {
         run(0, n_ids);
         return;
