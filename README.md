@@ -196,6 +196,13 @@ A group should be small: the page cache holds two groups while the next one is r
 `--layer-major 8` (about 26 GB per group) prefill fell to 48.9 tok/s. The model loads in under a
 minute too: when it is larger than the free RAM, the loader no longer reads it all in first.
 
+With `--layer-major 1` and `GGML_SCHED_PREFETCH_EXPERTS=3`, a layer's experts stay in the prefetch
+slots on the GPU for all ubatches: the first ubatch uploads them, the others read them from there,
+and the next layer replaces them. That uploads each expert once per prompt (about 119 GB here
+instead of about 600 GB) and prefilled at 76.9 tok/s, the same as `--layer-major 3`: the SSD is
+the limit. On the test machine the model files read back at about 1.7x their size (ZFS with
+16 KB records, written with gang blocks), so a 16k prompt still reads about 316 GB.
+
 ### Several models behind one server
 
 Every flag works as a key in a `--models-preset` INI section:
