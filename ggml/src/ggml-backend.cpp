@@ -1013,6 +1013,9 @@ struct ggml_backend_sched {
     // async CPU split execution (GGML_SCHED_ASYNC_CPU); NULL when disabled
     struct ggml_sched_cpu_async * cpu_async;
 
+    // host weights copied to a device from another copy of their contents (ggml_backend_sched_set_host_src)
+    std::unordered_map<const ggml_tensor *, const void *> * host_src;
+
     // host readahead (GGML_SCHED_READAHEAD); NULL when disabled
     struct ggml_sched_readahead * readahead;
     size_t readahead_bytes;
@@ -2083,10 +2086,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         size_t n = 0;
         for (int j = 0; j < sp->n_inputs; j++) {
             const ggml_tensor * in = sp->inputs[j];
-            // a weight a prefetch slot still holds is not read from host memory
+            // a weight a prefetch slot still holds, or copied from another source, is not read from its memory
             if (in->buffer == NULL || in->data == NULL || !ggml_backend_buffer_is_host(in->buffer) ||
                 ggml_backend_buffer_get_usage(in->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS || ggml_nbytes(in) < (1u << 20) ||
-                ggml_backend_sched_prefetch_holds(sched, sp->backend_id, in)) {
+                ggml_backend_sched_prefetch_holds(sched, sp->backend_id, in) ||
+                (sched->host_src && sched->host_src->count(in))) {
                 continue;
             }
             n += ggml_nbytes(in);
@@ -2211,6 +2215,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             input_cpy->data   = ggml_backend_buffer_get_base(pf->slots[slot]);
                             const size_t nbytes = ggml_nbytes(input);
                             const size_t padded = ggml_backend_buft_get_alloc_size(ggml_backend_get_default_buffer_type(split_backend), input);
+                            const char * src = (const char *) input->data;
+                            if (sched->host_src) {
+                                auto it = sched->host_src->find(input);
+                                if (it != sched->host_src->end()) {
+                                    src = (const char *) it->second;
+                                }
+                            }
                             const std::vector<uint8_t> * resident = nullptr;
                             if (sched->prefetch_resident) {
                                 auto it = sched->prefetch_resident->find(input);
@@ -2221,7 +2232,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             // only a full copy can be read again by a later split
                             pf->held[slot] = resident == nullptr ? input : NULL;
                             if (resident == nullptr) {
-                                ggml_backend_tensor_set_async(pf->backend, input_cpy, input->data, 0, nbytes);
+                                ggml_backend_tensor_set_async(pf->backend, input_cpy, src, 0, nbytes);
                             } else {
                                 // copy the runs of experts the device does not hold; their ids are the only ones the
                                 // matmul reads. each run also takes the start of the next expert, which the kernels
@@ -2239,7 +2250,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                     }
                                     const size_t off = e0*nb;
                                     const size_t end = std::min<size_t>(nbytes, e1*nb + (padded - nbytes));
-                                    ggml_backend_tensor_set_async(pf->backend, input_cpy, (const char *) input->data + off, off, end - off);
+                                    ggml_backend_tensor_set_async(pf->backend, input_cpy, src + off, off, end - off);
                                     e0 = e1;
                                 }
                             }
@@ -2548,6 +2559,19 @@ ggml_backend_sched_t ggml_backend_sched_new(
     return sched;
 }
 
+void ggml_backend_sched_set_host_src(ggml_backend_sched_t sched, const struct ggml_tensor * t, const void * data) {
+    if (data == NULL) {
+        if (sched->host_src) {
+            sched->host_src->erase(t);
+        }
+        return;
+    }
+    if (sched->host_src == NULL) {
+        sched->host_src = new std::unordered_map<const ggml_tensor *, const void *>();
+    }
+    (*sched->host_src)[t] = data;
+}
+
 bool ggml_backend_sched_readahead(ggml_backend_sched_t sched, const void * data, size_t size) {
     if (!sched->readahead) {
         return false;
@@ -2580,6 +2604,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         }
     }
     delete sched->cpu_async;
+    delete sched->host_src;
     delete sched->readahead;
     delete sched->prefetch_resident;
     ggml_gallocr_free(sched->galloc);

@@ -12,6 +12,7 @@
 #include "ggml-opt.h"
 
 #include <atomic>
+#include <future>
 #include <map>
 #include <thread>
 #include <vector>
@@ -370,6 +371,15 @@ private:
     const llm_graph_carry * lm_carry_in = nullptr;
     std::vector<llm_graph_carry> lm_carry;
     void readahead_layers(int32_t il0, int32_t il1); // queue the host weights of these layers on the readahead threads
+
+    // layer-major: the host weights of a layer range are read with pread into one of two buffers (pinned when the GPU
+    // has a host buffer type) and copied to the GPU from there, the next range is read while this one runs
+    ggml_backend_buffer_ptr lm_buf[2];
+    bool lm_buf_tried = false;
+    std::vector<const ggml_tensor *> lm_src; // the weights with a host source set
+    std::future<bool> read_layers(int32_t il0, int32_t il1, char * dst);
+    void set_layers_src(int32_t il0, int32_t il1, const char * base);
+    void clear_layers_src();
 
     // the configured ubatch: while the cache is lent, n_ubatch is the largest size up to this that fits in its memory
     uint32_t n_ubatch_max = 0;

@@ -20,6 +20,8 @@
 #include <stdexcept>
 #include <string>
 
+static std::vector<std::pair<const ggml_tensor *, size_t>> llama_layers_host_weights(const llama_model & model, int32_t il0, int32_t il1, size_t * size);
+
 //
 // llama_context
 //
@@ -2063,8 +2065,56 @@ int llama_context::decode(const llama_batch & batch_inp) {
         const int32_t n_group = (int32_t) cparams.n_layer_major;
         const int32_t il_last = ((n_layer - 1)/n_group)*n_group;
 
+        // the group buffers, sized for the largest range
+        if (!lm_buf_tried) {
+            lm_buf_tried = true;
+            size_t size_max = 0;
+            for (int32_t il0 = 0; il0 < n_layer; il0 += n_group) {
+                size_t size = 0;
+                llama_layers_host_weights(model, il0, il0 + n_group, &size);
+                size_max = std::max(size_max, size);
+            }
+            // pinned memory copies to the GPU fastest; plain RAM still saves the page faults on the mapping
+            ggml_backend_dev_t gpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+            ggml_backend_buffer_type_t buft = nullptr;
+            for (ggml_backend_buffer_type_t b : { gpu ? ggml_backend_dev_host_buffer_type(gpu) : nullptr, ggml_backend_cpu_buffer_type() }) {
+                if (b == nullptr || size_max == 0 || (lm_buf[0] && lm_buf[1])) {
+                    continue;
+                }
+                buft = b;
+                for (auto & buf : lm_buf) {
+                    buf.reset(ggml_backend_buft_alloc_buffer(b, size_max));
+                }
+            }
+            if (lm_buf[0] && lm_buf[1]) {
+                LLAMA_LOG_INFO("%s: layer-major: 2 x %.2f MiB %s buffers for reading the layer weights\n", __func__,
+                        size_max/1024.0/1024.0, ggml_backend_buft_name(buft));
+            } else {
+                LLAMA_LOG_WARN("%s: layer-major: could not allocate 2 x %.2f MiB to read the layer weights into, using the mapping\n",
+                        __func__, size_max/1024.0/1024.0);
+                lm_buf[0].reset();
+                lm_buf[1].reset();
+            }
+        }
+        const bool lm_read = lm_buf[0] && lm_buf[1];
+        const auto buf_base = [&](int b) { return (char *) ggml_backend_buffer_get_base(lm_buf[b].get()); };
+
+        // a range's weights are copied to the GPU from its buffer when the read of all of them succeeded
+        int cur = 0;
+        std::future<bool> rd;
+        if (lm_read) {
+            rd = read_layers(0, n_group, buf_base(cur));
+        }
+
         lm_carry.clear();
         for (int32_t il0 = 0; il0 < il_last; il0 += n_group) {
+            if (lm_read) {
+                if (rd.get()) {
+                    set_layers_src(il0, il0 + n_group, buf_base(cur));
+                }
+                // the other buffer is free: the copies of the range before it ended with its last ubatch
+                rd = read_layers(il0 + n_group, il0 + 2*n_group, buf_base(cur ^ 1));
+            }
             mctx->rewind();
             size_t iu = 0;
             do {
@@ -2080,6 +2130,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 ggml_status status;
                 const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
                 if (!res) {
+                    if (rd.valid()) {
+                        rd.wait();
+                    }
+                    clear_layers_src();
                     // every ubatch of the batch has layers without KV: remove the whole batch from the memory
                     for (llama_seq_id s = 0; s < (llama_seq_id) cparams.n_seq_max; ++s) {
                         const llama_pos p0 = balloc->seq_pos_min(s);
@@ -2111,12 +2165,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 ggml_backend_sched_synchronize(sched.get());
                 lm_carry[iu] = std::move(next);
 
-                // the next range's weights come in while the other ubatches run this range from RAM
-                if (iu == 0) {
+                // without the group buffers, the next range's weights come into RAM while the other ubatches run this one
+                if (iu == 0 && !lm_read) {
                     readahead_layers(il0 + n_group, il0 + 2*n_group);
                 }
                 ++iu;
             } while (mctx->next());
+
+            clear_layers_src();
+            cur ^= 1;
+        }
+
+        if (lm_read && rd.get()) {
+            set_layers_src(il_last, n_layer, buf_base(cur));
         }
 
         mctx->rewind();
@@ -2160,6 +2221,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
 
         if (!res) {
+            clear_layers_src();
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
             llama_pos pos_min[LLAMA_MAX_SEQ];
             for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
@@ -2313,6 +2375,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
         n_tokens_prev  += ubatch.n_tokens;
         ++i_ubatch;
     } while (mctx->next());
+
+    clear_layers_src();
 
     lm_il_start = 0;
     lm_il_end   = 0;
@@ -2917,19 +2981,86 @@ llm_graph_params llama_context::graph_params(
     return params;
 }
 
-void llama_context::readahead_layers(int32_t il0, int32_t il1) {
+// the host weights of layers [il0, il1), with their offset in a buffer holding all of them; a table read lazily
+// (Engram, PLE) is read by rows and left out: reading all of it would flush the page cache
+static std::vector<std::pair<const ggml_tensor *, size_t>> llama_layers_host_weights(const llama_model & model, int32_t il0, int32_t il1, size_t * size) {
+    std::vector<std::pair<const ggml_tensor *, size_t>> res;
+    size_t off = 0;
     for (const auto & [name, t] : model.tensors_by_name) {
         int il = -1;
         if (sscanf(name.c_str(), "blk.%d.", &il) != 1 || il < il0 || il >= il1) {
             continue;
         }
-        // a table read lazily (Engram, PLE) is read by rows: reading all of it would flush the page cache
         if (t->buffer && ggml_backend_buffer_is_host(t->buffer) && !model.is_lazy(t) &&
-            ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
-            !ggml_backend_sched_readahead(sched.get(), t->data, ggml_nbytes(t))) {
+            ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+            res.emplace_back(t, off);
+            off += GGML_PAD(ggml_nbytes(t), 4096);
+        }
+    }
+    *size = off;
+    return res;
+}
+
+void llama_context::readahead_layers(int32_t il0, int32_t il1) {
+    size_t size = 0;
+    for (const auto & [t, off] : llama_layers_host_weights(model, il0, il1, &size)) {
+        if (!ggml_backend_sched_readahead(sched.get(), t->data, ggml_nbytes(t))) {
             return;
         }
     }
+}
+
+std::future<bool> llama_context::read_layers(int32_t il0, int32_t il1, char * dst) {
+    size_t size = 0;
+    auto weights = llama_layers_host_weights(model, il0, il1, &size);
+    return std::async(std::launch::async, [this, weights = std::move(weights), dst]() {
+        // 4 MiB reads on 16 threads: page faults on the mapping read at about a third of the speed
+        struct piece {
+            const ggml_tensor * t;
+            size_t offs;
+            size_t size;
+            char * dst;
+        };
+        const size_t chunk = 4u << 20;
+        std::vector<piece> pieces;
+        for (const auto & [t, off] : weights) {
+            for (size_t o = 0; o < ggml_nbytes(t); o += chunk) {
+                pieces.push_back({ t, o, std::min(chunk, ggml_nbytes(t) - o), dst + off + o });
+            }
+        }
+        std::atomic<size_t> next{0};
+        std::atomic<bool> ok{true};
+        std::vector<std::thread> threads;
+        for (int i = 0; i < 16; i++) {
+            threads.emplace_back([&]() {
+                for (size_t k; (k = next++) < pieces.size(); ) {
+                    const auto & p = pieces[k];
+                    if (!model.read_mapped(p.t, p.offs, p.size, p.dst)) {
+                        ok = false;
+                    }
+                }
+            });
+        }
+        for (auto & th : threads) {
+            th.join();
+        }
+        return ok.load();
+    });
+}
+
+void llama_context::set_layers_src(int32_t il0, int32_t il1, const char * base) {
+    size_t size = 0;
+    for (const auto & [t, off] : llama_layers_host_weights(model, il0, il1, &size)) {
+        ggml_backend_sched_set_host_src(sched.get(), t, base + off);
+        lm_src.push_back(t);
+    }
+}
+
+void llama_context::clear_layers_src() {
+    for (const auto * t : lm_src) {
+        ggml_backend_sched_set_host_src(sched.get(), t, nullptr);
+    }
+    lm_src.clear();
 }
 
 ggml_status llama_context::graph_compute(

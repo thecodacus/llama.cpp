@@ -806,6 +806,9 @@ struct llama_model {
     // the tensor is read lazily (--lazy-mode): only the rows a batch gathers come into RAM
     bool is_lazy(const ggml_tensor * t) const;
 
+    // read bytes [offs, offs + size) of a tensor in a file mapping with pread into dst; false if it is not mapped
+    bool read_mapped(const ggml_tensor * t, size_t offs, size_t size, void * dst) const;
+
     virtual void load_stats  (llama_model_loader & ml) = 0;
     virtual void load_hparams(llama_model_loader & ml) = 0;
     virtual void load_vocab  (llama_model_loader & ml) = 0;

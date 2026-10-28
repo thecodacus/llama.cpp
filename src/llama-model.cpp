@@ -42,6 +42,10 @@
 #include <string>
 #include <vector>
 
+#if defined(__unix__) || defined(__APPLE__)
+#include <unistd.h>
+#endif
+
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
     switch (arch) {
         case LLM_ARCH_CLIP:
@@ -1163,6 +1167,9 @@ struct llama_model::impl {
     // the buffers of the tensors read lazily (--lazy-mode)
     std::unordered_set<ggml_backend_buffer_t> lazy_bufs;
 
+    // a descriptor of the file of each mapping, to read a mapped tensor with pread (-1: none)
+    std::vector<int> mapping_fds;
+
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
 
@@ -1207,6 +1214,38 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
         this->params.tensor_split = pimpl->tensor_split_owned.data();
     }
     pimpl->has_tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
+}
+
+bool llama_model::read_mapped(const ggml_tensor * t, size_t offs, size_t size, void * dst) const {
+#if defined(__unix__) || defined(__APPLE__)
+    for (size_t idx = 0; idx < pimpl->mappings.size() && idx < pimpl->mapping_fds.size(); idx++) {
+        const auto & mapping = pimpl->mappings[idx];
+        const int fd = pimpl->mapping_fds[idx];
+        if (!mapping || fd < 0) {
+            continue;
+        }
+        const char * base = (const char *) mapping->addr();
+        const char * data = (const char *) t->data;
+        if (data < base || data + ggml_nbytes(t) > base + mapping->size()) {
+            continue;
+        }
+        size_t done = 0;
+        while (done < size) {
+            const ssize_t n = pread(fd, (char *) dst + done, size - done, (data - base) + offs + done);
+            if (n <= 0) {
+                return false;
+            }
+            done += n;
+        }
+        return true;
+    }
+#else
+    GGML_UNUSED(t);
+    GGML_UNUSED(offs);
+    GGML_UNUSED(size);
+    GGML_UNUSED(dst);
+#endif
+    return false;
 }
 
 bool llama_model::is_lazy(const ggml_tensor * t) const {
@@ -1254,6 +1293,13 @@ llama_model::~llama_model() {
     for (auto & job : pimpl->row_readers) {
         job.wait();
     }
+#if defined(__unix__) || defined(__APPLE__)
+    for (int fd : pimpl->mapping_fds) {
+        if (fd >= 0) {
+            close(fd);
+        }
+    }
+#endif
     for (auto * lora : loras) {
         delete lora;
     }
@@ -1905,8 +1951,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     if (use_mmap_buffer) {
-        for (auto & mapping : ml.mappings) {
-            pimpl->mappings.emplace_back(std::move(mapping));
+        for (size_t idx = 0; idx < ml.mappings.size(); idx++) {
+            pimpl->mappings.emplace_back(std::move(ml.mappings[idx]));
+#if defined(__unix__) || defined(__APPLE__)
+            pimpl->mapping_fds.push_back(pimpl->mappings.back() ? dup(ml.files[idx]->file_id()) : -1);
+#endif
         }
     }
 
