@@ -348,6 +348,7 @@ extern "C" {
         int32_t      moe_cache_dyn;     // re-elect the cached experts every this many decoded tokens (0 = disabled); without a profile it turns the cache on
         int32_t      moe_cache_mask;    // route only to cached experts, except the router's top N picks (< 0 = disabled)
         float        moe_cache_decay;   // weight of the earlier windows in the re-election
+        int32_t      weights_in_ram;    // MiB of mapped host weights kept in RAM: the most routed experts of the profile, else whole layers (0 = none)
         // target for a draft head that declares nextn_shared_target_tensors; must outlive this model
         const struct llama_model * model_shared;
 

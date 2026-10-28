@@ -2863,6 +2863,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_DECAY"));
     add_opt(common_arg(
+        {"--weights-in-ram"}, "GIB",
+        "keep up to GIB GiB of the memory-mapped host weights in RAM, read at load: the most routed experts of the "
+        "routing profile (--moe-cache-profile), or whole layers from the first without one. They stay at their address, "
+        "so the CPU kernels, the copies to the GPU and the expert cache read RAM instead of the file (for a model larger "
+        "than the RAM, on Linux; default: 0 = none)",
+        [](common_params & params, int value) {
+            params.weights_in_ram = value;
+        }
+    ).set_env("LLAMA_ARG_WEIGHTS_IN_RAM"));
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",

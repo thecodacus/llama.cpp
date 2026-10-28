@@ -591,6 +591,7 @@ struct common_params {
     int32_t     moe_cache_dyn     = 0;    // re-elect the cached experts every N decoded tokens (0 = disabled)
     int32_t     moe_cache_mask    = -1;   // route only to cached experts except the router's top N picks (-1 = disabled)
     float       moe_cache_decay   = 0.9f; // weight of the earlier windows in the re-election
+    int32_t     weights_in_ram    = 0;    // GiB of mapped host weights kept in RAM: the most routed experts of the profile
 
     bool single_turn       = false; // single turn chat conversation
 

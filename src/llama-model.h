@@ -7,6 +7,7 @@
 #include "llama-memory.h"
 #include "llama-vocab.h"
 
+#include <set>
 #include <map>
 #include <memory>
 #include <string>
@@ -812,6 +813,13 @@ struct llama_model {
 
     // read bytes [offs, offs + size) of a tensor in a file mapping with pread into dst; false if it is not mapped
     bool read_mapped(const ggml_tensor * t, size_t offs, size_t size, void * dst) const;
+
+    // the tensor's data is in a file mapping
+    bool is_mapped(const ggml_tensor * t) const;
+
+    // keep mapped host weights in RAM, up to budget bytes (--weights-in-ram): every expert but those in skip
+    // (layer -> experts), most routed first; whole layers without a routing profile
+    void load_weights_ram(size_t budget, const std::map<int, std::set<int32_t>> & skip) const;
 
     virtual void load_stats  (llama_model_loader & ml) = 0;
     virtual void load_hparams(llama_model_loader & ml) = 0;

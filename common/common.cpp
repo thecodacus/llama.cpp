@@ -1703,6 +1703,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.moe_cache_dyn    = params.moe_cache_dyn;
     mparams.moe_cache_mask   = params.moe_cache_mask;
     mparams.moe_cache_decay  = params.moe_cache_decay;
+    mparams.weights_in_ram   = params.weights_in_ram*1024;
 
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;
