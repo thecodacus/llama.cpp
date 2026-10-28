@@ -211,10 +211,13 @@ before.
 | --- | --- | --- |
 | pinned group reads | 108.7 tok/s | 111.8 tok/s |
 | + whole-layer reads for the server's last 4096-token batch | 174.0 tok/s | 205.3 tok/s |
+| + one pass over the prompt (server) | 209.4 tok/s | 229.0 tok/s |
 
-The server processes the last `n_ubatch + 4` tokens of a prompt as separate batches, to make context
-checkpoints there. A batch that uses about every expert reads the whole model once, so this tail
-costs a second pass over the weights (about 30 s of the 94-96 s above).
+A batch that uses about every expert reads the whole model once. The server used to split a prompt at
+user messages and `n_ubatch + 4` tokens before its end to make context checkpoints there, and each
+split was another pass over the weights. With `--layer-major` it only splits off the last 4 tokens:
+the checkpoint there is the one a continued chat restores. Editing the last message of a chat
+processes it again from the start of the prompt.
 
 ### Several models behind one server
 
