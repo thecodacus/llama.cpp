@@ -163,6 +163,39 @@ The mask is not lossless: with 14 of 384 experts per layer cached, it decides 4 
 most tokens. GSM8K held on the questions above, but a larger evaluation is still to do. Not in this
 build: the DSpark draft model, vision, and DSML tool-call parsing.
 
+#### Long prompts
+
+A long prompt runs in several ubatches, and each ubatch normally runs every layer. The experts do
+not fit in RAM, so every ubatch reads all of them from the SSD again: a 16k prompt in 4096-token
+ubatches reads about 700 GB. `--layer-major N` runs N layers over all ubatches of a batch, then the
+next N, so each layer's experts are read about once per prompt. `GGML_SCHED_READAHEAD` reads the
+weights in on background threads, many requests at a time instead of one page fault after another,
+and with `--layer-major` it reads the next layers while the other ubatches run the current ones.
+`-b` must be larger than `-ub`, so that the whole prompt is one batch:
+
+```bash
+GGML_SCHED_PREFETCH_EXPERTS=3 GGML_SCHED_READAHEAD=16 \
+./build/bin/llama-server -m DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00004.gguf \
+  -ngl 99 -ncmoe 99 -fa on -c 32768 -ub 4096 -b 32768 --jinja \
+  -lm mmap --lazy-mode on --no-sched-async-cpu \
+  --moe-cache-dyn 32 --moe-cache-mask 2 --layer-major 3
+```
+
+Measured on one RTX 5060 Ti 16 GB with 58 GB of RAM (about 50 GB free for the page cache), a new
+16.7k-token prompt from a cold page cache, greedy:
+
+| Flags | Prefill tok/s | Read from SSD |
+| --- | --- | --- |
+| `-ub 4096 -b 4096` | 16.1 | 710 GB |
+| + `GGML_SCHED_READAHEAD=16` | 38.2 | 635 GB |
+| + `-b 32768 --layer-major 5` | 61.8 | 432 GB |
+| + `-b 32768 --layer-major 3` | 79.4 | 317 GB |
+
+A 19.2k-token prompt prefilled at 89.2 tok/s. Decode speed and the GSM8K answers did not change.
+A group should be small: the page cache holds two groups while the next one is read, and with
+`--layer-major 8` (about 26 GB per group) prefill fell to 48.9 tok/s. The model loads in under a
+minute too: when it is larger than the free RAM, the loader no longer reads it all in first.
+
 ### Several models behind one server
 
 Every flag works as a key in a `--models-preset` INI section:
@@ -194,6 +227,8 @@ Every flag below has a default that suits the common case; set one only to overr
 | `GGML_CUDA_REGISTER_HOST` | off (`=1` enables) | Pins the expert weights kept in RAM. Mapped weights are pinned in place where the GPU supports it; otherwise (e.g. GeForce cards) they are copied into pinned buffers at load, up to three quarters of the RAM. Lazily read tensors (`--lazy-mode`) are never pinned. Pinned memory cannot be paged out: on a model bigger than the RAM it can push lazily read tensors out of the page cache and slow everything down. |
 | `GGML_SCHED_PREFETCH_EXPERTS` | off (`=N` enables) | Uploads each layer's offloaded expert weights on a second CUDA stream while earlier layers compute. `N` is the staging slots per GPU (at most 8): a layer takes one set of slots, one per weight (gate, up, down), so `=6` gives two sets and the next layer's copy overlaps the current layer's compute; `=1` means one set. Each slot is the size of the largest weight it stages, so two sets cost about six expert tensors of VRAM per GPU. Needs op offload; pairs well with borrowing. |
 | `--moe-cache-dyn N` | `0` (off) | Re-elects the cached experts every `N` tokens decoded while the cache is resident: each layer keeps the experts with the most router picks (raw top-k, counted on the GPU), earlier windows weighted by `--moe-cache-decay` (default `0.9`). Experts that stay keep their slot; new ones leave the routing, upload on a worker thread while decoding goes on, and are routed to after the decode in which the upload finished. Output is unchanged. Without `--moe-cache-profile` it turns the cache on by itself, starting from each layer's first experts. Qwen3.8-Flash on one RTX 3060 with MTP: 27.9 -> 32.0 tok/s. |
+| `--layer-major N` | `0` (off) | A batch of several ubatches runs `N` layers over all of them, then the next `N`, so each layer's weights are read once per batch instead of once per ubatch. For a model larger than the RAM; use `-b` larger than `-ub`. Only DeepSeek-V4.1 builds layer ranges so far; off for embeddings. DeepSeek-V4.1-Flash on a 5060 Ti, 16k prompt: 38 -> 79 tok/s with `--layer-major 3`. |
+| `GGML_SCHED_READAHEAD` | off (`=N` threads) | `N` threads read in the host weights the next graph splits copy to the GPU (up to `GGML_SCHED_READAHEAD_MB`, default 8192, ahead), so a memory-mapped model larger than the RAM is read with many requests in flight. With `--layer-major` they also read the next layer group. Tables read by rows (`--lazy-mode`) are left out. |
 | `--moe-cache-mask N` | `-1` (off) | Routes each token only to cached experts, except the router's top `N` picks, which still run (on the CPU when not cached). Not lossless: it changes the output. `--moe-cache-mask 2` with `--moe-cache-dyn 32` and MTP: 38.7 tok/s decode, 170 tok/s prefill on short prompts, same GSM8K/HumanEval scores on a 20-task check. `0` (cache only) badly hurts quality. Batches that borrow the cache are never masked. |
 
 With an expert cache profile, the MTP draft context keeps a ubatch no larger than the borrow size
