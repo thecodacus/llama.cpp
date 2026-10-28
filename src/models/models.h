@@ -1357,6 +1357,8 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
 
     bool graph_layer_ranges() const override { return true; }
 
+    void prefetch_batch_rows(const std::vector<llama_ubatch> & ubatches) const override;
+
     struct graph : public llama_model_deepseek4::graph {
         graph(const llama_model & model, const llm_graph_params & params);
         // helpers only (no graph built): base of graph_dsv41

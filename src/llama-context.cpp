@@ -2103,6 +2103,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
         const bool lm_read = lm_buf[0] && lm_buf[1];
         const auto buf_base = [&](int b) { return (char *) ggml_backend_buffer_get_base(lm_buf[b].get()); };
 
+        // the rows the ubatches will gather from tables read lazily are read while the first layers run
+        {
+            std::vector<llama_ubatch> ubatches;
+            do {
+                ubatches.push_back(mctx->get_ubatch());
+            } while (mctx->next());
+            mctx->rewind();
+            model.prefetch_batch_rows(ubatches);
+        }
+
         // a range's weights are copied to the GPU from its buffer when the read of all of them succeeded
         int cur = 0;
         std::future<bool> rd;

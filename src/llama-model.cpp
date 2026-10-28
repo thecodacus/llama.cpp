@@ -1253,13 +1253,16 @@ bool llama_model::is_lazy(const ggml_tensor * t) const {
 }
 
 void llama_model::prefetch_rows(const ggml_tensor * table, const ggml_tensor * ids) const {
+    prefetch_rows(table, std::vector<int32_t>((const int32_t *) ids->data, (const int32_t *) ids->data + ggml_nelements(ids)));
+}
+
+void llama_model::prefetch_rows(const ggml_tensor * table, std::vector<int32_t> rows) const {
     // forget the jobs that have finished; a running one keeps going alongside the new one
     auto & jobs = pimpl->row_readers;
     jobs.erase(std::remove_if(jobs.begin(), jobs.end(), [](const std::future<void> & f) {
         return f.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
     }), jobs.end());
 
-    std::vector<int32_t> rows((const int32_t *) ids->data, (const int32_t *) ids->data + ggml_nelements(ids));
     std::sort(rows.begin(), rows.end());
     rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
 
