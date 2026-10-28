@@ -785,7 +785,7 @@ static bool ggml_is_view_op(enum ggml_op op) {
 #endif
 
 #ifndef GGML_SCHED_MAX_PREFETCH_SLOTS
-#define GGML_SCHED_MAX_PREFETCH_SLOTS 8
+#define GGML_SCHED_MAX_PREFETCH_SLOTS 16
 #endif
 
 struct ggml_backend_sched_split {
@@ -1866,8 +1866,13 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 
         // the re-allocation may cause the split inputs to be moved to a different address
         // synchronize without ggml_backend_sched_synchronize to avoid changing cur_copy
-        for (int i = 0; i < sched->n_backends; i++) {
-            ggml_backend_synchronize(sched->backends[i]);
+        // with one copy, a new plan in the same buffers needs no wait: the work of the graph before runs first on
+        // each backend's stream, and the user inputs were copied synchronously. a buffer that grows is freed only after
+        // the backends are done (ggml_backend_sched_realloc_sync)
+        if (sched->n_copies > 1) {
+            for (int i = 0; i < sched->n_backends; i++) {
+                ggml_backend_synchronize(sched->backends[i]);
+            }
         }
 
         ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
@@ -1878,6 +1883,14 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     }
 
     return true;
+}
+
+// the allocator is about to free a compute buffer to allocate a larger one
+static void ggml_backend_sched_realloc_sync(void * user_data) {
+    ggml_backend_sched_t sched = (ggml_backend_sched_t) user_data;
+    for (int i = 0; i < sched->n_backends; i++) {
+        ggml_backend_synchronize(sched->backends[i]);
+    }
 }
 
 static void ggml_backend_sched_prefetch_disable(ggml_backend_sched_t sched, int backend_id) {
@@ -2091,6 +2104,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_buffer_get_usage(in->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS || ggml_nbytes(in) < (1u << 20) ||
                 ggml_backend_sched_prefetch_holds(sched, sp->backend_id, in) ||
                 (sched->host_src && sched->host_src->count(in))) {
+                continue;
+            }
+            // the experts of a small batch: only the ones it routes to are copied
+            ggml_tensor * in_cpy = tensor_copy(sp->inputs[j], sp->backend_id, sched->cur_copy);
+            bool experts = false;
+            for (int n = 0; n < sp->graph.n_nodes && !experts; n++) {
+                experts = sp->graph.nodes[n]->op == GGML_OP_MUL_MAT_ID && sp->graph.nodes[n]->src[0] == in_cpy;
+            }
+            if (experts && ggml_backend_sched_prefetch_node(sp, sp->inputs[j], in_cpy) == NULL) {
                 continue;
             }
             n += ggml_nbytes(in);
@@ -2534,6 +2556,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
     }
 
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
+    ggml_gallocr_set_realloc_cb(sched->galloc, ggml_backend_sched_realloc_sync, sched);
     sched->op_offload = op_offload;
 
     // GGML_SCHED_PREFETCH_EXPERTS=1 enables the default slot count, higher values set it

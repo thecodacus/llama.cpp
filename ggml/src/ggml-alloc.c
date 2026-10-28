@@ -493,7 +493,15 @@ struct ggml_gallocr {
 
     struct leaf_alloc * leaf_allocs; // [n_leafs]
     int n_leafs;
+
+    void (*realloc_cb)(void * user_data);
+    void * realloc_cb_data;
 };
+
+void ggml_gallocr_set_realloc_cb(ggml_gallocr_t galloc, void (*cb)(void * user_data), void * user_data) {
+    galloc->realloc_cb      = cb;
+    galloc->realloc_cb_data = user_data;
+}
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
     ggml_gallocr_t galloc = (ggml_gallocr_t)calloc(1, sizeof(struct ggml_gallocr));
@@ -932,6 +940,9 @@ static bool ggml_gallocr_reserve_n_impl(
                 }
             }
 #endif
+            if (galloc->buffers[i] != NULL && galloc->realloc_cb != NULL) {
+                galloc->realloc_cb(galloc->realloc_cb_data);
+            }
             ggml_vbuffer_free(galloc->buffers[i]);
             if (no_alloc) {
                 galloc->buffers[i] = NULL;
@@ -1043,6 +1054,16 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
 #endif
                 return true;
             }
+        }
+    }
+
+    // a leaf no node reads (an input of a partial graph) is checked by itself
+    for (int i = 0; i < graph->n_leafs; i++) {
+        if (!ggml_gallocr_node_needs_realloc(galloc, graph->leafs[i], &galloc->leaf_allocs[i].leaf)) {
+#ifndef NDEBUG
+            GGML_LOG_DEBUG("%s: leaf %s is not valid\n", __func__, graph->leafs[i]->name);
+#endif
+            return true;
         }
     }
 
