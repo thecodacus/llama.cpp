@@ -207,10 +207,14 @@ faults on the mapping read at about 1.7 GB/s on the test machine, `pread` at 5-6
 buffers (two times the largest group) cannot be allocated, the weights come from the mapping as
 before.
 
-| Flags (with the pinned group reads) | 16.7k prompt | 19.2k prompt |
+| `--layer-major 1`, `GGML_SCHED_PREFETCH_EXPERTS=3` | 16.7k prompt | 19.2k prompt |
 | --- | --- | --- |
-| `--layer-major 1`, `GGML_SCHED_PREFETCH_EXPERTS=3` | 108.7 tok/s | 111.8 tok/s |
-| `--layer-major 3`, `GGML_SCHED_PREFETCH_EXPERTS=3` | 93.6 tok/s | 114.5 tok/s |
+| pinned group reads | 108.7 tok/s | 111.8 tok/s |
+| + whole-layer reads for the server's last 4096-token batch | 174.0 tok/s | 205.3 tok/s |
+
+The server processes the last `n_ubatch + 4` tokens of a prompt as separate batches, to make context
+checkpoints there. A batch that uses about every expert reads the whole model once, so this tail
+costs a second pass over the weights (about 30 s of the 94-96 s above).
 
 ### Several models behind one server
 
