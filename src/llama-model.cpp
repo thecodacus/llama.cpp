@@ -33,6 +33,7 @@
 #include <cmath>
 #include <functional>
 #include <future>
+#include <array>
 #include <atomic>
 #include <map>
 #include <thread>
@@ -2523,6 +2524,84 @@ size_t llama_model::moe_pack_upload(size_t i) const {
     std::vector<int32_t> map_hot, map_cold;
     size_t total_bytes = 0;
 
+    // the slabs of mapped weights are read with pread on 16 threads: page faults on the mapping read one page at a
+    // time, and the cache is uploaded again after every batch that borrowed its memory. a layer is read into one of
+    // two pinned buffers while the one before is copied to the device from the other
+    const auto slab_srcs = [&](size_t k) {
+        const auto & l = layers[group.layers[k]];
+        return std::array<const ggml_tensor *, 3>{ l.ffn_gate_exps, l.ffn_up_exps, l.ffn_down_exps };
+    };
+    const auto stage_layout = [&](size_t k, std::vector<size_t> & off) {
+        const auto srcs = slab_srcs(k);
+        const int64_t S = layers[group.layers[k]].ffn_gate_exps_hot->ne[2];
+        off.assign(3*S, SIZE_MAX);
+        size_t n = 0;
+        for (int64_t s = 0; s < S; s++) {
+            for (int t = 0; t < 3; t++) {
+                if (ggml_backend_buffer_is_host(srcs[t]->buffer) && is_mapped(srcs[t])) {
+                    off[3*s + t] = n;
+                    n += srcs[t]->nb[2];
+                }
+            }
+        }
+        return n;
+    };
+    size_t stage_max = 0;
+    {
+        std::vector<size_t> off;
+        for (size_t k = 0; k < group.layers.size(); k++) {
+            stage_max = std::max(stage_max, stage_layout(k, off));
+        }
+    }
+    ggml_backend_buffer_ptr stage_buf[2];
+    std::vector<uint8_t> stage_vec[2];
+    uint8_t * stage[2] = { nullptr, nullptr };
+    if (stage_max > 0) {
+        ggml_backend_buffer_type_t host = ggml_backend_dev_host_buffer_type(group.dev);
+        for (int b = 0; b < 2; b++) {
+            if (host != nullptr) {
+                stage_buf[b].reset(ggml_backend_buft_alloc_buffer(host, stage_max));
+            }
+            if (stage_buf[b]) {
+                stage[b] = (uint8_t *) ggml_backend_buffer_get_base(stage_buf[b].get());
+            } else {
+                stage_vec[b].resize(stage_max);
+                stage[b] = stage_vec[b].data();
+            }
+        }
+    }
+    // the offsets of the slabs of layer k in its buffer; SIZE_MAX for a slab read below instead
+    const auto read_layer = [&](size_t k) {
+        std::vector<size_t> off;
+        const size_t n = stage_layout(k, off);
+        const auto srcs = slab_srcs(k);
+        uint8_t * dst = stage[k % 2];
+        std::atomic<int64_t> next{0};
+        std::vector<std::thread> threads;
+        for (int i = 0; i < 16 && n > 0; i++) {
+            threads.emplace_back([&]() {
+                for (int64_t j; (j = next++) < (int64_t) off.size(); ) {
+                    if (off[j] == SIZE_MAX) {
+                        continue;
+                    }
+                    const int t = (int) (j%3);
+                    const size_t nb = srcs[t]->nb[2];
+                    if (!read_mapped(srcs[t], group.ranked[k][j/3]*nb, nb, dst + off[j])) {
+                        off[j] = SIZE_MAX; // read through the mapping below
+                    }
+                }
+            });
+        }
+        for (auto & th : threads) {
+            th.join();
+        }
+        return off;
+    };
+
+    std::future<std::vector<size_t>> next_read;
+    if (!group.layers.empty()) {
+        next_read = std::async(std::launch::async, read_layer, 0);
+    }
     for (size_t k = 0; k < group.layers.size(); k++) {
         const auto & l = layers[group.layers[k]];
         const int64_t n_expert = l.ffn_gate_exps->ne[2];
@@ -2535,45 +2614,15 @@ size_t llama_model::moe_pack_upload(size_t i) const {
         }
 
         // expert dim is outermost: one contiguous slab per expert
-        const ggml_tensor * srcs[3] = { l.ffn_gate_exps, l.ffn_up_exps, l.ffn_down_exps };
+        const auto srcs = slab_srcs(k);
         ggml_tensor * dsts[3] = { l.ffn_gate_exps_hot, l.ffn_up_exps_hot, l.ffn_down_exps_hot };
 
-        // the slabs of mapped weights are read with pread on 16 threads first: page faults on the mapping read one
-        // page at a time, and the cache is uploaded again after every batch that borrowed its memory
-        std::vector<uint8_t> staged;
-        std::vector<size_t> staged_off(3*S, SIZE_MAX);
-        {
-            size_t n = 0;
-            for (int64_t s = 0; s < S; s++) {
-                for (int t = 0; t < 3; t++) {
-                    if (ggml_backend_buffer_is_host(srcs[t]->buffer) && is_mapped(srcs[t])) {
-                        staged_off[3*s + t] = n;
-                        n += srcs[t]->nb[2];
-                    }
-                }
-            }
-            staged.resize(n);
-            std::atomic<int64_t> next{0};
-            std::vector<std::thread> threads;
-            for (int i = 0; i < 16 && n > 0; i++) {
-                threads.emplace_back([&]() {
-                    for (int64_t j; (j = next++) < 3*S; ) {
-                        const int64_t s = j/3;
-                        const int     t = (int) (j%3);
-                        if (staged_off[j] == SIZE_MAX) {
-                            continue;
-                        }
-                        const size_t nb = srcs[t]->nb[2];
-                        if (!read_mapped(srcs[t], group.ranked[k][s]*nb, nb, staged.data() + staged_off[j])) {
-                            staged_off[j] = SIZE_MAX; // read through the mapping below
-                        }
-                    }
-                });
-            }
-            for (auto & th : threads) {
-                th.join();
-            }
+        // the buffer of layer k + 1 is free: layer k - 1 was copied from it
+        const std::vector<size_t> staged_off = next_read.get();
+        if (k + 1 < group.layers.size()) {
+            next_read = std::async(std::launch::async, read_layer, k + 1);
         }
+        const uint8_t * staged = stage[k % 2];
 
         for (int64_t s = 0; s < S; s++) {
             const int32_t e = group.ranked[k][s];
@@ -2582,7 +2631,7 @@ size_t llama_model::moe_pack_upload(size_t i) const {
             for (int t = 0; t < 3; t++) {
                 const size_t nb = srcs[t]->nb[2];
                 if (staged_off[3*s + t] != SIZE_MAX) {
-                    ggml_backend_tensor_set(dsts[t], staged.data() + staged_off[3*s + t], s*nb, nb);
+                    ggml_backend_tensor_set(dsts[t], staged + staged_off[3*s + t], s*nb, nb);
                 } else if (ggml_backend_buffer_is_host(srcs[t]->buffer)) {
                     // straight from the host weights, they are pinned when mapped
                     ggml_backend_tensor_set(dsts[t], (const char *) srcs[t]->data + e*nb, s*nb, nb);
