@@ -8744,6 +8744,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 8, 2, 1, 1, false));
+    // narrow rows, one thread per row
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32,  1, 16384, 2051, 256, 1, false));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 10,   512,   10,  97, 1, false));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32,  3,    20,    7,   5, 3, true));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F16,  3,    20,    7,   5, 3, false));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_BF16, 16,   20,    7,   5, 3, false));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_I32,  1,   512,   20,   1, 1, false));
     for (ggml_type type : all_types) {
         for (int b : {1, 7}) {
             for (bool v : {false, true}) {
