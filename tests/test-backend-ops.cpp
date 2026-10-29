@@ -6597,6 +6597,51 @@ struct test_moe_weighted_reduction : public test_case {
     }
 };
 
+// several multiplications of F16/BF16 weights by the same F32 input: a backend may convert the input once for all
+struct test_mul_mat_shared_src1 : public test_case {
+    const ggml_type type;
+    const int64_t   k;
+    const int64_t   m;
+    const int64_t   n;
+    const int       n_mats;
+
+    std::string vars() override {
+        return VARS_TO_STR5(type, k, m, n, n_mats);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_SHARED_SRC1";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_mul_mat_shared_src1(ggml_type type, int64_t k, int64_t m, int64_t n, int n_mats)
+        : type(type), k(k), m(m), n(n), n_mats(n_mats) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(a, "a");
+        // a node, as the output of the op before
+        ggml_tensor * x = ggml_scale(ctx, a, 1.0f);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * out = nullptr;
+        for (int i = 0; i < n_mats; ++i) {
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, type, k, m);
+            ggml_set_name(w, ("w" + std::to_string(i)).c_str());
+            ggml_tensor * y = ggml_mul_mat(ctx, w, x);
+            out = out ? ggml_add(ctx, out, y) : y;
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // add(a, mul(repeat(b), w)): the backends fuse the three into one pass
 struct test_repeat_mul_add : public test_case {
     const std::array<int64_t, 4> ne;   // the output
@@ -10545,6 +10590,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // Cover the supported boundaries, common k = 8 shapes, interleaved views and adds, and k = 16 fallback.
     test_cases.emplace_back(new test_moe_weighted_reduction(63,  2, 17));
+    test_cases.emplace_back(new test_mul_mat_shared_src1(GGML_TYPE_BF16, 1024, 64, 256, 2));
+    test_cases.emplace_back(new test_mul_mat_shared_src1(GGML_TYPE_BF16, 1024, 4, 256, 3));
+    test_cases.emplace_back(new test_mul_mat_shared_src1(GGML_TYPE_F16, 1024, 64, 256, 2));
     test_cases.emplace_back(new test_moe_weighted_reduction(2048, 8, 128));
     test_cases.emplace_back(new test_moe_weighted_reduction(2048, 8, 128, false, true));
     test_cases.emplace_back(new test_moe_weighted_reduction(63,   12, 33, true,  true, true));

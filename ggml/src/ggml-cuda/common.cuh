@@ -1539,6 +1539,26 @@ struct ggml_backend_cuda_context {
     ggml_cuda_pool & pool() {
         return pool(device);
     }
+
+    // the f32 input of a matrix multiplication converted for cuBLAS, kept in pool memory for the later multiplications
+    // of the graph that read the same input (the graph loop asks for it, ggml_cuda_mul_mat_cublas_impl makes and reads it)
+    struct src1_conversion {
+        const ggml_tensor * src  = nullptr;
+        ggml_type           type = GGML_TYPE_COUNT;
+        int                 uses = 0;       // the later multiplications that read it
+        void *              ptr  = nullptr; // held: the pool memory
+        size_t              size = 0;
+        ggml_cuda_pool *    from = nullptr;
+    };
+    src1_conversion src1_conv_req; // asked for by the node about to run
+    src1_conversion src1_conv;     // held
+
+    void src1_conv_release() {
+        if (src1_conv.ptr != nullptr) {
+            src1_conv.from->free(src1_conv.ptr, src1_conv.size);
+        }
+        src1_conv = {};
+    }
 };
 
 struct ggml_cuda_mm_fusion_args_host {
