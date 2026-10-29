@@ -1202,6 +1202,9 @@ struct llama_model::impl {
     std::vector<std::pair<const char *, const char *>> ram_ranges;
     bool ram_done = false; // with an expert cache: kept once, around what its first build holds
 
+    // the pinned buffers the expert cache is read into before it is uploaded, kept for the uploads after each batch
+    ggml_backend_buffer_ptr moe_stage[2];
+
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
 
@@ -2553,17 +2556,17 @@ size_t llama_model::moe_pack_upload(size_t i) const {
             stage_max = std::max(stage_max, stage_layout(k, off));
         }
     }
-    ggml_backend_buffer_ptr stage_buf[2];
     std::vector<uint8_t> stage_vec[2];
     uint8_t * stage[2] = { nullptr, nullptr };
     if (stage_max > 0) {
         ggml_backend_buffer_type_t host = ggml_backend_dev_host_buffer_type(group.dev);
         for (int b = 0; b < 2; b++) {
-            if (host != nullptr) {
-                stage_buf[b].reset(ggml_backend_buft_alloc_buffer(host, stage_max));
+            auto & buf = pimpl->moe_stage[b];
+            if (host != nullptr && (!buf || ggml_backend_buffer_get_size(buf.get()) < stage_max)) {
+                buf.reset(ggml_backend_buft_alloc_buffer(host, stage_max));
             }
-            if (stage_buf[b]) {
-                stage[b] = (uint8_t *) ggml_backend_buffer_get_base(stage_buf[b].get());
+            if (buf) {
+                stage[b] = (uint8_t *) ggml_backend_buffer_get_base(buf.get());
             } else {
                 stage_vec[b].resize(stage_max);
                 stage[b] = stage_vec[b].data();
