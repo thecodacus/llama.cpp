@@ -21,6 +21,7 @@
 #include <string.h>
 #include <algorithm>
 #include <condition_variable>
+#include <deque>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -784,7 +785,7 @@ static bool ggml_is_view_op(enum ggml_op op) {
 #endif
 
 #ifndef GGML_SCHED_MAX_PREFETCH_SLOTS
-#define GGML_SCHED_MAX_PREFETCH_SLOTS 8
+#define GGML_SCHED_MAX_PREFETCH_SLOTS 16
 #endif
 
 struct ggml_backend_sched_split {
@@ -801,6 +802,69 @@ struct ggml_backend_sched_split {
 // async execution of CPU splits (GGML_SCHED_ASYNC_CPU): a persistent worker
 // computes a CPU split while the main thread keeps launching later splits that
 // do not depend on it, so an independent GPU split overlaps the CPU compute
+// GGML_SCHED_READAHEAD=N: N threads fault in the pages of the host weights the next splits copy to a device, so a
+// weight in a memory-mapped file (a model larger than RAM) is read with N requests in flight instead of one page fault
+// at a time; GGML_SCHED_READAHEAD_MB (default 8192) bounds how far ahead of the running split they read
+struct ggml_sched_readahead {
+    std::vector<std::thread> workers;
+    std::mutex m;
+    std::condition_variable cv;
+    std::deque<std::pair<const char *, size_t>> q;
+    bool stop = false;
+
+    explicit ggml_sched_readahead(int n) {
+        for (int i = 0; i < n; i++) {
+            workers.emplace_back([this] { run(); });
+        }
+    }
+
+    ~ggml_sched_readahead() {
+        {
+            std::lock_guard<std::mutex> lk(m);
+            stop = true;
+            q.clear();
+        }
+        cv.notify_all();
+        for (auto & w : workers) {
+            w.join();
+        }
+    }
+
+    void enqueue(const void * data, size_t size) {
+        const size_t chunk = 4u << 20;
+        {
+            std::lock_guard<std::mutex> lk(m);
+            for (size_t off = 0; off < size; off += chunk) {
+                q.emplace_back((const char *) data + off, std::min(chunk, size - off));
+            }
+        }
+        cv.notify_all();
+    }
+
+    void run() {
+        for (;;) {
+            std::pair<const char *, size_t> c;
+            {
+                std::unique_lock<std::mutex> lk(m);
+                cv.wait(lk, [this] { return stop || !q.empty(); });
+                if (stop) {
+                    return;
+                }
+                c = q.front();
+                q.pop_front();
+            }
+            // one read per page faults it in; the sum keeps the reads from being optimized out
+            volatile char sink = 0;
+            char acc = 0;
+            for (size_t off = 0; off < c.second; off += 4096) {
+                acc += c.first[off];
+            }
+            sink = acc;
+            (void) sink;
+        }
+    }
+};
+
 struct ggml_sched_cpu_async {
     std::thread             worker;
     std::mutex              mtx;
@@ -878,6 +942,9 @@ struct ggml_backend_sched_prefetch {
     ggml_backend_event_t  ready[GGML_SCHED_MAX_PREFETCH_SLOTS];
     ggml_backend_event_t  free_ev[GGML_SCHED_MAX_PREFETCH_SLOTS];
     bool                  used[GGML_SCHED_MAX_PREFETCH_SLOTS];
+    // the host weight a slot holds in full from an earlier split, NULL if none: a later split (the next ubatch of a
+    // layer-major batch) reads it from there without copying it again
+    const ggml_tensor *   held[GGML_SCHED_MAX_PREFETCH_SLOTS];
     int                   n_pos;  // staged weights per split: a set holds one slot per position (gate, up, down)
     int                   n_sets; // sets in the ring: a split takes a whole set, the next split the next one
     int                   cur;    // the set the next split takes
@@ -945,6 +1012,13 @@ struct ggml_backend_sched {
 
     // async CPU split execution (GGML_SCHED_ASYNC_CPU); NULL when disabled
     struct ggml_sched_cpu_async * cpu_async;
+
+    // host weights copied to a device from another copy of their contents (ggml_backend_sched_set_host_src)
+    std::unordered_map<const ggml_tensor *, const void *> * host_src;
+
+    // host readahead (GGML_SCHED_READAHEAD); NULL when disabled
+    struct ggml_sched_readahead * readahead;
+    size_t readahead_bytes;
 
     int debug;
 
@@ -1792,8 +1866,13 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 
         // the re-allocation may cause the split inputs to be moved to a different address
         // synchronize without ggml_backend_sched_synchronize to avoid changing cur_copy
-        for (int i = 0; i < sched->n_backends; i++) {
-            ggml_backend_synchronize(sched->backends[i]);
+        // with one copy, a new plan in the same buffers needs no wait: the work of the graph before runs first on
+        // each backend's stream, and the user inputs were copied synchronously. a buffer that grows is freed only after
+        // the backends are done (ggml_backend_sched_realloc_sync)
+        if (sched->n_copies > 1) {
+            for (int i = 0; i < sched->n_backends; i++) {
+                ggml_backend_synchronize(sched->backends[i]);
+            }
         }
 
         ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
@@ -1804,6 +1883,14 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     }
 
     return true;
+}
+
+// the allocator is about to free a compute buffer to allocate a larger one
+static void ggml_backend_sched_realloc_sync(void * user_data) {
+    ggml_backend_sched_t sched = (ggml_backend_sched_t) user_data;
+    for (int i = 0; i < sched->n_backends; i++) {
+        ggml_backend_synchronize(sched->backends[i]);
+    }
 }
 
 static void ggml_backend_sched_prefetch_disable(ggml_backend_sched_t sched, int backend_id) {
@@ -1817,7 +1904,19 @@ static void ggml_backend_sched_prefetch_disable(ggml_backend_sched_t sched, int 
         ggml_backend_buffer_free(pf->slots[i]);
         pf->slots[i] = NULL;
         pf->used[i] = false;
+        pf->held[i] = NULL;
     }
+}
+
+// a prefetch slot of the backend holds this host weight in full
+static bool ggml_backend_sched_prefetch_holds(ggml_backend_sched_t sched, int backend_id, const ggml_tensor * input) {
+    const struct ggml_backend_sched_prefetch * pf = &sched->prefetch[backend_id];
+    for (int i = 0; i < pf->n_sets*pf->n_pos; i++) {
+        if (pf->held[i] == input) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // the expert matmul of the split that reads this copy of a host weight, when the batch is large enough for prefetch to
@@ -1934,6 +2033,7 @@ static bool ggml_backend_sched_prefetch_init(ggml_backend_sched_t sched, int bac
         }
         pf->slots[i] = new_buf;
         pf->used[i]  = false;
+        pf->held[i]  = NULL;
     }
     return true;
 }
@@ -1987,10 +2087,52 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     int prev_backend_id = -1;
 
+    // host readahead: the host weights a device split copies in, queued up to readahead_bytes ahead of the running split
+    int    ra_next   = 0;   // the next split whose weights are not queued yet
+    size_t ra_queued = 0;   // bytes queued so far
+    size_t ra_passed = 0;   // bytes of the splits already run
+    auto ra_weights = [sched](struct ggml_backend_sched_split * sp, bool queue) -> size_t {
+        ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[sp->backend_id]);
+        if (dev == NULL || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            return 0;
+        }
+        size_t n = 0;
+        for (int j = 0; j < sp->n_inputs; j++) {
+            const ggml_tensor * in = sp->inputs[j];
+            // a weight a prefetch slot still holds, or copied from another source, is not read from its memory
+            if (in->buffer == NULL || in->data == NULL || !ggml_backend_buffer_is_host(in->buffer) ||
+                ggml_backend_buffer_get_usage(in->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS || ggml_nbytes(in) < (1u << 20) ||
+                ggml_backend_sched_prefetch_holds(sched, sp->backend_id, in) ||
+                (sched->host_src && sched->host_src->count(in))) {
+                continue;
+            }
+            // the experts of a small batch: only the ones it routes to are copied
+            ggml_tensor * in_cpy = tensor_copy(sp->inputs[j], sp->backend_id, sched->cur_copy);
+            bool experts = false;
+            for (int n = 0; n < sp->graph.n_nodes && !experts; n++) {
+                experts = sp->graph.nodes[n]->op == GGML_OP_MUL_MAT_ID && sp->graph.nodes[n]->src[0] == in_cpy;
+            }
+            if (experts && ggml_backend_sched_prefetch_node(sp, sp->inputs[j], in_cpy) == NULL) {
+                continue;
+            }
+            n += ggml_nbytes(in);
+            if (queue) {
+                sched->readahead->enqueue(in->data, ggml_nbytes(in));
+            }
+        }
+        return n;
+    };
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        if (sched->readahead) {
+            while (ra_next < sched->n_splits && (ra_next <= split_id || ra_queued - ra_passed < sched->readahead_bytes)) {
+                ra_queued += ra_weights(&splits[ra_next++], true);
+            }
+            ra_passed += ra_weights(split, false);
+        }
         // expert weights of this split staged through prefetch slots, restored after the split is launched
         int n_split_prefetch = 0;
         int split_set = 0;
@@ -2055,12 +2197,32 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     n_split_prefetch < pf->n_pos && split->graph.n_nodes > 0) {
                     if (ggml_backend_sched_prefetch_node(split, input, input_cpy) != NULL) {
                         {
-                            // the split takes the next set of the ring; its k-th staged weight goes to position k
+                            // the split takes the set that still holds its first weight, else the next set of the
+                            // ring; its k-th staged weight goes to position k
                             if (n_split_prefetch == 0) {
-                                split_set = pf->cur;
-                                pf->cur = (pf->cur + 1) % pf->n_sets;
+                                split_set = -1;
+                                for (int s = 0; s < pf->n_sets && split_set < 0; s++) {
+                                    if (pf->held[s*pf->n_pos] == input) {
+                                        split_set = s;
+                                    }
+                                }
+                                if (split_set < 0) {
+                                    split_set = pf->cur;
+                                    pf->cur = (pf->cur + 1) % pf->n_sets;
+                                }
                             }
                             const int slot = split_set*pf->n_pos + n_split_prefetch;
+                            if (pf->held[slot] == input) {
+                                // still on the device from an earlier split: no copy
+                                prefetch_input_cpy[n_split_prefetch]    = input_cpy;
+                                prefetch_saved_buffer[n_split_prefetch] = input_cpy->buffer;
+                                prefetch_saved_data[n_split_prefetch]   = input_cpy->data;
+                                input_cpy->buffer = pf->slots[slot];
+                                input_cpy->data   = ggml_backend_buffer_get_base(pf->slots[slot]);
+                                ggml_backend_event_wait(split_backend, pf->ready[slot]);
+                                split_prefetch_slot[n_split_prefetch++] = slot;
+                                continue;
+                            }
                             // wait for the previous user of this slot to finish computing
                             if (pf->used[slot]) {
                                 ggml_backend_event_wait(pf->backend, pf->free_ev[slot]);
@@ -2075,6 +2237,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             input_cpy->data   = ggml_backend_buffer_get_base(pf->slots[slot]);
                             const size_t nbytes = ggml_nbytes(input);
                             const size_t padded = ggml_backend_buft_get_alloc_size(ggml_backend_get_default_buffer_type(split_backend), input);
+                            const char * src = (const char *) input->data;
+                            if (sched->host_src) {
+                                auto it = sched->host_src->find(input);
+                                if (it != sched->host_src->end()) {
+                                    src = (const char *) it->second;
+                                }
+                            }
                             const std::vector<uint8_t> * resident = nullptr;
                             if (sched->prefetch_resident) {
                                 auto it = sched->prefetch_resident->find(input);
@@ -2082,8 +2251,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                     resident = &it->second;
                                 }
                             }
+                            // only a full copy can be read again by a later split
+                            pf->held[slot] = resident == nullptr ? input : NULL;
                             if (resident == nullptr) {
-                                ggml_backend_tensor_set_async(pf->backend, input_cpy, input->data, 0, nbytes);
+                                ggml_backend_tensor_set_async(pf->backend, input_cpy, src, 0, nbytes);
                             } else {
                                 // copy the runs of experts the device does not hold; their ids are the only ones the
                                 // matmul reads. each run also takes the start of the next expert, which the kernels
@@ -2101,7 +2272,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                     }
                                     const size_t off = e0*nb;
                                     const size_t end = std::min<size_t>(nbytes, e1*nb + (padded - nbytes));
-                                    ggml_backend_tensor_set_async(pf->backend, input_cpy, (const char *) input->data + off, off, end - off);
+                                    ggml_backend_tensor_set_async(pf->backend, input_cpy, src + off, off, end - off);
                                     e0 = e1;
                                 }
                             }
@@ -2385,6 +2556,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
     }
 
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
+    ggml_gallocr_set_realloc_cb(sched->galloc, ggml_backend_sched_realloc_sync, sched);
     sched->op_offload = op_offload;
 
     // GGML_SCHED_PREFETCH_EXPERTS=1 enables the default slot count, higher values set it
@@ -2398,10 +2570,37 @@ ggml_backend_sched_t ggml_backend_sched_new(
         sched->prefetch[b].n_slots = prefetch_n_slots <= 1 ? 3 : std::min(prefetch_n_slots, GGML_SCHED_MAX_PREFETCH_SLOTS);
     }
 
+    const char * GGML_SCHED_READAHEAD = getenv("GGML_SCHED_READAHEAD");
+    const int readahead_threads = GGML_SCHED_READAHEAD ? atoi(GGML_SCHED_READAHEAD) : 0;
+    sched->readahead = readahead_threads > 0 ? new ggml_sched_readahead(readahead_threads) : NULL;
+    const char * GGML_SCHED_READAHEAD_MB = getenv("GGML_SCHED_READAHEAD_MB");
+    sched->readahead_bytes = (size_t) (GGML_SCHED_READAHEAD_MB ? atoll(GGML_SCHED_READAHEAD_MB) : 8192) << 20;
+
 
     ggml_backend_sched_reset(sched);
 
     return sched;
+}
+
+void ggml_backend_sched_set_host_src(ggml_backend_sched_t sched, const struct ggml_tensor * t, const void * data) {
+    if (data == NULL) {
+        if (sched->host_src) {
+            sched->host_src->erase(t);
+        }
+        return;
+    }
+    if (sched->host_src == NULL) {
+        sched->host_src = new std::unordered_map<const ggml_tensor *, const void *>();
+    }
+    (*sched->host_src)[t] = data;
+}
+
+bool ggml_backend_sched_readahead(ggml_backend_sched_t sched, const void * data, size_t size) {
+    if (!sched->readahead) {
+        return false;
+    }
+    sched->readahead->enqueue(data, size);
+    return true;
 }
 
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
@@ -2428,6 +2627,8 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         }
     }
     delete sched->cpu_async;
+    delete sched->host_src;
+    delete sched->readahead;
     delete sched->prefetch_resident;
     ggml_gallocr_free(sched->galloc);
     ggml_free(sched->ctx);

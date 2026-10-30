@@ -1473,8 +1473,24 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
         src0_ptr = src0_alloc.get();
     }
 
+    // the input converted for an earlier multiplication of the graph, or converted now into memory kept for the later
+    // ones. only when src0 needs no conversion: the pool frees in the reverse order of its allocations
+    auto & conv     = ctx.src1_conv;
+    auto & conv_req = ctx.src1_conv_req;
     if (src1->type == compute_type) {
         src1_ptr = (const cuda_t *) src1->data;
+    } else if (conv.ptr != nullptr && conv.src == src1 && conv.type == compute_type) {
+        src1_ptr = (const cuda_t *) conv.ptr;
+        conv.uses--;
+    } else if (conv.ptr == nullptr && conv_req.src == src1 && conv_req.type == compute_type && src0->type == compute_type &&
+               ggml_is_contiguously_allocated(src1)) {
+        conv      = conv_req;
+        conv.from = &ctx.pool();
+        conv.ptr  = conv.from->alloc(ggml_nelements(src1)*sizeof(cuda_t), &conv.size);
+        const auto convert_func = traits::convert(src1->type);
+        GGML_ASSERT(convert_func != nullptr);
+        convert_func(src1->data, (cuda_t *) conv.ptr, ggml_nelements(src1), main_stream);
+        src1_ptr = (const cuda_t *) conv.ptr;
     } else {
         src1_alloc.alloc(ggml_nelements(src1));
 
@@ -4322,6 +4338,26 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     ggml_cuda_concurrent_event * concurrent_event           = nullptr;
     bool                         should_launch_concurrent_events = false;
 
+    // the kept input of the multiplications (src1_conv) goes when its last reader has run, or when a node wrote over its
+    // memory, and at the end of the graph
+    const auto src1_conv_after = [&](int first, int last) {
+        cuda_ctx->src1_conv_req = {};
+        if (cuda_ctx->src1_conv.ptr == nullptr) {
+            return;
+        }
+        const ggml_tensor * src = cuda_ctx->src1_conv.src;
+        const char * s0 = (const char *) src->data;
+        bool written = false;
+        for (int k = first; k <= last; k++) {
+            const ggml_tensor * t = cgraph->nodes[k];
+            const char * d0 = (const char *) t->data;
+            written = written || (d0 < s0 + ggml_nbytes(src) && s0 < d0 + ggml_nbytes(t));
+        }
+        if (cuda_ctx->src1_conv.uses <= 0 || written) {
+            cuda_ctx->src1_conv_release();
+        }
+    };
+
     const auto try_launch_concurrent_event = [&](const ggml_tensor * node) {
         if (stream_ctx.concurrent_events.find(node) != stream_ctx.concurrent_events.end()) {
             concurrent_event = &stream_ctx.concurrent_events[node];
@@ -4451,6 +4487,22 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                // a multiplication whose f32 input a later one reads as well asks for the converted input to be kept
+                cuda_ctx->src1_conv_req = {};
+                if (cuda_ctx->src1_conv.ptr == nullptr && !is_concurrent_event_active && node->op == GGML_OP_MUL_MAT &&
+                        (node->src[0]->type == GGML_TYPE_BF16 || node->src[0]->type == GGML_TYPE_F16) &&
+                        node->src[1]->type == GGML_TYPE_F32) {
+                    int uses = 0;
+                    for (int j = i + 1; j < cgraph->n_nodes; j++) {
+                        const ggml_tensor * other = cgraph->nodes[j];
+                        uses += other->op == GGML_OP_MUL_MAT && other->src[1] == node->src[1] &&
+                            other->src[0]->type == node->src[0]->type;
+                    }
+                    if (uses > 0) {
+                        cuda_ctx->src1_conv_req = { node->src[1], node->src[0]->type, uses };
+                    }
+                }
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
@@ -4460,6 +4512,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             nodes_to_skip + 1, ggml_op_name(node->op), node->name,
                             ggml_op_name(cgraph->nodes[last_fused]->op), cgraph->nodes[last_fused]->name);
 #endif
+                    src1_conv_after(i, i + nodes_to_skip);
                     i += nodes_to_skip;
                     continue;
                 }
@@ -4486,10 +4539,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
                 GGML_ASSERT(ok);
 
+                src1_conv_after(i, i);
+
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
                }
             }
+            cuda_ctx->src1_conv_release();
         }
 
 #ifdef USE_CUDA_GRAPH

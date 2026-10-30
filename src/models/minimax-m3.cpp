@@ -94,13 +94,13 @@ public:
         mctx(mctx), blk(blk), local(local) {}
 
     void set_input(const llama_ubatch * ubatch) override {
-        if (pos_slot_i) { mctx->set_input_pos_slot(pos_slot_i, ubatch); }
-        if (pos_slot_f) { mctx->set_input_pos_slot(pos_slot_f, ubatch); }
-        if (cell_blk)   { mctx->set_input_cell_pos(cell_blk, ubatch, blk); }
-        if (pos_mask)   { mctx->set_input_pos_mask(pos_mask, ubatch); }
+        if (pos_slot_i && pos_slot_i->buffer) { mctx->set_input_pos_slot(pos_slot_i, ubatch); }
+        if (pos_slot_f && pos_slot_f->buffer) { mctx->set_input_pos_slot(pos_slot_f, ubatch); }
+        if (cell_blk   && cell_blk->buffer)   { mctx->set_input_cell_pos(cell_blk, ubatch, blk); }
+        if (pos_mask   && pos_mask->buffer)   { mctx->set_input_pos_mask(pos_mask, ubatch); }
 
         // local-force bias over position blocks
-        if (bias && ubatch->pos) {
+        if (bias && bias->buffer && ubatch->pos) {
             const int64_t n_tokens = ubatch->n_tokens;
             const int64_t nblk     = bias->ne[0];
             std::vector<float> data((size_t) nblk * n_tokens, 0.0f);

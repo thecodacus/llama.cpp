@@ -353,6 +353,13 @@ extern "C" {
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
 
+    // queue host memory on the readahead threads (GGML_SCHED_READAHEAD) to fault its pages in; false when they are off
+    GGML_API bool                 ggml_backend_sched_readahead(ggml_backend_sched_t sched, const void * data, size_t size);
+
+    // copy the host weight t to a device from data (a copy of its contents, e.g. read into pinned memory) instead of
+    // from its own memory; data NULL removes it
+    GGML_API void                 ggml_backend_sched_set_host_src(ggml_backend_sched_t sched, const struct ggml_tensor * t, const void * data);
+
     // Reset all assignments and allocators - must be called before changing the node backends or allocating a new graph.
     // This in effect deallocates all tensors that were previously allocated and leaves them with dangling pointers.
     // The correct way to use this API is to discard the deallocated tensors and create new ones.

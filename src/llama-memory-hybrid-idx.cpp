@@ -719,6 +719,18 @@ bool llama_memory_hybrid_idx_context::apply() {
     return res;
 }
 
+bool llama_memory_hybrid_idx_context::replay() {
+    return llama_memory_hybrid_context::replay() && (!ctx_idx || ctx_idx->replay());
+}
+
+void llama_memory_hybrid_idx_context::rewind() {
+    if (ctx_idx) {
+        ctx_idx->rewind();
+    }
+    i_cur = 0;
+    llama_memory_hybrid_context::rewind();
+}
+
 const llama_kv_cache_context * llama_memory_hybrid_idx_context::get_idx() const {
     return static_cast<const llama_kv_cache_context *>(ctx_idx.get());
 }

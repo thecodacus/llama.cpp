@@ -13,12 +13,20 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <algorithm>
+#include <cctype>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <functional>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
+
+static std::vector<std::pair<const ggml_tensor *, size_t>> llama_layers_host_weights(const llama_model & model, int32_t il0, int32_t il1, size_t * size);
+
 
 //
 // llama_context
@@ -257,6 +265,8 @@ llama_context::llama_context(
     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
             cparams.n_outputs_max : std::min(params.n_outputs_max_per_seq, cparams.n_outputs_max);
 
+    cparams.n_layer_major = params.n_layer_major;
+
     // Initialize backend samplers here so they are part of the sampling graph
     // before the reserve passes run later in this function. This avoids a later
     // re-reserve when graph nodes change.
@@ -344,6 +354,9 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: n_rs_seq              = %u\n",   __func__, cparams.n_rs_seq);
     LLAMA_LOG_INFO("%s: n_outputs_max         = %u\n",   __func__, cparams.n_outputs_max);
     LLAMA_LOG_INFO("%s: n_outputs_max_per_seq = %u\n",   __func__, cparams.n_outputs_max_per_seq);
+    if (cparams.n_layer_major > 0) {
+        LLAMA_LOG_INFO("%s: n_layer_major         = %u\n",   __func__, cparams.n_layer_major);
+    }
 
     if (cparams.n_ctx_seq < hparams.n_ctx_train) {
         LLAMA_LOG_INFO("%s: n_ctx_seq (%u) < n_ctx_train (%u) -- the full capacity of the model will not be utilized\n",
@@ -1532,7 +1545,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
+    // a layer range is cut out of the graph it was built from: it is never reused
+    const bool layer_range = lm_il_end > 0;
+    bool lm_set_inputs = true;
+    std::vector<std::pair<ggml_tensor *, ggml_backend_buffer_t>> lm_inputs_set; // set by an earlier range
+
+    if (!graph_reuse_disable && !layer_range && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1561,6 +1579,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        if (layer_range) {
+            gf = lm_layer_range(gf, res->get_ctx());
+            res->set_gf(gf);
+            lm_set_inputs = lm_inputs_bind(gf, res->get_ctx(), lm_inputs_set);
+        }
+
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
@@ -1573,7 +1597,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
-        res->set_inputs(&ubatch);
+        if (lm_set_inputs) {
+            // the inputs an earlier range set are left as they are: without a buffer, set_inputs skips them
+            for (auto & [t, buf] : lm_inputs_set) {
+                t->buffer = nullptr;
+            }
+            res->set_inputs(&ubatch);
+            for (auto & [t, buf] : lm_inputs_set) {
+                t->buffer = buf;
+            }
+        }
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
@@ -1604,6 +1637,30 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+
+    // the nodes later layers read go to the buffers of the ubatch, copied on the device stream after the graph;
+    // what no later layer reads goes back to the pool
+    // (the copies come after the graph on its stream, so a buffer the graph read can take a copy)
+    if (layer_range) {
+        auto & lc = lm_carry[lm_ubatch];
+        for (auto it = lc.nodes.begin(); it != lc.nodes.end(); ) {
+            if (it->second.last_use < lm_il_end) {
+                if (it->second.owned) {
+                    lm_carry_give(it->second.t);
+                }
+                it = lc.nodes.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        for (const auto & out : lm_outs) {
+            ggml_backend_t backend_t = ggml_backend_sched_get_tensor_backend(sched.get(), out.t);
+            GGML_ASSERT(backend_t != nullptr);
+            ggml_tensor * dst = lm_carry_take(out.t, backend_t);
+            ggml_backend_tensor_copy_async(backend_t, backend_t, out.t, dst);
+            lc.nodes[out.idx] = { dst, out.last_use, true };
+        }
     }
 
     ret = GGML_STATUS_SUCCESS;
@@ -1854,7 +1911,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
 
-    n_decode_calls++;
+    lm_il_start = 0;
+    lm_il_end   = 0;
+    // what a layer-major batch that failed left behind
+    if (!lm_carry.empty() || !lm_carry_pool.empty()) {
+        ggml_backend_sched_synchronize(sched.get());
+        lm_carry.clear();
+        lm_carry_pool.clear();
+        gf_res_prev->reset();
+    }
 
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
@@ -1959,7 +2024,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // a batch whose first ubatch borrows the expert cache memory lends it before the batch is split, so the split uses
     // the ubatch size fitted to the lent memory. the buffers are reserved for the cells the batch can reach, twice
     // that for the batches that follow, and fitted again when a later batch reaches beyond them
-    if (moe_cache_on && (n_decode_calls > 1 || !model.moe_cache_auto()) && cparams.moe_cache_borrow > 0 &&
+    if (moe_cache_on && (!cparams.warmup || !model.moe_cache_auto()) && cparams.moe_cache_borrow > 0 &&
         std::min(n_tokens_all, n_ubatch_max) >= cparams.moe_cache_borrow) {
         uint32_t n_cells = n_tokens_all;
         for (llama_seq_id s = 0; memory && s < (llama_seq_id) cparams.n_seq_max; ++s) {
@@ -2025,11 +2090,179 @@ int llama_context::decode(const llama_batch & batch_inp) {
         llama_sampler_backend_begin(entry.second);
     }
 
+    // MoE expert cache: build it on first use (fitted slots), lend its memory to large batches, upload it again after.
+    // fitted slots skip the warm-up, which runs before a draft model is loaded
+    const auto moe_cache_borrow = [&](uint32_t n_tokens) {
+        if (moe_cache_on && (!cparams.warmup || !model.moe_cache_auto())) {
+            const bool off = cparams.moe_cache_borrow > 0 && n_tokens >= cparams.moe_cache_borrow;
+            if (off != cparams.moe_packs_off) {
+                moe_cache_switch(off);
+            }
+        }
+    };
+
+    // layer-major: the layer ranges before the last one run over all ubatches first, so each range's weights are
+    // read once per batch; the loop below runs the last range. the cache is lent or not for the whole batch.
+    // a batch of one ubatch also runs this way when it uses about every expert and has the whole cache memory (or
+    // there is no cache): its layers are then read whole
+    const bool all_experts = (uint64_t) n_tokens_all*hparams.n_expert_used() >= 2*(uint64_t) hparams.n_expert &&
+        (!moe_cache_on || (cparams.moe_cache_borrow > 0 && n_tokens_all >= cparams.moe_cache_borrow));
+    const bool layer_major = cparams.n_layer_major > 0 && cparams.n_layer_major < hparams.n_layer() &&
+        ctx_type_to_graph_type(cparams.ctx_type) == LLM_GRAPH_TYPE_DEFAULT &&
+        all_experts && !cparams.embeddings &&
+        std::find(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(), true) == cparams.embeddings_layer_inp.end() &&
+        mctx->replay();
+    // a layer range never outlives the batch, whichever way decode returns
+    struct lm_range_reset {
+        llama_context * ctx;
+        ~lm_range_reset() { ctx->lm_il_start = 0; ctx->lm_il_end = 0; }
+    } lm_reset { this };
+
+    // every range builds the same graph of a ubatch (the carried nodes are found by their index in it)
+    const auto ubatch_outputs = [&](const llama_ubatch & ub) {
+        if (n_outputs_all == n_tokens_all) {
+            return (int32_t) ub.n_tokens;
+        }
+        int32_t n = 0;
+        for (uint32_t i = 0; i < ub.n_tokens; i++) {
+            n += (int32_t) (ub.output[i] != 0);
+        }
+        return n;
+    };
+
+    if (layer_major) {
+        moe_cache_borrow(mctx->get_ubatch().n_tokens);
+
+        const int32_t n_layer = (int32_t) hparams.n_layer();
+        const int32_t n_group = (int32_t) cparams.n_layer_major;
+        const int32_t il_last = ((n_layer - 1)/n_group)*n_group;
+
+        // the group buffers, sized for the largest range
+        if (!lm_buf_tried) {
+            lm_buf_tried = true;
+            size_t size_max = 0;
+            for (int32_t il0 = 0; il0 < n_layer; il0 += n_group) {
+                size_t size = 0;
+                llama_layers_host_weights(model, il0, il0 + n_group, &size);
+                size_max = std::max(size_max, size);
+            }
+            // pinned memory copies to the GPU fastest; plain RAM still saves the page faults on the mapping
+            ggml_backend_dev_t gpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+            ggml_backend_buffer_type_t buft = nullptr;
+            for (ggml_backend_buffer_type_t b : { gpu ? ggml_backend_dev_host_buffer_type(gpu) : nullptr, ggml_backend_cpu_buffer_type() }) {
+                if (b == nullptr || size_max == 0 || (lm_buf[0] && lm_buf[1])) {
+                    continue;
+                }
+                buft = b;
+                for (auto & buf : lm_buf) {
+                    buf.reset(ggml_backend_buft_alloc_buffer(b, size_max));
+                }
+            }
+            if (lm_buf[0] && lm_buf[1]) {
+                LLAMA_LOG_INFO("%s: layer-major: 2 x %.2f MiB %s buffers for reading the layer weights\n", __func__,
+                        size_max/1024.0/1024.0, ggml_backend_buft_name(buft));
+            } else {
+                LLAMA_LOG_WARN("%s: layer-major: could not allocate 2 x %.2f MiB to read the layer weights into, using the mapping\n",
+                        __func__, size_max/1024.0/1024.0);
+                lm_buf[0].reset();
+                lm_buf[1].reset();
+            }
+        }
+        const bool lm_read = lm_buf[0] && lm_buf[1];
+        const auto buf_base = [&](int b) { return (char *) ggml_backend_buffer_get_base(lm_buf[b].get()); };
+
+        // the rows the ubatches will gather from tables read lazily are read while the first layers run
+        {
+            std::vector<llama_ubatch> ubatches;
+            do {
+                ubatches.push_back(mctx->get_ubatch());
+            } while (mctx->next());
+            mctx->rewind();
+            model.prefetch_batch_rows(ubatches);
+        }
+
+        // a range's weights are copied to the GPU from its buffer when the read of all of them succeeded
+        int cur = 0;
+        std::future<bool> rd;
+        if (lm_read) {
+            rd = read_layers(0, n_group, buf_base(cur));
+        }
+
+        lm_carry.clear();
+        for (int32_t il0 = 0; il0 < il_last; il0 += n_group) {
+            if (lm_read) {
+                if (rd.get()) {
+                    set_layers_src(il0, il0 + n_group, buf_base(cur));
+                }
+                // the other buffer is free: the copies of the range before it ended with its last ubatch
+                rd = read_layers(il0 + n_group, il0 + 2*n_group, buf_base(cur ^ 1));
+            }
+            mctx->rewind();
+            size_t iu = 0;
+            do {
+                const auto & ubatch = mctx->get_ubatch();
+                if (iu == lm_carry.size()) {
+                    lm_carry.emplace_back();
+                }
+                lm_il_start = il0;
+                lm_il_end   = il0 + n_group;
+                lm_ubatch   = iu;
+                n_outputs   = ubatch_outputs(ubatch);
+
+                ggml_status status;
+                const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+                if (!res) {
+                    if (rd.valid()) {
+                        rd.wait();
+                    }
+                    clear_layers_src();
+                    // every ubatch of the batch has layers without KV: remove the whole batch from the memory
+                    for (llama_seq_id s = 0; s < (llama_seq_id) cparams.n_seq_max; ++s) {
+                        const llama_pos p0 = balloc->seq_pos_min(s);
+                        if (p0 >= 0) {
+                            memory->seq_rm(s, p0, -1);
+                        }
+                    }
+                    switch (status) {
+                        case GGML_STATUS_ABORTED:      return  2;
+                        case GGML_STATUS_ALLOC_FAILED: return -2;
+                        case GGML_STATUS_FAILED:       return -3;
+                        case GGML_STATUS_SUCCESS:      GGML_ABORT("should not happen");
+                    }
+                }
+
+                // without the group buffers, the next range's weights come into RAM while the other ubatches run this one
+                if (iu == 0 && !lm_read) {
+                    readahead_layers(il0 + n_group, il0 + 2*n_group);
+                }
+                ++iu;
+            } while (mctx->next());
+
+            // the next read goes to the buffer this range was copied from
+            ggml_backend_sched_synchronize(sched.get());
+            clear_layers_src();
+            cur ^= 1;
+        }
+
+        if (lm_read && rd.get()) {
+            set_layers_src(il_last, n_layer, buf_base(cur));
+        }
+
+        mctx->rewind();
+        lm_il_start = il_last;
+        lm_il_end   = n_layer;
+    }
+
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
+    size_t  i_ubatch       = 0;
 
     do {
         const auto & ubatch = mctx->get_ubatch();
+
+        if (layer_major) {
+            lm_ubatch = i_ubatch;
+        }
 
         // count the outputs in this ubatch
         {
@@ -2047,13 +2280,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
             n_outputs = n_outputs_new;
         }
 
-        // MoE expert cache: build it on first use (fitted slots), lend its memory to large batches, upload it again after.
-        // fitted slots wait for the second decode: the first is the warm-up, which runs before a draft model is loaded
-        if (moe_cache_on && (n_decode_calls > 1 || !model.moe_cache_auto())) {
-            const bool off = cparams.moe_cache_borrow > 0 && ubatch.n_tokens >= cparams.moe_cache_borrow;
-            if (off != cparams.moe_packs_off) {
-                moe_cache_switch(off);
-            }
+        if (!layer_major) {
+            moe_cache_borrow(ubatch.n_tokens);
         }
 
         ggml_status status;
@@ -2061,6 +2289,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
 
         if (!res) {
+            clear_layers_src();
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
             llama_pos pos_min[LLAMA_MAX_SEQ];
             for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
@@ -2212,7 +2441,18 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
+        ++i_ubatch;
     } while (mctx->next());
+
+    clear_layers_src();
+
+    // the carried nodes and the range graph go: the next graph is built whole
+    if (layer_major) {
+        ggml_backend_sched_synchronize(sched.get());
+        lm_carry.clear();
+        lm_carry_pool.clear();
+        gf_res_prev->reset();
+    }
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
@@ -2789,7 +3029,7 @@ llm_graph_params llama_context::graph_params(
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype) const {
-    return {
+    llm_graph_params params = {
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
         /*.cparams     =*/ cparams,
@@ -2806,6 +3046,455 @@ llm_graph_params llama_context::graph_params(
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
     };
+    return params;
+}
+
+// the host weights of layers [il0, il1), with their offset in a buffer holding all of them; a table read lazily
+// (Engram, PLE) is read by rows and left out: reading all of it would flush the page cache
+static std::vector<std::pair<const ggml_tensor *, size_t>> llama_layers_host_weights(const llama_model & model, int32_t il0, int32_t il1, size_t * size) {
+    std::vector<std::pair<const ggml_tensor *, size_t>> res;
+    size_t off = 0;
+    for (const auto & [name, t] : model.tensors_by_name) {
+        int il = -1;
+        if (sscanf(name.c_str(), "blk.%d.", &il) != 1 || il < il0 || il >= il1) {
+            continue;
+        }
+        if (t->buffer && ggml_backend_buffer_is_host(t->buffer) && !model.is_lazy(t) && model.is_mapped(t) &&
+            ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+            res.emplace_back(t, off);
+            off += GGML_PAD(ggml_nbytes(t), 4096);
+        }
+    }
+    *size = off;
+    return res;
+}
+
+void llama_context::readahead_layers(int32_t il0, int32_t il1) {
+    size_t size = 0;
+    for (const auto & [t, off] : llama_layers_host_weights(model, il0, il1, &size)) {
+        if (!ggml_backend_sched_readahead(sched.get(), t->data, ggml_nbytes(t))) {
+            return;
+        }
+    }
+}
+
+std::future<bool> llama_context::read_layers(int32_t il0, int32_t il1, char * dst) {
+    size_t size = 0;
+    auto weights = llama_layers_host_weights(model, il0, il1, &size);
+    return std::async(std::launch::async, [this, weights = std::move(weights), dst]() {
+        // 4 MiB reads on 16 threads: page faults on the mapping read at about a third of the speed
+        struct piece {
+            const ggml_tensor * t;
+            size_t offs;
+            size_t size;
+            char * dst;
+        };
+        const size_t chunk = 4u << 20;
+        std::vector<piece> pieces;
+        for (const auto & [t, off] : weights) {
+            for (size_t o = 0; o < ggml_nbytes(t); o += chunk) {
+                pieces.push_back({ t, o, std::min(chunk, ggml_nbytes(t) - o), dst + off + o });
+            }
+        }
+        std::atomic<size_t> next{0};
+        std::atomic<bool> ok{true};
+        std::vector<std::thread> threads;
+        for (int i = 0; i < 16; i++) {
+            threads.emplace_back([&]() {
+                for (size_t k; (k = next++) < pieces.size(); ) {
+                    const auto & p = pieces[k];
+                    if (!model.read_mapped(p.t, p.offs, p.size, p.dst)) {
+                        ok = false;
+                    }
+                }
+            });
+        }
+        for (auto & th : threads) {
+            th.join();
+        }
+        return ok.load();
+    });
+}
+
+// layer-major: a view computes nothing, it shows its source
+static bool llama_lm_is_view(const ggml_tensor * t) {
+    return t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE;
+}
+
+// layer-major: the layer a tensor name gives: "blk.N." (weights), "name-N" (the graph callback), "name_lN" (memory
+// tensors); -1 if none
+static int llama_lm_name_layer(const char * name) {
+    int il = -1;
+    if (sscanf(name, "blk.%d.", &il) == 1) {
+        return il;
+    }
+    const char * end = name + strlen(name);
+    const char * p   = end;
+    while (p > name && isdigit((unsigned char) p[-1])) {
+        --p;
+    }
+    if (p == end || p == name) {
+        return -1;
+    }
+    if (p[-1] == '-' || (p - name >= 2 && p[-1] == 'l' && p[-2] == '_')) {
+        return atoi(p);
+    }
+    return -1;
+}
+
+// layer-major: the graph of layers [lm_il_start, lm_il_end) of a ubatch, cut out of its whole graph gf, built in ctx.
+// a node belongs to the layer its name gives, or to the latest layer among its sources; nodes of no layer that the
+// range reads (masks, positions) are computed again where needed. a node an earlier range computed is read from the
+// buffer it was copied to. the nodes of this range a later layer reads are listed in lm_outs
+ggml_cgraph * llama_context::lm_layer_range(ggml_cgraph * gf, ggml_context * ctx) {
+    const int32_t n_layer = (int32_t) model.hparams.n_layer();
+    const int32_t l0 = lm_il_start;
+    const int32_t l1 = lm_il_end;
+    const int n_nodes = ggml_graph_n_nodes(gf);
+
+    auto & lc = lm_carry[lm_ubatch];
+    if (lc.n_nodes < 0) {
+        lc.n_nodes = n_nodes;
+    }
+    // the carried nodes leave the device the scratch of the largest matrix multiplication of the whole graph
+    lm_scratch = 0;
+    for (int i = 0; i < n_nodes; i++) {
+        lm_scratch = std::max(lm_scratch, llama_mul_mat_scratch(ggml_graph_node(gf, i)));
+    }
+    GGML_ASSERT(lc.n_nodes == n_nodes && "layer-major: the graph of a ubatch changed between layer ranges");
+
+    std::unordered_map<const ggml_tensor *, int> idx;
+    std::vector<int> layer(n_nodes);
+    const auto layer_of = [&](const ggml_tensor * t) {
+        const auto it = idx.find(t);
+        return it != idx.end() ? layer[it->second] : llama_lm_name_layer(t->name);
+    };
+    for (int i = 0; i < n_nodes; i++) {
+        ggml_tensor * t = ggml_graph_node(gf, i);
+        int l = llama_lm_name_layer(t->name);
+        for (int k = 0; k < GGML_MAX_SRC; k++) {
+            if (t->src[k]) {
+                l = std::max(l, layer_of(t->src[k]));
+            }
+        }
+        layer[i] = std::min(l, n_layer - 1);
+        idx[t] = i;
+    }
+
+    // the computed node a source stands for, and the last layer that reads each node
+    const auto root = [](ggml_tensor * t) {
+        while (llama_lm_is_view(t)) {
+            t = t->src[0];
+        }
+        return t;
+    };
+    std::vector<int>  last_use(n_nodes, -1);
+    std::vector<char> is_read(n_nodes, 0);
+    for (int i = 0; i < n_nodes; i++) {
+        ggml_tensor * t = ggml_graph_node(gf, i);
+        for (int k = 0; k < GGML_MAX_SRC; k++) {
+            if (!t->src[k]) {
+                continue;
+            }
+            const auto it_s = idx.find(t->src[k]);
+            if (it_s != idx.end()) {
+                is_read[it_s->second] = 1;
+            }
+            if (llama_lm_is_view(t)) {
+                continue;
+            }
+            const auto it_r = idx.find(root(t->src[k]));
+            if (it_r != idx.end()) {
+                last_use[it_r->second] = std::max(last_use[it_r->second], layer[i]);
+            }
+        }
+    }
+
+    // a node of no layer that nothing reads (a write to memory) runs with the first range
+    const auto in_range = [&](int i) {
+        const int l = layer[i] >= 0 || is_read[i] ? layer[i] : 0;
+        return l >= l0 && l < l1;
+    };
+
+    // the computed nodes (not views, of a layer) a node reads
+    const auto computed_srcs = [&](const ggml_tensor * t, std::vector<int> & out) {
+        out.clear();
+        for (int k = 0; k < GGML_MAX_SRC; k++) {
+            if (!t->src[k]) {
+                continue;
+            }
+            const auto it = idx.find(root(t->src[k]));
+            if (it != idx.end() && layer[it->second] >= 0 && std::find(out.begin(), out.end(), it->second) == out.end()) {
+                out.push_back(it->second);
+            }
+        }
+    };
+    // ops a later range computes again rather than keeping their result, when their inputs are smaller (a row
+    // gather from the cache that several layers share, say)
+    const auto cheap = [](const ggml_tensor * t) {
+        switch (t->op) {
+            case GGML_OP_GET_ROWS:
+            case GGML_OP_CPY:
+            case GGML_OP_DUP:
+            case GGML_OP_CONT:
+            case GGML_OP_CONCAT:
+            case GGML_OP_REPEAT:
+            case GGML_OP_SCALE:
+            case GGML_OP_NORM:
+            case GGML_OP_RMS_NORM:
+                return t->view_src == nullptr;
+            default:
+                return false;
+        }
+    };
+
+    // what later layers read: kept, or computed again from what is kept
+    std::map<int, int32_t> keep; // node -> last layer that reads it
+    {
+        std::vector<std::pair<int, int32_t>> work;
+        for (int i = 0; i < n_nodes; i++) {
+            if (in_range(i) && !llama_lm_is_view(ggml_graph_node(gf, i)) && last_use[i] >= l1) {
+                work.push_back({ i, last_use[i] });
+            }
+        }
+        std::vector<int> srcs;
+        while (!work.empty()) {
+            const auto [i, until] = work.back();
+            work.pop_back();
+            ggml_tensor * t = ggml_graph_node(gf, i);
+            if (layer[i] < l0) {
+                // an earlier range's node: kept there, or computed again from what was kept
+                const auto c = lc.nodes.find(i);
+                if (c != lc.nodes.end()) {
+                    c->second.last_use = std::max(c->second.last_use, until);
+                } else {
+                    computed_srcs(t, srcs);
+                    for (int j : srcs) {
+                        work.push_back({ j, until });
+                    }
+                }
+                continue;
+            }
+            if (cheap(t)) {
+                computed_srcs(t, srcs);
+                size_t n_bytes = 0;
+                for (int j : srcs) {
+                    n_bytes += keep.count(j) || lc.nodes.count(j) ? 0 : ggml_nbytes(ggml_graph_node(gf, j));
+                }
+                if (n_bytes <= ggml_nbytes(t)) {
+                    for (int j : srcs) {
+                        work.push_back({ j, until });
+                    }
+                    continue;
+                }
+            }
+            keep[i] = std::max(keep.count(i) ? keep[i] : -1, until);
+        }
+    }
+
+    lm_outs.clear();
+    size_t n_keep_bytes = 0;
+    for (const auto & [i, until] : keep) {
+        ggml_tensor * t = ggml_graph_node(gf, i);
+        if (t->view_src != nullptr && idx.find(t->view_src) == idx.end()) {
+            // it wrote to a memory tensor (the KV cache): later layers read it there
+            if (!lc.views) {
+                ggml_init_params ip = { 256*ggml_tensor_overhead(), nullptr, true };
+                lc.views.reset(ggml_init(ip));
+            }
+            ggml_tensor * v = ggml_view_4d(lc.views.get(), t->view_src, t->ne[0], t->ne[1], t->ne[2], t->ne[3],
+                    t->nb[1], t->nb[2], t->nb[3], t->view_offs);
+            lc.nodes[i] = { v, until, false };
+        } else {
+            ggml_set_output(t);
+            lm_outs.push_back({ i, t, until });
+            n_keep_bytes += ggml_nbytes(t);
+        }
+    }
+    if (lm_ubatch == 0) {
+        LLAMA_LOG_DEBUG("%s: layers [%d, %d): %zu nodes kept for later layers, %.1f MiB\n", __func__, l0, l1, lm_outs.size(), n_keep_bytes/1024.0/1024.0);
+        for (const auto & out : lm_outs) {
+            LLAMA_LOG_DEBUG("%s:   %s %s %.1f MiB, read until layer %d\n", __func__, out.t->name, ggml_op_desc(out.t), ggml_nbytes(out.t)/1024.0/1024.0, out.last_use);
+        }
+    }
+
+    // the sources an earlier range computed: their copies, or the nodes computed again from them
+    std::vector<char> cut(n_nodes, 0);
+    std::function<void(ggml_tensor *)> cut_srcs = [&](ggml_tensor * t) {
+        for (int k = 0; k < GGML_MAX_SRC; k++) {
+            ggml_tensor * s = t->src[k];
+            if (!s) {
+                continue;
+            }
+            ggml_tensor * r = root(s);
+            const auto it = idx.find(r);
+            if (it == idx.end() || layer[it->second] < 0 || layer[it->second] >= l0) {
+                continue;
+            }
+            const auto c = lc.nodes.find(it->second);
+            if (c == lc.nodes.end()) {
+                GGML_ASSERT(cheap(r) && "layer-major: a node an earlier range computed was not kept");
+                if (!cut[it->second]) {
+                    cut[it->second] = 1;
+                    cut_srcs(r);
+                }
+                continue;
+            }
+            ggml_tensor * p = c->second.t;
+            if (s == r) {
+                t->src[k] = p;
+                continue;
+            }
+            for (ggml_tensor * v = s; llama_lm_is_view(v); v = v->src[0]) {
+                if (v->view_src == r) {
+                    v->view_src = p;
+                }
+                if (v->src[0] == r) {
+                    v->src[0] = p;
+                    break;
+                }
+            }
+        }
+    };
+    for (int i = 0; i < n_nodes; i++) {
+        ggml_tensor * t = ggml_graph_node(gf, i);
+        if (in_range(i) && !llama_lm_is_view(t)) {
+            cut_srcs(t);
+        }
+    }
+
+    // the inputs the range does not read stay unallocated, and their data is not set
+    ggml_cgraph * sub = ggml_new_graph_custom(ctx, ggml_graph_size(gf), false);
+    for (int i = 0; i < n_nodes; i++) {
+        if (in_range(i)) {
+            ggml_build_forward_expand(sub, ggml_graph_node(gf, i));
+        }
+    }
+    return sub;
+}
+
+bool llama_context::lm_inputs_bind(ggml_cgraph * gf, ggml_context * ctx, std::vector<std::pair<ggml_tensor *, ggml_backend_buffer_t>> & set) {
+    auto & lc = lm_carry[lm_ubatch];
+    std::vector<ggml_tensor *> inp;
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        if ((t->flags & GGML_TENSOR_FLAG_INPUT) && t->view_src == nullptr) {
+            inp.push_back(t);
+        }
+    }
+
+    if (lc.inp_ctx == nullptr) {
+        ggml_init_params ip = { inp.size()*ggml_tensor_overhead(), nullptr, true };
+        lc.inp_ctx.reset(ggml_init(ip));
+        for (ggml_tensor * t : inp) {
+            ggml_tensor * p = ggml_dup_tensor(lc.inp_ctx.get(), t);
+            ggml_set_name(p, t->name);
+            lc.inp.push_back(p);
+        }
+        lc.inp_set.assign(inp.size(), 0);
+        lc.inp_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(lc.inp_ctx.get(),
+                ggml_backend_sched_get_buffer_type(sched.get(), backend_cpu)));
+        GGML_ASSERT(lc.inp_buf != nullptr);
+    }
+    GGML_ASSERT(lc.inp.size() == inp.size() && "layer-major: the inputs of a ubatch changed between layer ranges");
+
+    // the inputs the range reads
+    std::unordered_set<const ggml_tensor *> read;
+    for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+        const ggml_tensor * t = ggml_graph_node(gf, i);
+        for (int k = 0; k < GGML_MAX_SRC; k++) {
+            if (t->src[k] && (t->src[k]->flags & GGML_TENSOR_FLAG_INPUT)) {
+                read.insert(t->src[k]);
+            }
+        }
+    }
+
+    // each input is set by the first range that reads it, in a buffer of the ubatch the later ranges read: a table
+    // read lazily from disk is gathered only for the layer that needs it, while the ranges before it run
+    bool need = false;
+    set.clear();
+    for (size_t i = 0; i < inp.size(); i++) {
+        ggml_tensor * p = lc.inp[i];
+        GGML_ASSERT(p->type == inp[i]->type && ggml_are_same_shape(p, inp[i]));
+        if (p->data == nullptr || (!lc.inp_set[i] && read.count(inp[i]) == 0)) {
+            continue;
+        }
+        inp[i]->buffer = p->buffer;
+        inp[i]->data   = p->data;
+        if (lc.inp_set[i]) {
+            set.push_back({ inp[i], p->buffer });
+        } else {
+            lc.inp_set[i] = 1;
+            need = true;
+        }
+    }
+
+    // an input the graph reads that is not kept (made outside the graph context) is set again
+    for (const ggml_tensor * t : read) {
+        need = need || t->buffer == nullptr;
+    }
+    return need;
+}
+
+// a buffer for a carried node, with its layout (it can be a strided view), on the device of the graph when it fits
+ggml_tensor * llama_context::lm_carry_take(const ggml_tensor * like, ggml_backend_t backend) {
+    for (auto & b : lm_carry_pool) {
+        if (!b.used && b.t->type == like->type && ggml_are_same_shape(b.t, like) &&
+            std::equal(like->nb, like->nb + GGML_MAX_DIMS, b.t->nb)) {
+            b.used = true;
+            return b.t;
+        }
+    }
+    ggml_init_params ip = { ggml_tensor_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    ggml_tensor * t = ggml_new_tensor(ctx, like->type, GGML_MAX_DIMS, like->ne);
+    std::copy(like->nb, like->nb + GGML_MAX_DIMS, t->nb);
+    ggml_set_name(t, "carry");
+    // the device keeps free the scratch the backend allocates while computing
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    size_t free = 0;
+    size_t total = 0;
+    if (dev != nullptr) {
+        ggml_backend_dev_memory(dev, &free, &total);
+    }
+    ggml_backend_buffer_t buf = nullptr;
+    if (free >= ggml_nbytes(t) + lm_scratch) {
+        buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_get_default_buffer_type(backend));
+    }
+    // else in pinned memory, which copies to and from the device fastest
+    ggml_backend_buffer_type_t host = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+    if (buf == nullptr && host != nullptr) {
+        buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, host);
+    }
+    if (buf == nullptr) {
+        buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_cpu_buffer_type());
+    }
+    GGML_ASSERT(buf != nullptr);
+    lm_carry_pool.push_back({ ggml_context_ptr(ctx), ggml_backend_buffer_ptr(buf), t, true });
+    return t;
+}
+
+void llama_context::lm_carry_give(const ggml_tensor * t) {
+    for (auto & b : lm_carry_pool) {
+        if (b.t == t) {
+            b.used = false;
+            return;
+        }
+    }
+}
+
+void llama_context::set_layers_src(int32_t il0, int32_t il1, const char * base) {
+    size_t size = 0;
+    for (const auto & [t, off] : llama_layers_host_weights(model, il0, il1, &size)) {
+        ggml_backend_sched_set_host_src(sched.get(), t, base + off);
+        lm_src.push_back(t);
+    }
+}
+
+void llama_context::clear_layers_src() {
+    for (const auto * t : lm_src) {
+        ggml_backend_sched_set_host_src(sched.get(), t, nullptr);
+    }
+    lm_src.clear();
 }
 
 ggml_status llama_context::graph_compute(
@@ -3941,6 +4630,7 @@ llama_context_params llama_context_default_params() {
         /*.n_rs_seq                    =*/ 0,
         /*.n_outputs_max               =*/ 0,
         /*.n_outputs_max_per_seq       =*/ 1,
+        /*.n_layer_major               =*/ 0,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
         /*.ctx_type                    =*/ LLAMA_CONTEXT_TYPE_DEFAULT,
@@ -4106,6 +4796,10 @@ uint32_t llama_n_batch(const llama_context * ctx) {
 
 uint32_t llama_n_ubatch(const llama_context * ctx) {
     return ctx->n_ubatch();
+}
+
+uint32_t llama_n_layer_major(const llama_context * ctx) {
+    return ctx->get_cparams().n_layer_major;
 }
 
 uint32_t llama_n_seq_max(const llama_context * ctx) {

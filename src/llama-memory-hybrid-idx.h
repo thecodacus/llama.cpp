@@ -151,6 +151,9 @@ public:
     bool next()  override;
     bool apply() override;
 
+    bool replay() override;
+    void rewind() override;
+
     //
     // llama_memory_hybrid_idx_context specific API
     //

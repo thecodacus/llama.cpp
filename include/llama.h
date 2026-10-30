@@ -348,6 +348,7 @@ extern "C" {
         int32_t      moe_cache_dyn;     // re-elect the cached experts every this many decoded tokens (0 = disabled); without a profile it turns the cache on
         int32_t      moe_cache_mask;    // route only to cached experts, except the router's top N picks (< 0 = disabled)
         float        moe_cache_decay;   // weight of the earlier windows in the re-election
+        int32_t      weights_in_ram;    // MiB of mapped host weights kept in RAM: the most routed experts of the profile, else whole layers (0 = none)
         // target for a draft head that declares nextn_shared_target_tensors; must outlive this model
         const struct llama_model * model_shared;
 
@@ -375,6 +376,7 @@ extern "C" {
         uint32_t n_rs_seq;              // number of recurrent-state snapshots per seq for rollback (0 = no rollback) [EXPERIMENTAL]
         uint32_t n_outputs_max;         // max outputs in a ubatch (0 = n_batch)
         uint32_t n_outputs_max_per_seq; // max outputs per sequence (0 = n_outputs_max)
+        uint32_t n_layer_major;         // a batch of several ubatches runs this many layers over all its ubatches, then the next layers (0 = off)
         int32_t  n_threads;             // number of threads to use for generation
         int32_t  n_threads_batch;       // number of threads to use for batch processing
 
@@ -580,6 +582,7 @@ extern "C" {
     LLAMA_API uint32_t llama_n_ctx_seq  (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_batch    (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_ubatch   (const struct llama_context * ctx);
+    LLAMA_API uint32_t llama_n_layer_major(const struct llama_context * ctx); // 0 when the model cannot run layer-major
     LLAMA_API uint32_t llama_n_seq_max  (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_rs_seq   (const struct llama_context * ctx);
 

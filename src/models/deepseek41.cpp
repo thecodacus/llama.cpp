@@ -336,6 +336,51 @@ void llama_model_deepseek41::engram_hash(int e, const llama_ubatch & ubatch, con
     }
 }
 
+// the Engram rows the ubatches of a batch will gather from the host tables. a token's history comes from the batch
+// (the tokens before the batch are not looked up: their few rows are read when gathered)
+void llama_model_deepseek41::prefetch_batch_rows(const std::vector<llama_ubatch> & ubatches) const {
+    if (engram_tab.empty()) {
+        return;
+    }
+    const int64_t n_prev = engram_max_ngram - 1;
+
+    std::unordered_map<int64_t, llama_token> tok_at; // (seq, pos) -> token
+    const auto key = [](llama_seq_id s, llama_pos p) { return ((int64_t) s << 32) | (uint32_t) p; };
+    for (const auto & ub : ubatches) {
+        for (uint32_t i = 0; ub.token && i < ub.n_tokens; ++i) {
+            tok_at[key(ub.seq_id[i][0], ub.pos[i])] = ub.token[i];
+        }
+    }
+
+    std::vector<std::vector<int32_t>> rows(engram_layers.size());
+    std::vector<llama_token> prev;
+    std::vector<int32_t> ids;
+    for (const auto & ub : ubatches) {
+        if (!ub.token) {
+            continue;
+        }
+        prev.assign((size_t) ub.n_tokens*n_prev, LLAMA_TOKEN_NULL);
+        for (uint32_t i = 0; i < ub.n_tokens; ++i) {
+            for (int64_t s = 1; s <= n_prev; ++s) {
+                const auto it = tok_at.find(key(ub.seq_id[i][0], ub.pos[i] - (llama_pos) s));
+                if (it != tok_at.end()) {
+                    prev[i*n_prev + (n_prev - s)] = it->second;
+                }
+            }
+        }
+        for (size_t e = 0; e < engram_layers.size(); ++e) {
+            engram_hash((int) e, ub, prev, ids);
+            rows[e].insert(rows[e].end(), ids.begin(), ids.end());
+        }
+    }
+    // each layer's rows go to readers of their own
+    for (size_t e = 0; e < engram_layers.size(); ++e) {
+        if (is_lazy(engram_tab[e])) {
+            prefetch_rows(engram_tab[e], std::move(rows[e]));
+        }
+    }
+}
+
 // cand_pin: +1e30 (the reference uses +inf) on the block holding each query's newest compressed row, so a partly
 // filled block always survives; a finite pin keeps fully masked blocks at -inf instead of NaN
 class llm_graph_input_dsv41 : public llm_graph_input_i {

@@ -456,6 +456,7 @@ struct common_params {
     int32_t n_sequences           =     1; // number of sequences to decode
     int32_t n_outputs_max         =     0; // max outputs in a batch (0 = n_batch)
     int32_t n_outputs_max_per_seq =     1; // max outputs per sequence
+    int32_t n_layer_major         =     0; // a batch of several ubatches runs this many layers over all of them at a time (0 = off)
     int32_t grp_attn_n            =     1; // group-attention factor
     int32_t grp_attn_w            =   512; // group-attention width
     int32_t n_print               =    -1; // print token count every n tokens (-1 = disabled)
@@ -590,6 +591,7 @@ struct common_params {
     int32_t     moe_cache_dyn     = 0;    // re-elect the cached experts every N decoded tokens (0 = disabled)
     int32_t     moe_cache_mask    = -1;   // route only to cached experts except the router's top N picks (-1 = disabled)
     float       moe_cache_decay   = 0.9f; // weight of the earlier windows in the re-election
+    int32_t     weights_in_ram    = 0;    // GiB of mapped host weights kept in RAM: the most routed experts of the profile
 
     bool single_turn       = false; // single turn chat conversation
 

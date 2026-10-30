@@ -1260,9 +1260,23 @@ bool llama_memory_recurrent_context::apply() {
         return true;
     }
 
+    if (replaying && i_next < slots_after.size()) {
+        mem->set_slots(slots_after[i_next]);
+        return true;
+    }
+
     mem->find_slot(ubatches[i_next]);
 
+    if (replaying) {
+        slots_after.push_back(mem->get_slots());
+    }
+
     return true;
+}
+
+bool llama_memory_recurrent_context::replay() {
+    replaying = !ubatches.empty();
+    return replaying;
 }
 
 llama_memory_status llama_memory_recurrent_context::get_status() const {

@@ -12,6 +12,7 @@
 #include "ggml-opt.h"
 
 #include <atomic>
+#include <future>
 #include <map>
 #include <thread>
 #include <vector>
@@ -363,6 +364,58 @@ private:
     void moe_dyn_after(uint32_t n_tokens); // end of a decode
     void moe_dyn_finish();                 // wait for the uploads and route to them
 
+    // layer-major prompt processing (fork, --layer-major): process_ubatch computes layers [lm_il_start, lm_il_end) of
+    // the graph of ubatch lm_ubatch (lm_il_end 0: the whole graph). the nodes an earlier range computed for later
+    // layers are kept per ubatch, by their index in the graph, until the last layer that reads them
+    int32_t lm_il_start = 0;
+    int32_t lm_il_end   = 0;
+    size_t  lm_ubatch   = 0;
+    struct lm_carried {
+        ggml_tensor * t;
+        int32_t last_use;
+        bool owned; // a pool buffer; else a view of the memory the node wrote to
+    };
+    struct lm_carry_ubatch {
+        std::map<int, lm_carried> nodes;
+        int n_nodes = -1;
+        ggml_context_ptr views; // the views of memory tensors
+        // the inputs of the ubatch, the same for every range: the first range sets them, the later ones read them
+        ggml_context_ptr inp_ctx;
+        ggml_backend_buffer_ptr inp_buf;
+        std::vector<ggml_tensor *> inp;
+        std::vector<char> inp_set; // set by a range
+    };
+    std::vector<lm_carry_ubatch> lm_carry;
+    struct lm_carry_out {
+        int idx;
+        ggml_tensor * t;
+        int32_t last_use;
+    };
+    std::vector<lm_carry_out> lm_outs; // of the last range graph
+    struct lm_carry_buf {
+        ggml_context_ptr ctx;
+        ggml_backend_buffer_ptr buf;
+        ggml_tensor * t;
+        bool used;
+    };
+    std::vector<lm_carry_buf> lm_carry_pool; // on the device when it fits, reused across ranges and ubatches
+    size_t lm_scratch = 0; // what the carried nodes leave free on the device
+    ggml_cgraph * lm_layer_range(ggml_cgraph * gf, ggml_context * ctx);
+    // true: an input is to be set; set: the inputs an earlier range set, with their buffers
+    bool lm_inputs_bind(ggml_cgraph * gf, ggml_context * ctx, std::vector<std::pair<ggml_tensor *, ggml_backend_buffer_t>> & set);
+    ggml_tensor * lm_carry_take(const ggml_tensor * like, ggml_backend_t backend);
+    void lm_carry_give(const ggml_tensor * t);
+    void readahead_layers(int32_t il0, int32_t il1); // queue the host weights of these layers on the readahead threads
+
+    // layer-major: the host weights of a layer range are read with pread into one of two buffers (pinned when the GPU
+    // has a host buffer type) and copied to the GPU from there, the next range is read while this one runs
+    ggml_backend_buffer_ptr lm_buf[2];
+    bool lm_buf_tried = false;
+    std::vector<const ggml_tensor *> lm_src; // the weights with a host source set
+    std::future<bool> read_layers(int32_t il0, int32_t il1, char * dst);
+    void set_layers_src(int32_t il0, int32_t il1, const char * base);
+    void clear_layers_src();
+
     // the configured ubatch: while the cache is lent, n_ubatch is the largest size up to this that fits in its memory
     uint32_t n_ubatch_max = 0;
 
@@ -373,8 +426,6 @@ private:
     // the reserve does not pipeline at all
     bool pipeline_required = false;
     bool pipeline_blocked  = false;
-
-    int64_t n_decode_calls = 0;
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;

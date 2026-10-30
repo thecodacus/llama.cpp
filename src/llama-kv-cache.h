@@ -188,6 +188,10 @@ public:
 
     uint32_t get_n_kv(const slot_info & sinfo) const;
 
+    // the cell metadata (not the K/V data), to put back the state of an earlier ubatch
+    llama_kv_cells_vec get_cells_all() const { return v_cells; }
+    void set_cells_all(const llama_kv_cells_vec & cells) { v_cells = cells; }
+
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
@@ -389,6 +393,9 @@ public:
     bool next()  override;
     bool apply() override;
 
+    bool replay() override;
+    void rewind() override { i_cur = 0; }
+
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
 
@@ -456,6 +463,10 @@ private:
 
     // the index of the cur ubatch to process
     size_t i_cur = 0;
+
+    // replay: the cells after the first run of each ubatch
+    bool replaying = false;
+    std::vector<llama_kv_cells_vec> cells_after;
 
     slot_info_vec_t sinfos;
 

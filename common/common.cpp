@@ -1703,6 +1703,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.moe_cache_dyn    = params.moe_cache_dyn;
     mparams.moe_cache_mask   = params.moe_cache_mask;
     mparams.moe_cache_decay  = params.moe_cache_decay;
+    mparams.weights_in_ram   = params.weights_in_ram*1024;
 
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;
@@ -1734,6 +1735,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
     cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
+    cparams.n_layer_major         = std::max(params.n_layer_major, 0);
     cparams.n_batch           = params.n_batch;
     cparams.n_ubatch          = params.n_ubatch;
     cparams.n_threads         = params.cpuparams.n_threads;

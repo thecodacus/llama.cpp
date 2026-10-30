@@ -3,8 +3,8 @@
 Faster **mixture-of-experts (MoE) models on consumer GPUs** when the experts don't fit in VRAM.
 This is [llama.cpp](https://github.com/ggml-org/llama.cpp) plus a handful of changes for the
 `--n-cpu-moe` case (experts in system RAM, the rest on the GPU). The expert cache turns on when you
-give it a routing profile; everything it needs after that sizes itself (see
-[Flags and defaults](#flags-and-defaults)). Models without a profile run as upstream.
+give it a routing profile, or `--moe-cache-dyn N` without one; everything it needs after that sizes
+itself (see [Flags and defaults](#flags-and-defaults)). Without either flag a model runs as upstream.
 
 | Feature | What it does | How to turn it on |
 | --- | --- | --- |
@@ -14,6 +14,7 @@ give it a routing profile; everything it needs after that sizes itself (see
 | **Routing profiles** | `llama-moe-trace` records which experts a model picks, with your real sampling settings, so the cache knows what to keep. | `llama-moe-trace` (see below) |
 | **Async CPU splits** | CPU and GPU halves of each MoE layer run at the same time. | on by default with the cache (`--no-sched-async-cpu` to disable) |
 | **Prefill speedups** | Pins the expert weights kept in RAM and prefetches them on a second CUDA stream, double-buffered per GPU. | `GGML_CUDA_REGISTER_HOST=1` `GGML_SCHED_PREFETCH_EXPERTS=6` |
+| **DeepSeek-V4.1-Flash** | `deepseek41`, from ISTA-DASLab's GSQ-RCO GGUFs (the Engram tables in their own file next to the shards), with the expert cache. | see [DeepSeek-V4.1-Flash](#deepseek-v41-flash) |
 | **Qwen3.8-Flash-Next MTP** | `--spec-type draft-mtp` works for `qwen4exp` with its separate draft head. | `-md mtp-*.gguf --spec-type draft-mtp` |
 
 Measured decode speed on one **RTX 3060 12 GB** (`-ngl 99 -ncmoe 99 -fa 1`):
@@ -31,7 +32,8 @@ On **two RTX 3060s**, Qwen3.8-Flash-Next with the cache split across both cards 
 (see [Two GPUs](#two-gpus)). With prefill borrowing and prefetch, the GSQ-RCO IQ3_XXS build of the
 same model reads a 17k-token prompt at **437 tok/s**, up from 61 with its experts on the CPU.
 
-Cache-capable architectures: `qwen35moe`, `qwen4exp` (Qwen3.8-Flash-Next), `deepseek2`, `laguna`.
+Cache-capable architectures: `qwen35moe`, `qwen4exp` (Qwen3.8-Flash-Next), `deepseek2`, `deepseek41`
+(DeepSeek-V4.1-Flash), `laguna`.
 Other models run unchanged.
 
 ## Quick start
@@ -123,6 +125,102 @@ no gain); at `-c 131072` `-ub 8192` settles on 2048 pipelined (a 58k-token promp
 copies run at full PCIe speed on GeForce cards. Lending the cache memory took 0.5–1.3 s and
 uploading it again about 2 s per long prompt.
 
+### DeepSeek-V4.1-Flash
+
+Runs the GSQ-RCO GGUFs from [ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF)
+(763B parameters, 384 experts per layer, 6 per token). Put the four shards of one set and
+`DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf` in one folder: the backbone names its Engram file, and the
+loader opens it from there. The Engram tables (111 GB) are read one row per token, lazily, and never
+go to the GPU. No routing profile is needed: `--moe-cache-dyn` fills the cache from the live routing.
+
+```bash
+GGML_SCHED_PREFETCH_EXPERTS=3 \
+./build/bin/llama-server -m DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00004.gguf \
+  -ngl 99 -ncmoe 99 -fa on -c 8192 -ub 2048 -b 2048 --jinja \
+  -lm mmap --lazy-mode on --no-sched-async-cpu \
+  --moe-cache-dyn 32 --moe-cache-mask 2
+```
+
+`-lm mmap` is needed: the 129 GiB backbone (IQ2_XXS) is larger than the RAM of a normal PC, and
+the experts the cache does not hold are paged in from the files. Use an NVMe drive. Drop
+`--moe-cache-mask 2` for output identical to the full model.
+
+Measured on one RTX 3060 12 GB with 52 GB of RAM: 4 GSM8K questions, greedy, thinking off,
+14 cache slots per layer. Decode is given for the first and the fourth request, as the page cache warms:
+
+| Flags | Decode tok/s | GSM8K |
+| --- | --- | --- |
+| profile, static cache | 4.0 -> 5.1 | 4/4 |
+| `--moe-cache-dyn 32` | 3.7 -> 6.5 | 4/4 |
+| `--moe-cache-dyn 32 --moe-cache-mask 2` | 7.8 -> 15.2 | 4/4 |
+
+Started from a cold page cache, `--moe-cache-dyn 32 --moe-cache-mask 2` decoded at 6.7 -> 10.7 tok/s.
+It read 46-63 MB per token from the SSD once warm, but 178 GB while loading, so the first start
+takes about 4 minutes. With the mask, a second GPU did not help: two RTX 3060s (49 + 45 slots per
+layer, `-sm layer`) decoded at 13.5 tok/s, the cards taking turns on every token.
+
+The mask is not lossless: with 14 of 384 experts per layer cached, it decides 4 of the 6 experts of
+most tokens. GSM8K held on the questions above, but a larger evaluation is still to do. Not in this
+build: the DSpark draft model, vision, and DSML tool-call parsing.
+
+#### Long prompts
+
+A long prompt runs in several ubatches, and each ubatch normally runs every layer. The experts do
+not fit in RAM, so every ubatch reads all of them from the SSD again: a 16k prompt in 4096-token
+ubatches reads about 700 GB. `--layer-major N` runs N layers over all ubatches of a batch, then the
+next N, so each layer's experts are read about once per prompt. `GGML_SCHED_READAHEAD` reads the
+weights in on background threads, many requests at a time instead of one page fault after another,
+and with `--layer-major` it reads the next layers while the other ubatches run the current ones.
+`-b` must be larger than `-ub`, so that the whole prompt is one batch:
+
+```bash
+GGML_SCHED_PREFETCH_EXPERTS=3 GGML_SCHED_READAHEAD=16 \
+./build/bin/llama-server -m DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00004.gguf \
+  -ngl 99 -ncmoe 99 -fa on -c 32768 -ub 4096 -b 32768 --jinja \
+  -lm mmap --lazy-mode on --no-sched-async-cpu \
+  --moe-cache-dyn 32 --moe-cache-mask 2 --layer-major 1
+```
+
+Measured on one RTX 5060 Ti 16 GB with 58 GB of RAM (about 50 GB free for the page cache), a new
+16.7k-token prompt from a cold page cache, greedy:
+
+| Flags | Prefill tok/s | Read from SSD |
+| --- | --- | --- |
+| `-ub 4096 -b 4096` | 16.1 | 710 GB |
+| + `GGML_SCHED_READAHEAD=16` | 38.2 | 635 GB |
+| + `-b 32768 --layer-major 5` | 61.8 | 432 GB |
+| + `-b 32768 --layer-major 3` | 79.4 | 317 GB |
+
+A 19.2k-token prompt prefilled at 89.2 tok/s. Decode speed and the GSM8K answers did not change.
+A group should be small: the page cache holds two groups while the next one is read, and with
+`--layer-major 8` (about 26 GB per group) prefill fell to 48.9 tok/s. The model loads in under a
+minute too: when it is larger than the free RAM, the loader no longer reads it all in first.
+
+With `--layer-major 1` and `GGML_SCHED_PREFETCH_EXPERTS=3`, a layer's experts stay in the prefetch
+slots on the GPU for all ubatches: the first ubatch uploads them, the others read them from there,
+and the next layer replaces them. Each expert is uploaded once per prompt (about 119 GB here instead
+of about 600 GB).
+
+A layer-major batch reads each layer group with `pread` (16 threads, 4 MiB reads) into one of two
+pinned buffers and uploads it from there, while the next group is read into the other buffer. Page
+faults on the mapping read at about 1.7 GB/s on the test machine, `pread` at 5-6 GB/s. If the
+buffers (two times the largest group) cannot be allocated, the weights come from the mapping as
+before.
+
+| `--layer-major 1`, `GGML_SCHED_PREFETCH_EXPERTS=3` | 16.7k prompt | 19.2k prompt |
+| --- | --- | --- |
+| pinned group reads | 108.7 tok/s | 111.8 tok/s |
+| + whole-layer reads for the server's last 4096-token batch | 174.0 tok/s | 205.3 tok/s |
+| + one pass over the prompt (server) | 209.4 tok/s | 229.0 tok/s |
+| + carry kept on the GPU | 290.8 tok/s | 342.3 tok/s |
+| + Engram rows read ahead | 314.0 tok/s | 348.3 tok/s |
+
+A batch that uses about every expert reads the whole model once. The server used to split a prompt at
+user messages and `n_ubatch + 4` tokens before its end to make context checkpoints there, and each
+split was another pass over the weights. With `--layer-major` it only splits off the last 4 tokens:
+the checkpoint there is the one a continued chat restores. Editing the last message of a chat
+processes it again from the start of the prompt.
+
 ### Several models behind one server
 
 Every flag works as a key in a `--models-preset` INI section:
@@ -154,6 +252,8 @@ Every flag below has a default that suits the common case; set one only to overr
 | `GGML_CUDA_REGISTER_HOST` | off (`=1` enables) | Pins the expert weights kept in RAM. Mapped weights are pinned in place where the GPU supports it; otherwise (e.g. GeForce cards) they are copied into pinned buffers at load, up to three quarters of the RAM. Lazily read tensors (`--lazy-mode`) are never pinned. Pinned memory cannot be paged out: on a model bigger than the RAM it can push lazily read tensors out of the page cache and slow everything down. |
 | `GGML_SCHED_PREFETCH_EXPERTS` | off (`=N` enables) | Uploads each layer's offloaded expert weights on a second CUDA stream while earlier layers compute. `N` is the staging slots per GPU (at most 8): a layer takes one set of slots, one per weight (gate, up, down), so `=6` gives two sets and the next layer's copy overlaps the current layer's compute; `=1` means one set. Each slot is the size of the largest weight it stages, so two sets cost about six expert tensors of VRAM per GPU. Needs op offload; pairs well with borrowing. |
 | `--moe-cache-dyn N` | `0` (off) | Re-elects the cached experts every `N` tokens decoded while the cache is resident: each layer keeps the experts with the most router picks (raw top-k, counted on the GPU), earlier windows weighted by `--moe-cache-decay` (default `0.9`). Experts that stay keep their slot; new ones leave the routing, upload on a worker thread while decoding goes on, and are routed to after the decode in which the upload finished. Output is unchanged. Without `--moe-cache-profile` it turns the cache on by itself, starting from each layer's first experts. Qwen3.8-Flash on one RTX 3060 with MTP: 27.9 -> 32.0 tok/s. |
+| `--layer-major N` | `0` (off) | A batch of several ubatches runs `N` layers over all of them, then the next `N`, so each layer's weights are read once per batch instead of once per ubatch. For a model larger than the RAM; use `-b` larger than `-ub`. Only DeepSeek-V4.1 builds layer ranges so far; off for embeddings. DeepSeek-V4.1-Flash on a 5060 Ti, 16k prompt: 38 -> 79 tok/s with `--layer-major 3`. |
+| `GGML_SCHED_READAHEAD` | off (`=N` threads) | `N` threads read in the host weights the next graph splits copy to the GPU (up to `GGML_SCHED_READAHEAD_MB`, default 8192, ahead), so a memory-mapped model larger than the RAM is read with many requests in flight. With `--layer-major` they also read the next layer group. Tables read by rows (`--lazy-mode`) are left out. |
 | `--moe-cache-mask N` | `-1` (off) | Routes each token only to cached experts, except the router's top `N` picks, which still run (on the CPU when not cached). Not lossless: it changes the output. `--moe-cache-mask 2` with `--moe-cache-dyn 32` and MTP: 38.7 tok/s decode, 170 tok/s prefill on short prompts, same GSM8K/HumanEval scores on a 20-task check. `0` (cache only) badly hurts quality. Batches that borrow the cache are never masked. |
 
 With an expert cache profile, the MTP draft context keeps a ubatch no larger than the borrow size

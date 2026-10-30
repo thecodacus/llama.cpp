@@ -717,10 +717,15 @@ public:
     virtual ~llm_graph_input_qsa() = default;
 
     void set_input(const llama_ubatch * ubatch) override {
-        mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
-        mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias, pos_vis ? &vis : nullptr);
+        if (k_idxs->buffer) {
+            mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
+        }
+        // the block tables are read together, by the indexer
+        if (cell_blk->buffer) {
+            mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias, pos_vis ? &vis : nullptr);
+        }
 
-        if (tok_rows) {
+        if (tok_rows && tok_rows->buffer) {
             GGML_ASSERT(ggml_backend_buffer_is_host(tok_rows->buffer));
             int32_t * rows = (int32_t *) tok_rows->data;
             for (int64_t s = 0; s < tok_rows->ne[1]; ++s) {
@@ -1411,6 +1416,10 @@ public:
 };
 
 void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
+    if (!rows->buffer) {
+        return;
+    }
+
     const auto & hp = pmodel.hparams;
 
     // an image arrives as an embd batch, so ubatch->token is null, but every position still needs a row for ggml_get_rows

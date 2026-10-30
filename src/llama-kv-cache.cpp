@@ -2729,10 +2729,25 @@ bool llama_kv_cache_context::apply() {
         return true;
     }
 
+    if (replaying && i_cur < cells_after.size()) {
+        kv->set_cells_all(cells_after[i_cur]);
+        n_kv = kv->get_n_kv(sinfos[i_cur]);
+        return true;
+    }
+
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
     n_kv = kv->get_n_kv(sinfos[i_cur]);
 
+    if (replaying) {
+        cells_after.push_back(kv->get_cells_all());
+    }
+
     return true;
+}
+
+bool llama_kv_cache_context::replay() {
+    replaying = !ubatches.empty();
+    return replaying;
 }
 
 llama_memory_status llama_kv_cache_context::get_status() const {

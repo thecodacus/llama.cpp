@@ -64,6 +64,12 @@ struct llama_memory_context_i {
 
     // get the status of the memory context - used for error handling and checking if any updates would be applied
     virtual llama_memory_status get_status() const = 0;
+
+    // layer-major prompt processing runs each ubatch once per group of layers. after replay(), apply() keeps the
+    // memory state of a ubatch on its first run and puts it back on later runs; rewind() goes back to the first ubatch
+    // replay() returns false if the memory cannot do this
+    virtual bool replay() { return false; }
+    virtual void rewind() {}
 };
 
 using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;

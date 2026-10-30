@@ -90,7 +90,7 @@ public:
             }
         }
 
-        if (inp_slopes) {
+        if (inp_slopes && inp_slopes->buffer) {
             GGML_ASSERT(ggml_backend_buffer_is_host(inp_slopes->buffer));
 
             float * data = (float *) inp_slopes->data;
@@ -103,7 +103,7 @@ public:
             }
         }
 
-        if (inp_q_decay) {
+        if (inp_q_decay && inp_q_decay->buffer) {
             GGML_ASSERT(ggml_backend_buffer_is_host(inp_q_decay->buffer));
 
             float * slopes = (float *) inp_slopes->data;
@@ -123,7 +123,7 @@ public:
             }
         }
 
-        if (inp_k_decay) {
+        if (inp_k_decay && inp_k_decay->buffer) {
             GGML_ASSERT(ggml_backend_buffer_is_host(inp_k_decay->buffer));
 
             float * slopes = (float *) inp_slopes->data;
@@ -143,7 +143,7 @@ public:
             }
         }
 
-        if (inp_diag_decay) {
+        if (inp_diag_decay && inp_diag_decay->buffer) {
             GGML_ASSERT(ggml_backend_buffer_is_host(inp_diag_decay->buffer));
 
             float * slopes = (float *) inp_slopes->data;

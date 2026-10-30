@@ -265,6 +265,16 @@ bool llama_memory_hybrid_context::apply() {
     return res;
 }
 
+bool llama_memory_hybrid_context::replay() {
+    return ctx_attn->replay() && ctx_recr->replay();
+}
+
+void llama_memory_hybrid_context::rewind() {
+    ctx_attn->rewind();
+    ctx_recr->rewind();
+    i_next = 0;
+}
+
 llama_memory_status llama_memory_hybrid_context::get_status() const {
     return status;
 }

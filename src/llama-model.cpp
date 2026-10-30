@@ -33,6 +33,8 @@
 #include <cmath>
 #include <functional>
 #include <future>
+#include <array>
+#include <atomic>
 #include <map>
 #include <thread>
 #include <numeric>
@@ -41,6 +43,36 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#if defined(__unix__) || defined(__APPLE__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
+// routing profile: moe-trace CSV (pos,layer,id0,...), decode rows only: layer -> expert -> count
+static bool llama_moe_profile_read(const char * path, std::map<int, std::map<int, int64_t>> & freq) {
+    FILE * f = fopen(path, "r");
+    if (!f) {
+        return false;
+    }
+    char line[4096];
+    while (fgets(line, sizeof(line), f)) {
+        char * p = line;
+        const long pos = strtol(p, &p, 10);
+        if (*p != ',' || pos < 0) { continue; }
+        p++;
+        const long il = strtol(p, &p, 10);
+        while (*p == ',') {
+            p++;
+            const long e = strtol(p, &p, 10);
+            if (e >= 0) {
+                freq[(int) il][(int) e]++;
+            }
+        }
+    }
+    fclose(f);
+    return true;
+}
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
     switch (arch) {
@@ -1160,6 +1192,19 @@ struct llama_model::impl {
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
 
+    // the buffers of the tensors read lazily (--lazy-mode)
+    std::unordered_set<ggml_backend_buffer_t> lazy_bufs;
+
+    // a descriptor of the file of each mapping, to read a mapped tensor with pread (-1: none)
+    std::vector<int> mapping_fds;
+
+    // the address ranges of the mapping read into RAM (--weights-in-ram), sorted
+    std::vector<std::pair<const char *, const char *>> ram_ranges;
+    bool ram_done = false; // with an expert cache: kept once, around what its first build holds
+
+    // the pinned buffers the expert cache is read into before it is uploaded, kept for the uploads after each batch
+    ggml_backend_buffer_ptr moe_stage[2];
+
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
 
@@ -1206,14 +1251,284 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
     pimpl->has_tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
 }
 
+bool llama_model::is_mapped(const ggml_tensor * t) const {
+    for (const auto & mapping : pimpl->mappings) {
+        const char * base = mapping ? (const char *) mapping->addr() : nullptr;
+        if (base && (const char *) t->data >= base && (const char *) t->data + ggml_nbytes(t) <= base + mapping->size()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// --weights-in-ram: the most routed experts of the routing profile (without one: whole layers from the first) are read
+// into anonymous memory at their own place in the file mappings. the addresses do not change, so every reader of them
+// (the CPU kernels, the copies to the GPU, the expert cache) reads RAM instead of the file; without swap the kernel
+// cannot drop them as it drops the page cache
+void llama_model::load_weights_ram(size_t budget, const std::map<int, std::set<int32_t>> & skip) const {
+#if defined(__linux__)
+    const int64_t t_start_us = ggml_time_us();
+    const int64_t n_expert = hparams.n_expert;
+
+    // the mapped host weights of each layer: the expert tensors by expert, the others whole
+    std::map<int, std::vector<ggml_tensor *>> experts_of;
+    std::map<int, std::vector<ggml_tensor *>> others_of;
+    for (const auto & [name, t] : tensors_by_name) {
+        int il = -1;
+        if (sscanf(name.c_str(), "blk.%d.", &il) != 1 || !t->buffer || !ggml_backend_buffer_is_host(t->buffer) ||
+            ggml_backend_buffer_get_usage(t->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS || is_lazy(t) || !is_mapped(t)) {
+            continue;
+        }
+        (n_expert > 0 && t->ne[2] == n_expert ? experts_of : others_of)[il].push_back(t);
+    }
+
+    std::vector<std::pair<const char *, size_t>> ranges; // address, size
+    size_t total = 0;
+    const auto take = [&](const void * p, size_t n) {
+        if (total + n > budget) {
+            return false;
+        }
+        ranges.emplace_back((const char *) p, n);
+        total += n;
+        return true;
+    };
+
+    std::map<int, std::map<int, int64_t>> freq;
+    const char * profile = params.moe_cache_profile;
+    if (profile == nullptr || profile[0] == '\0') {
+        profile = getenv("GGML_MOE_CACHE_PROFILE");
+    }
+    std::string what;
+    if (profile != nullptr && profile[0] != '\0' && llama_moe_profile_read(profile, freq) && !freq.empty()) {
+        for (const auto & [il, ts] : others_of) {
+            for (const auto * t : ts) {
+                take(t->data, ggml_nbytes(t));
+            }
+        }
+        // (count, layer, expert), most routed first, the ones the profile never saw last; none the cache holds
+        std::vector<std::tuple<int64_t, int, int>> ranked;
+        for (const auto & [il, ts] : experts_of) {
+            const auto it_skip = skip.find(il);
+            const auto & counts = freq[il];
+            for (int e = 0; e < n_expert; e++) {
+                if (it_skip != skip.end() && it_skip->second.count(e)) {
+                    continue;
+                }
+                const auto it = counts.find(e);
+                ranked.emplace_back(it == counts.end() ? 0 : -it->second, il, e);
+            }
+        }
+        std::sort(ranked.begin(), ranked.end());
+        size_t n_taken = 0;
+        int64_t routed = 0;
+        int64_t routed_all = 0;
+        for (const auto & [c, il, e] : ranked) {
+            routed_all -= c;
+        }
+        for (const auto & [c, il, e] : ranked) {
+            size_t n = 0;
+            for (const auto * t : experts_of[il]) {
+                n += t->nb[2];
+            }
+            if (total + n > budget) {
+                break;
+            }
+            for (const auto * t : experts_of[il]) {
+                take((const char *) t->data + e*t->nb[2], t->nb[2]);
+            }
+            n_taken++;
+            routed -= c;
+        }
+        size_t n_skip = 0;
+        for (const auto & [il, es] : skip) {
+            n_skip += es.size();
+        }
+        what = format("%zu of %zu experts (%zu more on the GPU), %.1f%% of the routing to experts not on the GPU", n_taken,
+                (size_t) n_expert*experts_of.size(), n_skip, routed_all > 0 ? 100.0*routed/routed_all : 0.0);
+    } else {
+        int n_layers = 0;
+        for (const auto & [il, ts] : experts_of) {
+            size_t n = 0;
+            for (const auto * t : ts) {
+                n += ggml_nbytes(t);
+            }
+            for (const auto * t : others_of[il]) {
+                n += ggml_nbytes(t);
+            }
+            if (total + n > budget) {
+                break;
+            }
+            for (const auto * t : ts) {
+                take(t->data, ggml_nbytes(t));
+            }
+            for (const auto * t : others_of[il]) {
+                take(t->data, ggml_nbytes(t));
+            }
+            n_layers++;
+        }
+        what = format("%d of %zu layers (no routing profile)", n_layers, experts_of.size());
+    }
+    if (ranges.empty()) {
+        LLAMA_LOG_WARN("%s: nothing fits in %.2f GiB\n", __func__, budget/1024.0/1024.0/1024.0);
+        return;
+    }
+
+    // whole pages, merged within one mapping
+    const size_t page = sysconf(_SC_PAGESIZE);
+    const auto mapping_of = [&](const char * p) {
+        for (size_t idx = 0; idx < pimpl->mappings.size() && idx < pimpl->mapping_fds.size(); idx++) {
+            const auto & m = pimpl->mappings[idx];
+            if (m && pimpl->mapping_fds[idx] >= 0 && p >= (const char *) m->addr() && p < (const char *) m->addr() + m->size()) {
+                return (int) idx;
+            }
+        }
+        return -1;
+    };
+    std::sort(ranges.begin(), ranges.end());
+    std::vector<std::tuple<char *, char *, int>> pages; // begin, end, mapping
+    for (const auto & [p, n] : ranges) {
+        const int idx = mapping_of(p);
+        GGML_ASSERT(idx >= 0);
+        char * base = (char *) pimpl->mappings[idx]->addr();
+        char * b = base + (((p - base)/page)*page);
+        char * e = base + (((p + n - base + page - 1)/page)*page);
+        if (!pages.empty() && std::get<2>(pages.back()) == idx && b <= std::get<1>(pages.back())) {
+            std::get<1>(pages.back()) = std::max(std::get<1>(pages.back()), e);
+        } else {
+            pages.emplace_back(b, e, idx);
+        }
+    }
+
+    // anonymous memory in place of the file pages, then the file's bytes read into it: 4 MiB reads on 16 threads
+    size_t n_bytes = 0;
+    struct piece {
+        char * dst;
+        size_t size;
+        int fd;
+        size_t offs;
+    };
+    std::vector<piece> pieces;
+    for (const auto & [b, e, idx] : pages) {
+        if (mmap(b, e - b, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) != b) {
+            throw std::runtime_error(format("%s: mmap failed: %s", __func__, strerror(errno)));
+        }
+        const char * base = (const char *) pimpl->mappings[idx]->addr();
+        const size_t file_end = pimpl->mappings[idx]->size();
+        for (char * p = b; p < e; p += 4u << 20) {
+            const size_t offs = p - base;
+            const size_t size = std::min({ (size_t) (4u << 20), (size_t) (e - p), file_end > offs ? file_end - offs : (size_t) 0 });
+            if (size > 0) {
+                pieces.push_back({ p, size, pimpl->mapping_fds[idx], offs });
+            }
+        }
+        n_bytes += e - b;
+    }
+    std::atomic<size_t> next{0};
+    std::atomic<bool> ok{true};
+    std::vector<std::thread> threads;
+    for (int i = 0; i < 16; i++) {
+        threads.emplace_back([&]() {
+            for (size_t k; (k = next++) < pieces.size(); ) {
+                const auto & pc = pieces[k];
+                size_t done = 0;
+                while (done < pc.size) {
+                    const ssize_t n = pread(pc.fd, pc.dst + done, pc.size - done, pc.offs + done);
+                    if (n <= 0) {
+                        ok = false;
+                        break;
+                    }
+                    done += n;
+                }
+            }
+        });
+    }
+    for (auto & th : threads) {
+        th.join();
+    }
+    if (!ok) {
+        throw std::runtime_error(format("%s: could not read the weights kept in RAM", __func__));
+    }
+    for (const auto & [b, e, idx] : pages) {
+        mprotect(b, e - b, PROT_READ);
+        pimpl->ram_ranges.emplace_back(b, e);
+    }
+
+    LLAMA_LOG_INFO("%s: %s (%.2f GiB) read into RAM in %.1f s\n", __func__, what.c_str(), n_bytes/1024.0/1024.0/1024.0,
+            (ggml_time_us() - t_start_us)/1e6);
+#else
+    GGML_UNUSED(budget);
+    GGML_UNUSED(skip);
+    LLAMA_LOG_WARN("%s: --weights-in-ram needs Linux\n", __func__);
+#endif
+}
+
+bool llama_model::read_mapped(const ggml_tensor * t, size_t offs, size_t size, void * dst) const {
+#if defined(__unix__) || defined(__APPLE__)
+    for (size_t idx = 0; idx < pimpl->mappings.size() && idx < pimpl->mapping_fds.size(); idx++) {
+        const auto & mapping = pimpl->mappings[idx];
+        const int fd = pimpl->mapping_fds[idx];
+        if (!mapping || fd < 0) {
+            continue;
+        }
+        const char * base = (const char *) mapping->addr();
+        const char * data = (const char *) t->data;
+        if (data < base || data + ggml_nbytes(t) > base + mapping->size()) {
+            continue;
+        }
+        // the parts kept in RAM are copied from there, the rest is read from the file
+        const char * p   = data + offs;
+        const char * end = p + size;
+        auto it = std::upper_bound(pimpl->ram_ranges.begin(), pimpl->ram_ranges.end(), std::make_pair(p, (const char *) nullptr));
+        if (it != pimpl->ram_ranges.begin() && std::prev(it)->second > p) {
+            --it;
+        }
+        while (p < end) {
+            const char * q = end;
+            if (it != pimpl->ram_ranges.end() && it->first <= p) {
+                q = std::min(end, it->second);
+                memcpy((char *) dst + (p - data - offs), p, q - p);
+                ++it;
+            } else {
+                if (it != pimpl->ram_ranges.end()) {
+                    q = std::min(end, it->first);
+                }
+                size_t done = 0;
+                while (done < (size_t) (q - p)) {
+                    const ssize_t n = pread(fd, (char *) dst + (p - data - offs) + done, (q - p) - done, (p - base) + done);
+                    if (n <= 0) {
+                        return false;
+                    }
+                    done += n;
+                }
+            }
+            p = q;
+        }
+        return true;
+    }
+#else
+    GGML_UNUSED(t);
+    GGML_UNUSED(offs);
+    GGML_UNUSED(size);
+    GGML_UNUSED(dst);
+#endif
+    return false;
+}
+
+bool llama_model::is_lazy(const ggml_tensor * t) const {
+    return pimpl->lazy_bufs.count(t->buffer) > 0;
+}
+
 void llama_model::prefetch_rows(const ggml_tensor * table, const ggml_tensor * ids) const {
+    prefetch_rows(table, std::vector<int32_t>((const int32_t *) ids->data, (const int32_t *) ids->data + ggml_nelements(ids)));
+}
+
+void llama_model::prefetch_rows(const ggml_tensor * table, std::vector<int32_t> rows) const {
     // forget the jobs that have finished; a running one keeps going alongside the new one
     auto & jobs = pimpl->row_readers;
     jobs.erase(std::remove_if(jobs.begin(), jobs.end(), [](const std::future<void> & f) {
         return f.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
     }), jobs.end());
 
-    std::vector<int32_t> rows((const int32_t *) ids->data, (const int32_t *) ids->data + ggml_nelements(ids));
     std::sort(rows.begin(), rows.end());
     rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
 
@@ -1247,6 +1562,13 @@ llama_model::~llama_model() {
     for (auto & job : pimpl->row_readers) {
         job.wait();
     }
+#if defined(__unix__) || defined(__APPLE__)
+    for (int fd : pimpl->mapping_fds) {
+        if (fd >= 0) {
+            close(fd);
+        }
+    }
+#endif
     for (auto * lora : loras) {
         delete lora;
     }
@@ -1844,6 +2166,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             // indicate that this buffer contains weights
             // this is used by ggml_backend_sched to improve op scheduling: ops that use a weight are preferably scheduled to the backend that contains the weight
             ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            if (ctx_key.lazy) {
+                pimpl->lazy_bufs.insert(buf.get());
+            }
         }
 
         pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::move(bufs));
@@ -1895,12 +2220,20 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     if (use_mmap_buffer) {
-        for (auto & mapping : ml.mappings) {
-            pimpl->mappings.emplace_back(std::move(mapping));
+        for (size_t idx = 0; idx < ml.mappings.size(); idx++) {
+            pimpl->mappings.emplace_back(std::move(ml.mappings[idx]));
+#if defined(__unix__) || defined(__APPLE__)
+            pimpl->mapping_fds.push_back(pimpl->mappings.back() ? dup(ml.files[idx]->file_id()) : -1);
+#endif
         }
     }
 
     init_moe_expert_cache();
+
+    // with an expert cache, the experts it holds on the GPU are not kept in RAM as well: the first build decides them
+    if (params.weights_in_ram > 0 && use_mmap_buffer && pimpl->moe_groups.empty()) {
+        load_weights_ram((size_t) params.weights_in_ram << 20, {});
+    }
 
     return true;
 }
@@ -1925,28 +2258,9 @@ void llama_model_base::init_moe_expert_cache() {
 
     // routing profile: moe-trace CSV (pos,layer,id0,...), decode rows only
     std::map<int, std::map<int, int64_t>> freq; // layer -> expert -> count
-    if (!no_profile) {
-        FILE * f = fopen(profile_path, "r");
-        if (!f) {
-            LLAMA_LOG_WARN("%s: cannot open profile '%s' - expert cache disabled\n", __func__, profile_path);
-            return;
-        }
-        char line[4096];
-        while (fgets(line, sizeof(line), f)) {
-            char * p = line;
-            const long pos = strtol(p, &p, 10);
-            if (*p != ',' || pos < 0) { continue; }
-            p++;
-            const long il = strtol(p, &p, 10);
-            while (*p == ',') {
-                p++;
-                const long e = strtol(p, &p, 10);
-                if (e >= 0) {
-                    freq[(int) il][(int) e]++;
-                }
-            }
-        }
-        fclose(f);
+    if (!no_profile && !llama_moe_profile_read(profile_path, freq)) {
+        LLAMA_LOG_WARN("%s: cannot open profile '%s' - expert cache disabled\n", __func__, profile_path);
+        return;
     }
     if (!no_profile && freq.empty()) {
         LLAMA_LOG_WARN("%s: profile '%s' has no decode rows - expert cache disabled\n", __func__, profile_path);
@@ -2213,6 +2527,84 @@ size_t llama_model::moe_pack_upload(size_t i) const {
     std::vector<int32_t> map_hot, map_cold;
     size_t total_bytes = 0;
 
+    // the slabs of mapped weights are read with pread on 16 threads: page faults on the mapping read one page at a
+    // time, and the cache is uploaded again after every batch that borrowed its memory. a layer is read into one of
+    // two pinned buffers while the one before is copied to the device from the other
+    const auto slab_srcs = [&](size_t k) {
+        const auto & l = layers[group.layers[k]];
+        return std::array<const ggml_tensor *, 3>{ l.ffn_gate_exps, l.ffn_up_exps, l.ffn_down_exps };
+    };
+    const auto stage_layout = [&](size_t k, std::vector<size_t> & off) {
+        const auto srcs = slab_srcs(k);
+        const int64_t S = layers[group.layers[k]].ffn_gate_exps_hot->ne[2];
+        off.assign(3*S, SIZE_MAX);
+        size_t n = 0;
+        for (int64_t s = 0; s < S; s++) {
+            for (int t = 0; t < 3; t++) {
+                if (ggml_backend_buffer_is_host(srcs[t]->buffer) && is_mapped(srcs[t])) {
+                    off[3*s + t] = n;
+                    n += srcs[t]->nb[2];
+                }
+            }
+        }
+        return n;
+    };
+    size_t stage_max = 0;
+    {
+        std::vector<size_t> off;
+        for (size_t k = 0; k < group.layers.size(); k++) {
+            stage_max = std::max(stage_max, stage_layout(k, off));
+        }
+    }
+    std::vector<uint8_t> stage_vec[2];
+    uint8_t * stage[2] = { nullptr, nullptr };
+    if (stage_max > 0) {
+        ggml_backend_buffer_type_t host = ggml_backend_dev_host_buffer_type(group.dev);
+        for (int b = 0; b < 2; b++) {
+            auto & buf = pimpl->moe_stage[b];
+            if (host != nullptr && (!buf || ggml_backend_buffer_get_size(buf.get()) < stage_max)) {
+                buf.reset(ggml_backend_buft_alloc_buffer(host, stage_max));
+            }
+            if (buf) {
+                stage[b] = (uint8_t *) ggml_backend_buffer_get_base(buf.get());
+            } else {
+                stage_vec[b].resize(stage_max);
+                stage[b] = stage_vec[b].data();
+            }
+        }
+    }
+    // the offsets of the slabs of layer k in its buffer; SIZE_MAX for a slab read below instead
+    const auto read_layer = [&](size_t k) {
+        std::vector<size_t> off;
+        const size_t n = stage_layout(k, off);
+        const auto srcs = slab_srcs(k);
+        uint8_t * dst = stage[k % 2];
+        std::atomic<int64_t> next{0};
+        std::vector<std::thread> threads;
+        for (int i = 0; i < 16 && n > 0; i++) {
+            threads.emplace_back([&]() {
+                for (int64_t j; (j = next++) < (int64_t) off.size(); ) {
+                    if (off[j] == SIZE_MAX) {
+                        continue;
+                    }
+                    const int t = (int) (j%3);
+                    const size_t nb = srcs[t]->nb[2];
+                    if (!read_mapped(srcs[t], group.ranked[k][j/3]*nb, nb, dst + off[j])) {
+                        off[j] = SIZE_MAX; // read through the mapping below
+                    }
+                }
+            });
+        }
+        for (auto & th : threads) {
+            th.join();
+        }
+        return off;
+    };
+
+    std::future<std::vector<size_t>> next_read;
+    if (!group.layers.empty()) {
+        next_read = std::async(std::launch::async, read_layer, 0);
+    }
     for (size_t k = 0; k < group.layers.size(); k++) {
         const auto & l = layers[group.layers[k]];
         const int64_t n_expert = l.ffn_gate_exps->ne[2];
@@ -2225,15 +2617,25 @@ size_t llama_model::moe_pack_upload(size_t i) const {
         }
 
         // expert dim is outermost: one contiguous slab per expert
-        const ggml_tensor * srcs[3] = { l.ffn_gate_exps, l.ffn_up_exps, l.ffn_down_exps };
+        const auto srcs = slab_srcs(k);
         ggml_tensor * dsts[3] = { l.ffn_gate_exps_hot, l.ffn_up_exps_hot, l.ffn_down_exps_hot };
+
+        // the buffer of layer k + 1 is free: layer k - 1 was copied from it
+        const std::vector<size_t> staged_off = next_read.get();
+        if (k + 1 < group.layers.size()) {
+            next_read = std::async(std::launch::async, read_layer, k + 1);
+        }
+        const uint8_t * staged = stage[k % 2];
+
         for (int64_t s = 0; s < S; s++) {
             const int32_t e = group.ranked[k][s];
             map_hot[e]  = (int32_t) s;
             map_cold[e] = -1;
             for (int t = 0; t < 3; t++) {
                 const size_t nb = srcs[t]->nb[2];
-                if (ggml_backend_buffer_is_host(srcs[t]->buffer)) {
+                if (staged_off[3*s + t] != SIZE_MAX) {
+                    ggml_backend_tensor_set(dsts[t], staged + staged_off[3*s + t], s*nb, nb);
+                } else if (ggml_backend_buffer_is_host(srcs[t]->buffer)) {
                     // straight from the host weights, they are pinned when mapped
                     ggml_backend_tensor_set(dsts[t], (const char *) srcs[t]->data + e*nb, s*nb, nb);
                 } else {
@@ -2304,6 +2706,19 @@ bool llama_model::moe_cache_build(bool probe) const {
         pimpl->moe_built = true;
         LLAMA_LOG_INFO("%s: expert cache: %zu layers x %d slots, %.2f MiB uploaded to %s\n",
             __func__, group.layers.size(), n_slots, total_bytes/1024.0/1024.0, ggml_backend_dev_name(group.dev));
+    }
+
+    // RAM keeps the experts the cache does not hold (the GPU and RAM together then hold most of the model)
+    if (!probe && pimpl->moe_built && params.weights_in_ram > 0 && !pimpl->ram_done) {
+        pimpl->ram_done = true;
+        std::map<int, std::set<int32_t>> skip;
+        for (int il = 0; il < (int) layers.size(); il++) {
+            const auto & l = layers[il];
+            if (l.ffn_gate_exps_hot != nullptr && l.moe_hot_ids != nullptr) {
+                skip[il].insert(l.moe_hot_ids, l.moe_hot_ids + l.ffn_gate_exps_hot->ne[2]);
+            }
+        }
+        load_weights_ram((size_t) params.weights_in_ram << 20, skip);
     }
 
     return !pimpl->moe_packs.empty();
@@ -3121,6 +3536,7 @@ llama_model_params llama_model_default_params() {
         /*.moe_cache_dyn               =*/ 0,
         /*.moe_cache_mask              =*/ -1,
         /*.moe_cache_decay             =*/ 0.9f,
+        /*.weights_in_ram              =*/ 0,
         /*.model_shared                =*/ nullptr,
         /*.vocab_only                  =*/ false,
         /*.check_tensors               =*/ false,
